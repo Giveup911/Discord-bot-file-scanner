@@ -384,6 +384,7 @@ async def mb_lookup(sha256: str, session: aiohttp.ClientSession) -> Optional[dic
     """Query MalwareBazaar by SHA-256 hash. No API key needed."""
     if not CFG.get("malwarebazaar", {}).get("enabled", True):
         return None
+    permalink = f"https://bazaar.abuse.ch/sample/{sha256}/"
     try:
         data = aiohttp.FormData()
         data.add_field("query", "get_info")
@@ -391,10 +392,14 @@ async def mb_lookup(sha256: str, session: aiohttp.ClientSession) -> Optional[dic
         async with session.post(MB_API, data=data, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status != 200:
                 log.warning(f"MalwareBazaar returned {resp.status}")
-                return None
-            result = await resp.json()
-            if result.get("query_status") != "ok":
-                return None
+                return {"status": "error", "permalink": permalink}
+            result = await resp.json(content_type=None)
+            query_status = result.get("query_status", "")
+            if query_status == "hash_not_found" or query_status == "no_results":
+                return {"status": "not_found", "permalink": permalink}
+            if query_status != "ok":
+                log.warning(f"MalwareBazaar query_status: {query_status}")
+                return {"status": "not_found", "permalink": permalink}
             sample = result["data"][0]
             tags = sample.get("tags") or []
             return {
@@ -406,12 +411,12 @@ async def mb_lookup(sha256: str, session: aiohttp.ClientSession) -> Optional[dic
                 "delivery_method": sample.get("delivery_method", ""),
                 "downloads": sample.get("intelligence", {}).get("downloads", 0),
                 "uploads": sample.get("intelligence", {}).get("uploads", 0),
-                "permalink": f"https://bazaar.abuse.ch/sample/{sha256}/",
+                "permalink": permalink,
                 "status": "found",
             }
     except Exception as e:
         log.warning(f"MalwareBazaar lookup failed: {e}")
-        return None
+        return {"status": "error", "permalink": permalink}
 
 
 # ─── Hybrid Analysis ─────────────────────────────────────────────────────────
@@ -424,34 +429,58 @@ async def ha_search(sha256: str, session: aiohttp.ClientSession) -> Optional[dic
     api_key = CFG.get("hybrid_analysis", {}).get("api_key", "")
     if not api_key or not CFG.get("hybrid_analysis", {}).get("enabled", True):
         return None
-    headers = {"api-key": api_key, "User-Agent": "Falcon Sandbox", "accept": "application/json"}
+    permalink = f"https://www.hybrid-analysis.com/sample/{sha256}"
+    headers = {
+        "api-key": api_key,
+        "User-Agent": "Falcon Sandbox",
+        "accept": "application/json",
+    }
     try:
-        data = aiohttp.FormData()
-        data.add_field("hash", sha256)
+        # HA v2 search/hash expects form-encoded data
         async with session.post(
-            f"{HA_BASE}/search/hash", headers=headers, data=data,
-            timeout=aiohttp.ClientTimeout(total=15),
+            f"{HA_BASE}/search/hash",
+            headers=headers,
+            data={"hash": sha256},
+            timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
+            body = await resp.text()
+            if resp.status == 403:
+                log.warning(f"Hybrid Analysis: 403 Forbidden — API key may be invalid. Body: {body[:300]}")
+                return {"status": "error", "error": "API key invalid or rate limited", "permalink": permalink}
+            if resp.status == 429:
+                log.warning(f"Hybrid Analysis: 429 rate limited")
+                return {"status": "error", "error": "Rate limited", "permalink": permalink}
             if resp.status != 200:
-                log.warning(f"Hybrid Analysis search returned {resp.status}")
-                return None
-            results = await resp.json()
-            if not results:
-                return None
-            # Pick the most recent result
-            best = results[0]
+                log.warning(f"Hybrid Analysis search returned {resp.status}: {body[:300]}")
+                return {"status": "error", "error": f"HTTP {resp.status}", "permalink": permalink}
+            try:
+                results = await resp.json(content_type=None)
+            except Exception:
+                log.warning(f"Hybrid Analysis: failed to parse JSON: {body[:300]}")
+                return {"status": "error", "error": "Invalid response", "permalink": permalink}
+            # HA returns [] for no results, or a list of dicts
+            if not results or (isinstance(results, list) and len(results) == 0):
+                return {"status": "not_found", "permalink": permalink}
+            # Pick the best result (highest threat score)
+            if isinstance(results, list):
+                best = max(results, key=lambda r: r.get("threat_score") or 0)
+            else:
+                best = results
             return {
                 "verdict": best.get("verdict", ""),
                 "threat_score": best.get("threat_score"),
                 "threat_level": best.get("threat_level"),
                 "analysis_start_time": best.get("analysis_start_time", ""),
                 "environment": best.get("environment_description", ""),
-                "permalink": f"https://www.hybrid-analysis.com/sample/{sha256}",
+                "permalink": permalink,
                 "status": "found",
             }
+    except asyncio.TimeoutError:
+        log.warning("Hybrid Analysis search timed out")
+        return {"status": "error", "error": "Timeout", "permalink": permalink}
     except Exception as e:
         log.warning(f"Hybrid Analysis search failed: {e}")
-        return None
+        return {"status": "error", "error": str(e), "permalink": permalink}
 
 
 async def ha_submit(filepath: str, sha256: str, session: aiohttp.ClientSession) -> Optional[dict]:
@@ -498,9 +527,14 @@ async def ha_search_or_submit(
 ) -> Optional[dict]:
     """Search HA first; if not found, submit the file."""
     result = await ha_search(sha256, session)
-    if result:
+    if result and result.get("status") == "found":
         return result
-    return await ha_submit(filepath, sha256, session)
+    # If search returned error (bad key, rate limit), don't try to submit
+    if result and result.get("status") == "error":
+        return result
+    # Not found — submit for sandbox analysis
+    submit_result = await ha_submit(filepath, sha256, session)
+    return submit_result if submit_result else result
 
 
 # ─── VirusTotal Sandbox/Behavior Links ───────────────────────────────────────
@@ -2382,11 +2416,25 @@ def build_mb_embed(mb_result: Optional[dict], sha256: str, scan_id: str) -> disc
             desc_parts.append(f"**Downloads:** {mb_result['downloads']}")
         desc_parts.append(f"\n**[View on MalwareBazaar]({permalink})**")
         e.description = _trunc("\n".join(desc_parts), 2000)
+    elif mb_result and mb_result.get("status") == "not_found":
+        e = discord.Embed(
+            title="\U0001F9A0 MalwareBazaar",
+            description=f"Not found in abuse.ch database — this sample has not been reported.\n\n**[Search MalwareBazaar]({permalink})**",
+            color=0x2ECC71,
+            timestamp=datetime.now(timezone.utc),
+        )
+    elif mb_result and mb_result.get("status") == "error":
+        e = discord.Embed(
+            title="\U0001F9A0 MalwareBazaar",
+            description=f"API request failed.\n\n**[Search Manually]({permalink})**",
+            color=0x95A5A6,
+            timestamp=datetime.now(timezone.utc),
+        )
     else:
         e = discord.Embed(
             title="\U0001F9A0 MalwareBazaar",
-            description=f"Not found in abuse.ch database.\n\n**[Search MalwareBazaar]({permalink})**",
-            color=0x2ECC71,
+            description=f"Lookup skipped or unavailable.\n\n**[Search MalwareBazaar]({permalink})**",
+            color=0x95A5A6,
             timestamp=datetime.now(timezone.utc),
         )
     e.set_footer(text=f"Scan ID: {scan_id}")
@@ -2436,10 +2484,31 @@ def build_ha_embed(ha_result: Optional[dict], sha256: str, scan_id: str) -> disc
             color=0xF39C12,
             timestamp=datetime.now(timezone.utc),
         )
+    elif ha_result and ha_result.get("status") == "not_found":
+        e = discord.Embed(
+            title="\U0001F50D Hybrid Analysis",
+            description=(
+                "Not previously analyzed.\n"
+                "File was submitted for sandbox analysis.\n"
+                "**ETA:** ~5\u201310 minutes\n\n"
+                f"**[View Results on Hybrid Analysis]({permalink})**\n"
+                "*(page will update when analysis completes)*"
+            ),
+            color=0xF39C12,
+            timestamp=datetime.now(timezone.utc),
+        )
+    elif ha_result and ha_result.get("status") == "error":
+        error_detail = ha_result.get("error", "Unknown error")
+        e = discord.Embed(
+            title="\U0001F50D Hybrid Analysis",
+            description=f"Lookup failed: {error_detail}\n\n**[Check Manually]({permalink})**",
+            color=0x95A5A6,
+            timestamp=datetime.now(timezone.utc),
+        )
     else:
         e = discord.Embed(
             title="\U0001F50D Hybrid Analysis",
-            description=f"Lookup failed or unavailable.\n\n**[Check Manually]({permalink})**",
+            description=f"Lookup skipped or unavailable.\n\n**[Check Manually]({permalink})**",
             color=0x95A5A6,
             timestamp=datetime.now(timezone.utc),
         )
