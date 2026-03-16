@@ -508,6 +508,10 @@ async def ha_search(sha256: str, session: aiohttp.ClientSession) -> Optional[dic
             timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
             body = await resp.text()
+            if resp.status == 404:
+                # HA returns 404 when hash is not in their database
+                log.info(f"Hybrid Analysis: hash not found ({sha256[:16]}...)")
+                return {"status": "not_found", "permalink": permalink}
             if resp.status == 403:
                 log.warning(f"Hybrid Analysis: 403 Forbidden — API key may be invalid. Body: {body[:300]}")
                 return {"status": "error", "error": "API key invalid or rate limited", "permalink": permalink}
@@ -518,18 +522,28 @@ async def ha_search(sha256: str, session: aiohttp.ClientSession) -> Optional[dic
                 log.warning(f"Hybrid Analysis search returned {resp.status}: {body[:300]}")
                 return {"status": "error", "error": f"HTTP {resp.status}", "permalink": permalink}
             try:
-                results = await resp.json(content_type=None)
+                data = await resp.json(content_type=None)
             except Exception:
                 log.warning(f"Hybrid Analysis: failed to parse JSON: {body[:300]}")
                 return {"status": "error", "error": "Invalid response", "permalink": permalink}
-            # HA returns [] for no results, or a list of dicts
-            if not results or (isinstance(results, list) and len(results) == 0):
+            # HA v2 response format: {"sha256s": [...], "reports": [...]}
+            # or sometimes a flat list of report dicts
+            reports = []
+            if isinstance(data, dict) and "reports" in data:
+                reports = data["reports"]
+            elif isinstance(data, list):
+                reports = data
+            elif isinstance(data, dict) and data.get("sha256"):
+                reports = [data]
+            if not reports:
                 return {"status": "not_found", "permalink": permalink}
-            # Pick the best result (highest threat score)
-            if isinstance(results, list):
-                best = max(results, key=lambda r: r.get("threat_score") or 0)
+            # Filter to completed reports with verdicts
+            completed = [r for r in reports if r.get("verdict") and r.get("state") == "SUCCESS"]
+            if not completed:
+                # Have reports but none completed successfully
+                best = reports[0]
             else:
-                best = results
+                best = max(completed, key=lambda r: r.get("threat_score") or 0)
             return {
                 "verdict": best.get("verdict", ""),
                 "threat_score": best.get("threat_score"),
@@ -3795,10 +3809,9 @@ async def run_scan(
             mb_result=mb_result, ha_result=ha_result,
         )
 
-        # ── Upload flagged files to MalwareBazaar ──
+        # ── Upload to MalwareBazaar if not already in database ──
         mb_upload_enabled = CFG.get("malwarebazaar", {}).get("upload_flagged", True)
-        if (score > DETECTION_THRESHOLD
-                and mb_result and mb_result.get("status") == "not_found"
+        if (mb_result and mb_result.get("status") == "not_found"
                 and http_session and mb_enabled and mb_upload_enabled):
             mb_tags = []
             if all_iocs and all_iocs.get("variant", "").lower() != "unknown":

@@ -11,7 +11,7 @@ Built for the Minecraft community but works on any file type.
 - **13+ Minecraft malware variant detection** (Weedhack, Fractureiser, Skyrage, AdamRAT, etc.)
 - **Multi-format analysis** — PE (.exe/.dll/.scr), PDF, Office (.doc/.docx/.xls), LNK, scripts (.bat/.ps1/.vbs), MSI, ISO
 - **VirusTotal integration** — hash lookup, upload, sandbox behavior reports
-- **MalwareBazaar integration** — abuse.ch threat intel database (no API key needed)
+- **MalwareBazaar integration** — abuse.ch threat intel lookup + auto-upload scanned samples
 - **Hybrid Analysis integration** — CrowdStrike sandbox with automated submission
 - **Progressive scan updates** — live embed updates as each service completes with ETAs
 - **7,800+ YARA rules** from 43 public threat intelligence repositories
