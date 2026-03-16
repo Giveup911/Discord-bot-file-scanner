@@ -47,7 +47,8 @@ virustotal:
 hybrid_analysis:
   api_key: "YOUR_HA_API_KEY"    # free at https://www.hybrid-analysis.com/signup
 
-# MalwareBazaar is enabled by default, no API key needed
+malwarebazaar:
+  auth_key: "YOUR_MB_AUTH_KEY"  # free at https://bazaar.abuse.ch/account/
 ```
 
 Alternatively, set environment variables (these override `config.yml`):
@@ -55,6 +56,7 @@ Alternatively, set environment variables (these override `config.yml`):
 DISCORD_TOKEN=your_token
 VT_API_KEY=your_key
 HA_API_KEY=your_key
+MB_AUTH_KEY=your_key
 DISCORD_GUILD_ID=your_guild_id   # optional
 ```
 

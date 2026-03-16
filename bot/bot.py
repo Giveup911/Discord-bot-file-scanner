@@ -56,7 +56,7 @@ STATS_FILE = BOT_DIR / "stats.json"
 DEFAULT_CFG = {
     "discord": {"token": "", "guild_id": None},
     "virustotal": {"api_key": "", "enabled": True, "upload_unknown": False},
-    "malwarebazaar": {"enabled": True},
+    "malwarebazaar": {"enabled": True, "auth_key": ""},
     "hybrid_analysis": {"api_key": "", "enabled": True},
     "scanner": {
         "java_path": "java",
@@ -89,6 +89,8 @@ def load_config() -> dict:
         cfg["discord"]["guild_id"] = os.getenv("DISCORD_GUILD_ID")
     if os.getenv("HA_API_KEY"):
         cfg["hybrid_analysis"]["api_key"] = os.getenv("HA_API_KEY")
+    if os.getenv("MB_AUTH_KEY"):
+        cfg["malwarebazaar"]["auth_key"] = os.getenv("MB_AUTH_KEY")
     return cfg
 
 
@@ -381,15 +383,24 @@ MB_API = "https://mb-api.abuse.ch/api/v1/"
 
 
 async def mb_lookup(sha256: str, session: aiohttp.ClientSession) -> Optional[dict]:
-    """Query MalwareBazaar by SHA-256 hash. No API key needed."""
+    """Query MalwareBazaar by SHA-256 hash."""
     if not CFG.get("malwarebazaar", {}).get("enabled", True):
         return None
     permalink = f"https://bazaar.abuse.ch/sample/{sha256}/"
     try:
-        data = aiohttp.FormData()
-        data.add_field("query", "get_info")
-        data.add_field("hash", sha256)
-        async with session.post(MB_API, data=data, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        mb_headers = {}
+        mb_auth = CFG.get("malwarebazaar", {}).get("auth_key", "")
+        if mb_auth:
+            mb_headers["Auth-Key"] = mb_auth
+        async with session.post(
+            MB_API,
+            headers=mb_headers,
+            data=f"query=get_info&hash={sha256}",
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status == 401:
+                log.warning("MalwareBazaar: 401 Unauthorized — auth_key may be required or invalid")
+                return {"status": "error", "permalink": permalink}
             if resp.status != 200:
                 log.warning(f"MalwareBazaar returned {resp.status}")
                 return {"status": "error", "permalink": permalink}
@@ -436,11 +447,11 @@ async def ha_search(sha256: str, session: aiohttp.ClientSession) -> Optional[dic
         "accept": "application/json",
     }
     try:
-        # HA v2 search/hash expects form-encoded data
-        async with session.post(
+        # HA v2 search/hash — use GET (POST is deprecated)
+        async with session.get(
             f"{HA_BASE}/search/hash",
             headers=headers,
-            data={"hash": sha256},
+            params={"hash": sha256},
             timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
             body = await resp.text()
