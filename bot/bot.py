@@ -315,6 +315,28 @@ def sanitize_path(text: str) -> str:
     return result
 
 
+def _clean_class_name(marker: str, class_map: dict) -> str:
+    """Replace unreadable obfuscated class names with clean labels.
+
+    Class names with heavy Unicode (combining chars, invisible chars, Hangul fillers)
+    are unreadable in Discord and look scary. Replace them with 'obfuscated_class_N'.
+    """
+    # Extract class name from "(in <classname>.class)" pattern
+    m = re.search(r'\(in (.+?)\.class\)', marker)
+    if not m:
+        return marker
+    raw_name = m.group(1)
+    # Check if the class name has significant non-ASCII characters
+    non_ascii = sum(1 for c in raw_name if ord(c) > 127)
+    if non_ascii < 3:
+        return marker  # Normal class name, leave it
+    # Map this obfuscated name to a clean label
+    if raw_name not in class_map:
+        class_map[raw_name] = f"obfuscated_class_{len(class_map) + 1}"
+    clean = class_map[raw_name]
+    return marker.replace(f"(in {raw_name}.class)", f"(in {clean}.class)")
+
+
 # ─── Stats Persistence ──────────────────────────────────────────────────────
 
 
@@ -2622,8 +2644,8 @@ def build_embeds(
         high_concern = []  # APIs that are almost always suspicious in mods
         moderate_concern = []  # APIs that are common but worth noting
         other_concern = []  # Everything else worth showing
-        ALWAYS_SUSPICIOUS = ["defineClass", "URLClassLoader", "deleteOnExit", "setAccessible"]
-        CONTEXT_DEPENDENT = ["Runtime.exec", "ProcessBuilder", "System.load", "System.loadLibrary"]
+        ALWAYS_SUSPICIOUS = ["defineClass", "URLClassLoader", "setAccessible"]
+        CONTEXT_DEPENDENT = ["Runtime.exec", "ProcessBuilder", "System.load", "System.loadLibrary", "deleteOnExit"]
         for m in non_lib_markers:
             if any(x in m for x in ALWAYS_SUSPICIOUS):
                 high_concern.append(m)
@@ -2633,20 +2655,24 @@ def build_embeds(
                 other_concern.append(m)
         if high_concern or moderate_concern or other_concern:
             e2 = discord.Embed(title="\U0001F50E Bytecode API Analysis", color=color)
-            lines = ["*Scanned Java bytecode for sensitive API calls. Known library code (LWJGL, FlatLaf, Fabric, etc.) is filtered out — only application code is shown below.*\n"]
+            lines = ["*Scanned Java bytecode for sensitive API calls. Known library code (LWJGL, FlatLaf, Fabric, etc.) is filtered out \u2014 only application code is shown below.*\n"]
+            # Clean up obfuscated class names for readability
+            _obf_map = {}  # shared across all categories so numbering is consistent
             if high_concern:
                 lines.append("**Unusual for mods** (rarely needed by legitimate code):")
                 for m in high_concern[:10]:
-                    # Strip [LIB] tag for display (shouldn't be here but safety)
-                    lines.append(f"\U0001F6A8 {sanitize_path(m.replace('[LIB] ', ''))}")
+                    cleaned = _clean_class_name(sanitize_path(m.replace('[LIB] ', '')), _obf_map)
+                    lines.append(f"\U0001F6A8 {cleaned}")
             if moderate_concern:
                 lines.append("**Context-dependent** (normal for installers/launchers, also used by malware):")
                 for m in moderate_concern[:10]:
-                    lines.append(f"\u26A0 {sanitize_path(m.replace('[LIB] ', ''))}")
+                    cleaned = _clean_class_name(sanitize_path(m.replace('[LIB] ', '')), _obf_map)
+                    lines.append(f"\u26A0 {cleaned}")
             if other_concern:
                 lines.append("**Other API references:**")
                 for m in other_concern[:8]:
-                    lines.append(f"\u2022 {sanitize_path(m.replace('[LIB] ', ''))}")
+                    cleaned = _clean_class_name(sanitize_path(m.replace('[LIB] ', '')), _obf_map)
+                    lines.append(f"\u2022 {cleaned}")
             total = len(high_concern) + len(moderate_concern) + len(other_concern)
             if total > 28:
                 lines.append(f"*... and {total - 28} more*")

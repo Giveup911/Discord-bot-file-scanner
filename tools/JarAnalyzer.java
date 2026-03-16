@@ -1564,7 +1564,7 @@ public class JarAnalyzer {
         dangerousRefs.put("java/lang/System\u0001loadLibrary", "System.loadLibrary() native library loading");
         dangerousRefs.put("java/lang/reflect/Field\u0001setAccessible", "Field.setAccessible() access bypass");
         dangerousRefs.put("java/io/File\u0001delete", "File.delete() file deletion");
-        dangerousRefs.put("java/io/File\u0001deleteOnExit", "File.deleteOnExit() deferred deletion (anti-forensics)");
+        dangerousRefs.put("java/io/File\u0001deleteOnExit", "File.deleteOnExit() deferred file deletion on JVM exit");
 
         // Track non-library hits separately for combo detection
         boolean nonLibURLClassLoader = false, nonLibDefineClass = false;
