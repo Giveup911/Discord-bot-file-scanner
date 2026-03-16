@@ -264,6 +264,15 @@ The main orchestration function `run_scan()`:
 - Semaphore-based concurrency limiter
 - Configurable max concurrent scans (default 3)
 - Tracks pending vs active count for status display
+- Live-updating queue position messages (auto-deleted when scan starts)
+- `on_dequeue` callback for cleanup when scan leaves the queue
+
+#### User-Installable App Support
+- Configurable `integration_types` and `contexts` on all slash commands
+- `allow_user_install` — registers commands with `IntegrationType.user_install`
+- `allow_dms` — adds `InteractionContextType.private_channel` and `bot_dm` contexts
+- `allow_external_guilds` — works in servers without the bot installed (via user install)
+- `debug_guilds` automatically disabled when `allow_user_install` is true (they're incompatible)
 
 ---
 

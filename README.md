@@ -21,6 +21,8 @@ Built for the Minecraft community but works on any file type.
 - **Zero trust on file extensions** — all detection is magic-byte based
 - **Tor integration** — URL downloads routed through Tor for operator safety
 - **SSRF protection** — blocks private IPs, loopback, link-local, CGNAT, cloud metadata via DNS resolution checks
+- **User-installable app** — add to your profile and use `/giverat` in any server or DMs
+- **Smart scan queue** — handles 3 concurrent scans, queues the rest with live position updates
 
 ---
 
@@ -66,6 +68,14 @@ python bot.py
 ```
 
 Use `/giverat` in your Discord server — attach a file or paste a URL.
+
+To enable the bot as a **user-installable app** (works in any server + DMs), add to `config.yml`:
+```yaml
+discord:
+  allow_user_install: true   # let users add bot to their profile
+  allow_dms: true            # accept /giverat in DMs
+  allow_external_guilds: true # work in servers without the bot installed
+```
 
 ### Option B: CLI (no bot needed)
 
@@ -179,6 +189,22 @@ scanner:
 5. Go to **OAuth2 > URL Generator**, select `bot` + `applications.commands`
 6. Select permissions: `Send Messages`, `Attach Files`, `Embed Links`, `Use Slash Commands`
 7. Copy the invite URL and add the bot to your server
+
+#### User-Installable App (optional)
+
+To let users install the bot to their **profile** (works in any server with external apps + DMs):
+
+1. In the Discord Developer Portal, go to **Installation**
+2. Enable **User Install** alongside Guild Install
+3. Under **Install Link**, select "Discord Provided Link"
+4. In `config.yml`, set:
+   ```yaml
+   discord:
+     allow_user_install: true
+     allow_dms: true
+     allow_external_guilds: true
+   ```
+5. Share the install link — users can add the bot to their account and use `/giverat` anywhere
 
 ### 2. Configure
 

@@ -5,6 +5,12 @@ discord:
   token: "YOUR_BOT_TOKEN_HERE"
   # Optional: restrict to a specific guild for faster slash command registration
   # guild_id: "123456789012345678"
+  # Allow users to install the bot to their account (works in any server with external apps)
+  allow_user_install: false
+  # Allow the bot to receive commands in DMs
+  allow_dms: false
+  # Allow the bot to work in servers it hasn't been added to (via user install)
+  allow_external_guilds: false
 
 virustotal:
   api_key: "YOUR_VT_API_KEY_HERE"

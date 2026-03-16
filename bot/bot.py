@@ -54,7 +54,13 @@ MASTER_DIR = BOT_DIR.parent
 TOOLS_DIR = MASTER_DIR / "tools"
 STATS_FILE = BOT_DIR / "stats.json"
 DEFAULT_CFG = {
-    "discord": {"token": "", "guild_id": None},
+    "discord": {
+        "token": "",
+        "guild_id": None,
+        "allow_user_install": False,
+        "allow_dms": False,
+        "allow_external_guilds": False,
+    },
     "virustotal": {"api_key": "", "enabled": True, "upload_unknown": False},
     "malwarebazaar": {"enabled": True, "auth_key": ""},
     "hybrid_analysis": {"api_key": "", "enabled": True},
@@ -444,40 +450,43 @@ async def mb_upload(filepath: str, sha256: str, session: aiohttp.ClientSession,
         if comment:
             json_meta["context"] = {"comment": comment[:500]}
 
-        data = aiohttp.FormData()
-        data.add_field("json_data", json.dumps(json_meta), content_type="application/json")
-        data.add_field(
-            "file",
-            open(filepath, "rb"),
-            filename=os.path.basename(filepath),
-            content_type="application/octet-stream",
-        )
-        async with session.post(
-            MB_API,
-            headers={"Auth-Key": mb_auth},
-            data=data,
-            timeout=aiohttp.ClientTimeout(total=60),
-        ) as resp:
-            body = await resp.text()
-            if resp.status == 200:
-                try:
-                    result = json.loads(body)
-                except Exception:
-                    result = {}
-                status = result.get("query_status", "")
-                if status == "ok":
-                    log.info(f"MalwareBazaar: sample uploaded successfully ({sha256})")
-                    return {"status": "uploaded", "permalink": permalink,
-                            "sha256_hash": result.get("data", [{}])[0].get("sha256_hash", sha256)}
-                elif "already" in status.lower() or "exists" in body.lower():
-                    log.info(f"MalwareBazaar: sample already exists ({sha256})")
-                    return {"status": "already_exists", "permalink": permalink}
+        fh = open(filepath, "rb")
+        try:
+            data = aiohttp.FormData()
+            data.add_field("json_data", json.dumps(json_meta), content_type="application/json")
+            data.add_field(
+                "file", fh,
+                filename=os.path.basename(filepath),
+                content_type="application/octet-stream",
+            )
+            async with session.post(
+                MB_API,
+                headers={"Auth-Key": mb_auth},
+                data=data,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                body = await resp.text()
+                if resp.status == 200:
+                    try:
+                        result = json.loads(body)
+                    except Exception:
+                        result = {}
+                    status = result.get("query_status", "")
+                    if status == "ok":
+                        log.info(f"MalwareBazaar: sample uploaded successfully ({sha256})")
+                        return {"status": "uploaded", "permalink": permalink,
+                                "sha256_hash": result.get("data", [{}])[0].get("sha256_hash", sha256)}
+                    elif "already" in status.lower() or "exists" in body.lower():
+                        log.info(f"MalwareBazaar: sample already exists ({sha256})")
+                        return {"status": "already_exists", "permalink": permalink}
+                    else:
+                        log.warning(f"MalwareBazaar upload query_status: {status} — {body[:200]}")
+                        return {"status": "upload_failed", "permalink": permalink, "detail": status}
                 else:
-                    log.warning(f"MalwareBazaar upload query_status: {status} — {body[:200]}")
-                    return {"status": "upload_failed", "permalink": permalink, "detail": status}
-            else:
-                log.warning(f"MalwareBazaar upload returned {resp.status}: {body[:200]}")
-                return {"status": "upload_failed", "permalink": permalink, "detail": f"HTTP {resp.status}"}
+                    log.warning(f"MalwareBazaar upload returned {resp.status}: {body[:200]}")
+                    return {"status": "upload_failed", "permalink": permalink, "detail": f"HTTP {resp.status}"}
+        finally:
+            fh.close()
     except Exception as e:
         log.warning(f"MalwareBazaar upload failed: {e}")
         return {"status": "upload_failed", "permalink": permalink, "detail": str(e)}
@@ -2692,6 +2701,10 @@ def extract_files_from_zip(zip_path: str, extract_to: str, depth: int = 0, max_e
                         if not safe_name:
                             safe_name = f"nested_{depth}_{len(extracted)}"
                         dest = os.path.join(extract_to, f"depth{depth}_{safe_name}")
+                        # Zip slip protection: ensure dest stays within extract_to
+                        if not os.path.abspath(dest).startswith(os.path.abspath(extract_to)):
+                            log.warning(f"Zip slip blocked: {entry} -> {dest}")
+                            continue
                         with open(dest, "wb") as dst:
                             dst.write(data)
                         extracted.append(dest)
@@ -3061,6 +3074,9 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
                 # Check final URL after redirects
                 final_url = str(head_resp.url)
                 final_parsed = urlparse(final_url)
+                # Block non-HTTP(S) schemes after redirect (C2 fix)
+                if final_parsed.scheme not in ("http", "https"):
+                    raise ValueError(f"Redirect to unsafe scheme: {final_parsed.scheme}")
                 final_host = final_parsed.hostname or ""
                 final_block = _is_blocked_host(final_host)
                 if final_block:
@@ -3099,6 +3115,8 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
             # Re-check final URL after GET redirects
             final_url = str(resp.url)
             final_parsed = urlparse(final_url)
+            if final_parsed.scheme not in ("http", "https"):
+                raise ValueError(f"Redirect to unsafe scheme: {final_parsed.scheme}")
             final_host = final_parsed.hostname or ""
             final_block = _is_blocked_host(final_host)
             if final_block:
@@ -3125,17 +3143,31 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
                 match = re.search(r'filename[*]?=["\']?([^"\';]+)', cd)
                 if match:
                     cd_name = re.sub(r"[^\w.\-]", "_", match.group(1))[:100]
+                    # Block Windows reserved device names
+                    stem = cd_name.split(".")[0].upper()
+                    _WIN_RESERVED = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
+                                     "LPT1", "LPT2", "LPT3", "CLOCK$"}
+                    if stem in _WIN_RESERVED:
+                        cd_name = f"_{cd_name}"
                     if cd_name:
                         display_name = cd_name
                         dl_path = os.path.join(work_dir, display_name)
 
             total = 0
-            async with aiofiles.open(dl_path, "wb") as f:
-                async for chunk in resp.content.iter_chunked(65536):
-                    total += len(chunk)
-                    if total > MAX_URL_DOWNLOAD:
-                        raise ValueError(f"File too large (>{MAX_URL_DOWNLOAD / 1024 / 1024:.0f} MB)")
-                    await f.write(chunk)
+            try:
+                async with aiofiles.open(dl_path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(65536):
+                        total += len(chunk)
+                        if total > MAX_URL_DOWNLOAD:
+                            raise ValueError(f"File too large (>{MAX_URL_DOWNLOAD / 1024 / 1024:.0f} MB)")
+                        await f.write(chunk)
+            except Exception:
+                # Clean up partial file on error
+                try:
+                    os.unlink(dl_path)
+                except OSError:
+                    pass
+                raise
 
     if use_tor and AIOHTTP_SOCKS_AVAILABLE:
         log.info(f"Downloaded via Tor: {display_name} ({total} bytes)")
@@ -3154,6 +3186,7 @@ class ScanQueue:
         self._pending = 0
         self._active = 0
         self._lock = asyncio.Lock()
+        self._waiters: list[asyncio.Event] = []
 
     @property
     def pending(self):
@@ -3163,16 +3196,33 @@ class ScanQueue:
     def active(self):
         return self._active
 
-    async def submit(self, coro):
+    async def submit(self, coro, on_dequeue=None):
+        """Submit a coroutine to the scan queue.
+        on_dequeue is called (if provided) when the scan leaves the queue and starts running.
+        """
         entered_sem = False
         async with self._lock:
             self._pending += 1
+            evt = asyncio.Event()
+            self._waiters.append(evt)
         try:
             async with self._sem:
                 async with self._lock:
                     self._pending -= 1
                     self._active += 1
                     entered_sem = True
+                    if evt in self._waiters:
+                        self._waiters.remove(evt)
+                    evt.set()
+                    # Notify remaining waiters so they can update position
+                    for w in self._waiters:
+                        w.set()
+                        w.clear()
+                if on_dequeue:
+                    try:
+                        await on_dequeue()
+                    except Exception:
+                        pass
                 try:
                     return await coro
                 finally:
@@ -3183,7 +3233,16 @@ class ScanQueue:
                 async with self._lock:
                     if self._pending > 0:
                         self._pending -= 1
+                    if evt in self._waiters:
+                        self._waiters.remove(evt)
             raise
+
+    def position_of(self, evt: asyncio.Event) -> int:
+        """Return 1-based queue position for the given event, or 0 if not queued."""
+        try:
+            return self._waiters.index(evt) + 1
+        except ValueError:
+            return 0
 
 
 # ─── Cooldown Tracker ────────────────────────────────────────────────────────
@@ -3208,8 +3267,31 @@ def check_and_set_cooldown(user_id: int) -> Optional[int]:
 # ─── Bot ─────────────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
+if CFG["discord"].get("allow_dms", False):
+    intents.dm_messages = True
 bot = discord.Bot(intents=intents)
 scan_queue = ScanQueue(CFG["scanner"]["max_concurrent_scans"])
+
+# ─── Build integration_types / contexts for slash commands ───────────────────
+
+def _build_command_install_params() -> dict:
+    """Return kwargs (integration_types, contexts) for slash_command decorators."""
+    params = {}
+    itypes = {discord.IntegrationType.guild_install}
+    ctxs = {discord.InteractionContextType.guild}
+    if CFG["discord"].get("allow_user_install", False):
+        itypes.add(discord.IntegrationType.user_install)
+    if CFG["discord"].get("allow_dms", False):
+        ctxs.add(discord.InteractionContextType.private_channel)
+        ctxs.add(discord.InteractionContextType.bot_dm)
+    if CFG["discord"].get("allow_external_guilds", False):
+        # guild context already included; user_install handles external guilds
+        pass
+    params["integration_types"] = itypes
+    params["contexts"] = ctxs
+    return params
+
+_install_params = _build_command_install_params()
 http_session: Optional[aiohttp.ClientSession] = None
 _ready_fired = False
 
@@ -3252,7 +3334,7 @@ async def update_presence():
 
 # ─── /giverat command ────────────────────────────────────────────────────────
 
-@bot.slash_command(name="giverat", description="Scan a file for RAT/malware signatures")
+@bot.slash_command(name="giverat", description="Scan a file for RAT/malware signatures", **_install_params)
 async def giverat_command(
     ctx: discord.ApplicationContext,
     file: discord.Option(
@@ -3298,19 +3380,71 @@ async def giverat_command(
         ephemeral=True,
     )
 
-    # queue position
-    if scan_queue.pending > 0:
-        await ctx.followup.send(
-            f"Queued \u2014 {scan_queue.pending} scan(s) ahead, {scan_queue.active} active.",
-            ephemeral=True,
-        )
+    # ── Queue with live position updates ──
+    queue_msg = None  # public message showing queue position
+
+    # Determine where to send messages (works in DMs and guilds)
+    send_channel = ctx.channel
+
+    if scan_queue.active >= scan_queue._sem._value:
+        # Scan will be queued — send a live-updating queue position message
+        try:
+            queue_msg = await send_channel.send(
+                f"Scan `{display_name}` by {ctx.author.mention} is queued — "
+                f"position **{scan_queue.pending + 1}**, {scan_queue.active} active scan(s)."
+            )
+        except Exception:
+            pass
+
+        # Background task to keep updating the queue message
+        async def _update_queue_msg():
+            nonlocal queue_msg
+            if queue_msg is None:
+                return
+            while True:
+                await asyncio.sleep(3)
+                pos = scan_queue.pending
+                if pos <= 0:
+                    break
+                try:
+                    await queue_msg.edit(
+                        content=(
+                            f"Scan `{display_name}` by {ctx.author.mention} is queued — "
+                            f"position **{pos}**, {scan_queue.active} active scan(s)."
+                        )
+                    )
+                except Exception:
+                    break
+
+        update_task = asyncio.create_task(_update_queue_msg())
+    else:
+        update_task = None
+
+    async def _on_dequeue():
+        """Called when scan leaves queue and starts running — delete queue message."""
+        nonlocal queue_msg
+        if update_task is not None:
+            update_task.cancel()
+        if queue_msg is not None:
+            try:
+                await queue_msg.delete()
+            except Exception:
+                pass
+            queue_msg = None
 
     try:
-        await scan_queue.submit(run_scan(ctx, file, url, scan_id))
+        await scan_queue.submit(run_scan(ctx, file, url, scan_id), on_dequeue=_on_dequeue)
     except Exception as e:
         log.exception("Scan failed")
+        if update_task is not None:
+            update_task.cancel()
+        if queue_msg is not None:
+            try:
+                await queue_msg.delete()
+            except Exception:
+                pass
         try:
-            await ctx.channel.send(
+            await send_channel.send(
                 embed=discord.Embed(
                     title="Scan Failed",
                     description=f"```{sanitize_path(str(e)[:1000])}```",
@@ -3323,7 +3457,7 @@ async def giverat_command(
 
 # ─── /stats command ──────────────────────────────────────────────────────────
 
-@bot.slash_command(name="stats", description="Show scanner statistics")
+@bot.slash_command(name="stats", description="Show scanner statistics", **_install_params)
 async def stats_command(ctx: discord.ApplicationContext):
     e = discord.Embed(title="\U0001F4CA Scanner Statistics", color=0x3498DB)
     e.add_field(name="Total Scans", value=str(scan_stats["total_scans"]), inline=True)
@@ -3343,9 +3477,9 @@ async def stats_command(ctx: discord.ApplicationContext):
 
 # ─── /reload command ─────────────────────────────────────────────────────────
 
-@bot.slash_command(name="reload", description="Reload YARA rules (admin only)")
+@bot.slash_command(name="reload", description="Reload YARA rules (admin only)", **_install_params)
 async def reload_command(ctx: discord.ApplicationContext):
-    if not ctx.author.guild_permissions.administrator:
+    if not ctx.guild or not hasattr(ctx.author, "guild_permissions") or not ctx.author.guild_permissions.administrator:
         return await ctx.respond("Admin only.", ephemeral=True)
     load_yara_rules()
     await ctx.respond(f"YARA rules reloaded. {YARA_RULES is not None}", ephemeral=True)
@@ -3353,7 +3487,7 @@ async def reload_command(ctx: discord.ApplicationContext):
 
 # ─── /save command ───────────────────────────────────────────────────────────
 
-@bot.slash_command(name="save", description="Toggle saving scanned files to disk (admin only)")
+@bot.slash_command(name="save", description="Toggle saving scanned files to disk (admin only)", **_install_params)
 async def save_command(
     ctx: discord.ApplicationContext,
     enabled: discord.Option(
@@ -3362,7 +3496,7 @@ async def save_command(
         required=True,
     ),
 ):
-    if not ctx.author.guild_permissions.administrator:
+    if not ctx.guild or not hasattr(ctx.author, "guild_permissions") or not ctx.author.guild_permissions.administrator:
         return await ctx.respond("Admin only.", ephemeral=True)
     CFG["scanner"]["save_samples"] = enabled
     status = "enabled" if enabled else "disabled"
@@ -3938,23 +4072,19 @@ def _find_tor_exe() -> Optional[str]:
     if tor_path.exists():
         return str(tor_path)
     # Also check if tor is on PATH
-    if shutil.which("tor"):
-        return shutil.which("tor")
-    return None
+    return shutil.which("tor")
 
 
 def _is_tor_running(proxy: str) -> bool:
     """Quick check if Tor SOCKS proxy is already listening."""
     import socket
     try:
-        # Parse host:port from socks5://host:port
-        parts = proxy.replace("socks5://", "").replace("socks5h://", "")
-        host, port = parts.rsplit(":", 1)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(2)
-        result = sock.connect_ex((host, int(port)))
-        sock.close()
-        return result == 0
+        parsed = urlparse(proxy)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 9050
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(2)
+            return sock.connect_ex((host, port)) == 0
     except Exception:
         return False
 
@@ -3982,11 +4112,11 @@ def start_tor():
 
     log.info(f"Starting Tor from {tor_exe}...")
     try:
-        # Launch Tor as a background process
+        # Launch Tor as a background process (DEVNULL prevents pipe buffer deadlock)
         _tor_process = subprocess.Popen(
             [tor_exe],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             cwd=str(Path(tor_exe).parent),
         )
         # Wait for Tor to bootstrap (check every second, up to 30s)
@@ -3997,8 +4127,7 @@ def start_tor():
                 return
             # Check if process died
             if _tor_process.poll() is not None:
-                stderr = _tor_process.stderr.read().decode(errors="replace")[:500]
-                log.error(f"Tor process exited with code {_tor_process.returncode}: {stderr}")
+                log.error(f"Tor process exited with code {_tor_process.returncode}")
                 _tor_process = None
                 return
         log.warning("Tor started but proxy not responding after 30s — URL downloads may fail")
@@ -4037,7 +4166,9 @@ if __name__ == "__main__":
         sys.exit(1)
 
     guild_id = CFG["discord"].get("guild_id")
-    if guild_id:
+    # debug_guilds is incompatible with integration_types/contexts (user-installable apps)
+    # Only set it when user_install is disabled
+    if guild_id and not CFG["discord"].get("allow_user_install", False):
         try:
             bot.debug_guilds = [int(guild_id)]
         except (ValueError, TypeError):
