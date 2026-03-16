@@ -3119,7 +3119,7 @@ def package_logs(log_dir: str, work_dir: str, mod_name: str) -> list[str]:
                 skipped.append(rel)
 
     if skipped:
-        log.info(f"Stripped {len(skipped)} binary/malicious file(s) from output: {skipped[:10]}")
+        log.info(f"Stripped {len(skipped)} non-source file(s) from output: {skipped[:10]}")
 
     if not all_files:
         return []
@@ -4414,16 +4414,25 @@ async def run_scan(
             if scan_msg:
                 await scan_msg.edit(content=f"Scan requested by {ctx.author.mention}", embeds=embeds)
                 if files_to_send:
-                    try:
-                        await safe_send(files=files_to_send, reference=discord.MessageReference.from_message(scan_msg))
-                    except (TypeError, Exception):
-                        await safe_send(files=files_to_send)
+                    # Discord limits to 10 files per message — batch if needed
+                    for i in range(0, len(files_to_send), 10):
+                        batch = files_to_send[i:i + 10]
+                        try:
+                            await safe_send(files=batch, reference=discord.MessageReference.from_message(scan_msg))
+                        except (TypeError, Exception):
+                            await safe_send(files=batch)
             else:
+                # First message: embeds + up to 10 files
+                first_batch = files_to_send[:10]
                 await safe_send(
                     content=f"Scan requested by {ctx.author.mention}",
                     embeds=embeds,
-                    files=files_to_send,
+                    files=first_batch,
                 )
+                # Remaining files in follow-up messages
+                for i in range(10, len(files_to_send), 10):
+                    batch = files_to_send[i:i + 10]
+                    await safe_send(files=batch)
         finally:
             for f_obj in files_to_send:
                 try:
