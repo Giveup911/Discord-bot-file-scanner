@@ -4105,6 +4105,26 @@ async def run_scan(
         else:
             jars_to_scan.append(dl_path)
 
+        # ── Primary file for external API lookups ──
+        # When a ZIP wraps an inner file (JAR, EXE, etc.), use the inner file's
+        # hash for VT/MB/HA since analysts submit the payload, not the wrapper ZIP.
+        primary_path = dl_path  # file to upload to VT/HA
+        primary_hashes = hashes  # hashes to query VT/MB/HA
+        primary_sha256 = sha256
+        is_wrapper_zip = False
+
+        if is_zip and dl_path.lower().endswith(".zip"):
+            inner_files = [f for f in (jars_to_scan + extracted_files) if f != dl_path and f != dl_path + ".jar"]
+            if inner_files:
+                # Use the first extracted file as the primary for API lookups
+                primary_path = inner_files[0]
+                primary_hashes = await asyncio.to_thread(compute_hashes, primary_path)
+                primary_sha256 = primary_hashes["sha256"]
+                is_wrapper_zip = True
+                inner_name = os.path.basename(primary_path)
+                log.info(f"[{scan_id}] ZIP wrapper detected — using inner file '{inner_name}' "
+                         f"(SHA256={primary_sha256[:16]}...) for API lookups")
+
         # ── JarAnalyzer ──
         all_iocs = None
         all_analysis = None
@@ -4206,15 +4226,15 @@ async def run_scan(
             await update_progress(stages, filename, file_size, hashes)
             # Send pending VT message
             vt_msg = await safe_send(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "~30s", scan_id))
-            vt_result = await vt_lookup(sha256, http_session)
+            vt_result = await vt_lookup(primary_sha256, http_session)
             if vt_result is None:
                 if vt_msg:
                     await vt_msg.edit(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "uploading ~2-3min", scan_id))
-                vt_result = await vt_upload(dl_path, sha256, http_session)
+                vt_result = await vt_upload(primary_path, primary_sha256, http_session)
             stages["VirusTotal"] = "complete"
             # Update VT message with results
             if vt_result and vt_msg:
-                await vt_msg.edit(embed=build_vt_embed(vt_result, sha256, scan_id))
+                await vt_msg.edit(embed=build_vt_embed(vt_result, primary_sha256, scan_id))
             await update_progress(stages, filename, file_size, hashes)
 
         # ── Send pending messages for parallel services ──
@@ -4235,13 +4255,13 @@ async def run_scan(
         api_tasks = {}
         if http_session and mb_enabled:
             stages["MalwareBazaar"] = "running"
-            api_tasks["mb"] = asyncio.create_task(mb_lookup(sha256, http_session))
+            api_tasks["mb"] = asyncio.create_task(mb_lookup(primary_sha256, http_session))
         if http_session and ha_enabled:
             stages["Hybrid Analysis"] = "running"
-            api_tasks["ha"] = asyncio.create_task(ha_search_or_submit(sha256, dl_path, http_session))
+            api_tasks["ha"] = asyncio.create_task(ha_search_or_submit(primary_sha256, primary_path, http_session))
         if http_session and vt_enabled and vt_result:
             stages["VT Sandbox"] = "running"
-            api_tasks["vt_sb"] = asyncio.create_task(vt_get_sandbox_links(sha256, http_session))
+            api_tasks["vt_sb"] = asyncio.create_task(vt_get_sandbox_links(primary_sha256, http_session))
         if api_tasks:
             await update_progress(stages, filename, file_size, hashes)
 
@@ -4251,18 +4271,18 @@ async def run_scan(
                 mb_result = await api_tasks["mb"]
             except Exception as exc:
                 log.warning(f"MalwareBazaar task failed: {exc}")
-                mb_result = {"status": "error", "permalink": f"https://bazaar.abuse.ch/sample/{sha256}/"}
+                mb_result = {"status": "error", "permalink": f"https://bazaar.abuse.ch/sample/{primary_sha256}/"}
             stages["MalwareBazaar"] = "complete"
             if mb_result and mb_result.get("status") == "found":
                 await update_stats(mb_hits=1)
             if mb_msg:
                 try:
-                    await mb_msg.edit(embed=build_mb_embed(mb_result, sha256, scan_id))
+                    await mb_msg.edit(embed=build_mb_embed(mb_result, primary_sha256, scan_id))
                 except discord.HTTPException:
                     pass
         elif mb_msg:
             try:
-                await mb_msg.edit(embed=build_mb_embed(None, sha256, scan_id))
+                await mb_msg.edit(embed=build_mb_embed(None, primary_sha256, scan_id))
             except discord.HTTPException:
                 pass
 
@@ -4275,7 +4295,7 @@ async def run_scan(
             stages["Hybrid Analysis"] = "complete"
             if ha_msg:
                 try:
-                    await ha_msg.edit(embed=build_ha_embed(ha_result, sha256, scan_id))
+                    await ha_msg.edit(embed=build_ha_embed(ha_result, primary_sha256, scan_id))
                 except discord.HTTPException:
                     pass
 
@@ -4284,13 +4304,13 @@ async def run_scan(
             stages["VT Sandbox"] = "complete"
             if vt_sb_msg:
                 try:
-                    await vt_sb_msg.edit(embed=build_vt_sandbox_embed(vt_sandbox, sha256, scan_id))
+                    await vt_sb_msg.edit(embed=build_vt_sandbox_embed(vt_sandbox, primary_sha256, scan_id))
                 except discord.HTTPException:
                     pass
         elif vt_sb_msg:
             # No VT result to query sandbox for
             try:
-                await vt_sb_msg.edit(embed=build_vt_sandbox_embed(None, sha256, scan_id))
+                await vt_sb_msg.edit(embed=build_vt_sandbox_embed(None, primary_sha256, scan_id))
             except discord.HTTPException:
                 pass
 
@@ -4332,7 +4352,7 @@ async def run_scan(
             if yara_matches:
                 mb_tags.extend(m["rule"] for m in yara_matches[:5])
             comment = f"Auto-submitted by RATScanner (score {score}/100, {level})"
-            upload_result = await mb_upload(dl_path, sha256, http_session, tags=mb_tags, comment=comment)
+            upload_result = await mb_upload(primary_path, primary_sha256, http_session, tags=mb_tags, comment=comment)
             if upload_result:
                 mb_result = upload_result
                 if mb_msg:

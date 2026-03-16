@@ -143,7 +143,8 @@ public class JarAnalyzer {
         CFG.setProperty("donut.dupe.rawstrings", "polygon-rpc.com|epqfgikdhiuzuybl|cwmhwqsenglvcost|glcqksioqxlglmmb");
 
         // VAPE_CURIUM detection
-        CFG.setProperty("vape.curium.classes", "TextureAtlasCache|ShaderCompileCache|ChunkMeshPool|StateTracker|NetworkManager");
+        // NetworkManager removed — too common in legitimate mods (every Fabric/Forge networking mod has one)
+        CFG.setProperty("vape.curium.classes", "TextureAtlasCache|ShaderCompileCache|ChunkMeshPool");
         CFG.setProperty("vape.curium.rawstrings", "curium|boobility|daddydex|fabric-perf-tweaks|lazydfu");
         CFG.setProperty("vape.curium.packages", "com_curium|com/curium");
 
@@ -1015,7 +1016,7 @@ public class JarAnalyzer {
         System.out.println(BOLD + GREEN + "  " + jarName + "_config.log" + RESET);
         System.out.println(BOLD + GREEN + "  " + jarName + "_iocs.json" + RESET);
         System.out.println(BOLD + GREEN + "  source/ (full decompiled source)" + RESET);
-        System.out.println(BOLD + GREEN + "  main/ (main malware source)" + RESET);
+        System.out.println(BOLD + GREEN + "  main/ (main application source)" + RESET);
         System.out.println(BOLD + GREEN + "  main/important/ (C2/config code)" + RESET);
         System.out.println(BOLD + GREEN + "  analysis.txt" + RESET);
         } finally {
@@ -1240,13 +1241,19 @@ public class JarAnalyzer {
                 return Variant.VAPE_CURIUM;
             }
         }
+        int curiumClassHits = 0;
         for (String cls : cfgArr("vape.curium.classes")) {
             for (String n : names) {
                 if (!cls.isEmpty() && n.contains(cls)) {
-                    ilog("  → Vape Curium: class '" + n + "' matched hint '" + cls + "'");
-                    return Variant.VAPE_CURIUM;
+                    curiumClassHits++;
+                    ilog("  → Vape Curium candidate: class '" + n + "' matched hint '" + cls + "'");
+                    break; // count each pattern once
                 }
             }
+        }
+        if (curiumClassHits >= 2) {
+            ilog("  → Vape Curium: " + curiumClassHits + " signature classes matched");
+            return Variant.VAPE_CURIUM;
         }
         for (byte[] classData : classes.values()) {
             String ascii = new String(classData, StandardCharsets.US_ASCII);
@@ -1951,7 +1958,7 @@ public class JarAnalyzer {
         }
 
         // Fallback: write what we know
-        writeUnknownConfigLog(jarPath, jarSha256, ts, markers, "Could not decrypt config");
+        writeUnknownConfigLog(jarPath, jarSha256, ts, markers, "No known malware config found");
         exportGenericIocsJson(jarPath, jarSha256, "unknown", markers, extractedUrls, new LinkedHashMap<>());
         warn("RESULT: PARTIAL — config.log has partial info");
     }
@@ -4329,7 +4336,7 @@ public class JarAnalyzer {
                                   boolean hasTrailingSlash) {
         try (PrintWriter w = new PrintWriter(new FileWriter(outDir.resolve("analysis.txt").toFile()))) {
             w.println("═══════════════════════════════════════════════════════════");
-            w.println("MALWARE ANALYSIS REPORT");
+            w.println("FILE ANALYSIS REPORT");
             w.println("═══════════════════════════════════════════════════════════");
             w.println();
             w.println("File: " + Paths.get(jarPath).getFileName());
@@ -4457,7 +4464,7 @@ public class JarAnalyzer {
                 w.println("   - JAR uses trailing '/' trick on .class entries to evade decompilers");
             w.println("2. Decompiled using " + decompilerUsed + " decompiler");
             w.println("   - Full source written to source/ directory");
-            w.println("   - Main malware code copied to main/ directory");
+            w.println("   - Main application code copied to main/ directory");
             w.println("   - C2/config code highlighted in main/important/ directory");
             if (configRaw != null)
                 w.println("3. Found and decrypted embedded configuration file");
@@ -4492,7 +4499,7 @@ public class JarAnalyzer {
             w.println("──── OUTPUT FILES ────");
             w.println();
             w.println("  source/           Full decompiled Java source code");
-            w.println("  main/             Main malware source files (non-library)");
+            w.println("  main/             Main application source files (non-library)");
             w.println("  main/important/   C2, config, and crypto code specifically");
             w.println("  analysis.txt      This report");
             w.println("  *_info.log        Detailed analysis log");
