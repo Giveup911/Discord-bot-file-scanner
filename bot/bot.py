@@ -410,7 +410,10 @@ def run_yara(filepath: str) -> list[dict]:
     if YARA_RULES is None:
         return []
     try:
-        matches = YARA_RULES.match(filepath, timeout=60)
+        # Suppress stdout from YARA console module (some rules use console.log/console.hex)
+        import io, contextlib
+        with contextlib.redirect_stdout(io.StringIO()):
+            matches = YARA_RULES.match(filepath, timeout=60)
         return [{"rule": m.rule, "tags": m.tags, "meta": m.meta} for m in matches]
     except Exception as e:
         log.warning(f"YARA scan error: {e}")
@@ -1793,10 +1796,16 @@ def detect_obfuscators(jar_path: str) -> list[str]:
 
             unicode_names = sum(1 for n in class_names if any(ord(c) > 127 for c in n))
             if unicode_names > 5:
+                # Check for Skidfuscator: uses Hangul fillers (ᅠ U+3164, ㅤ U+3164, ᅟ U+115F)
+                # and invisible/zero-width joiners as class name identifiers
+                hangul_names = sum(1 for n in class_names if any(
+                    ord(c) in (0x3164, 0x115F, 0x1160, 0xFFA0, 0x2800, 0xFF9E, 0x3000) for c in n))
                 # Check for DashO's combining character pattern (U+0300-U+036F, zero-width)
                 dasho_chars = sum(1 for n in class_names if any(
                     0x0300 <= ord(c) <= 0x036F or ord(c) in (0x200B, 0x200C, 0x200D, 0xFEFF) for c in n))
-                if dasho_chars > 3:
+                if hangul_names > 3:
+                    found.add("Skidfuscator (Hangul/invisible chars)")
+                elif dasho_chars > 3:
                     found.add("DashO (Unicode combining chars)")
                 else:
                     found.add("Unicode class names")
@@ -1955,10 +1964,13 @@ def compute_risk_score(
             m for m in markers
             if m not in high_risk_markers and (
                 not m.startswith("Bytecode API ref:")
-                or any(x in m for x in [
-                    "Runtime.exec", "ProcessBuilder", "defineClass",
-                    "URLClassLoader", "System.load",
-                ])
+                or (
+                    "[LIB]" not in m  # Skip library-origin bytecode refs
+                    and any(x in m for x in [
+                        "Runtime.exec", "ProcessBuilder", "defineClass",
+                        "URLClassLoader",
+                    ])
+                )
             )
         ]
         score += min(len(non_library_markers), 10)
@@ -2213,14 +2225,30 @@ def build_embeds(
     zip_bomb_warning: str = None,
     format_analysis: dict = None,
     deobfuscation: dict = None,
+    mb_result: dict = None,
 ) -> list[discord.Embed]:
     embeds = []
     emoji = LEVEL_EMOJI.get(level, "")
     budget = [MAX_EMBED_TOTAL]  # mutable list so _safe_add_field can decrement
 
     # — Main embed —
+    # Build a brief description of what was analyzed
+    scan_steps = ["hash checked against threat databases"]
+    if iocs:
+        scan_steps.append("Java bytecode decompiled and inspected")
+    if yara_matches:
+        scan_steps.append(f"{len(yara_matches)} YARA rule(s) matched")
+    if vt and vt.get("total", 0) > 0:
+        scan_steps.append("checked VirusTotal")
+    if mb_result and mb_result.get("status") == "found":
+        scan_steps.append("found in MalwareBazaar")
+    elif mb_result:
+        scan_steps.append("not found in MalwareBazaar")
+    scan_desc = "Analyzed: " + ", ".join(scan_steps) + "."
+
     e = discord.Embed(
         title=f"{emoji} Scan Results: {filename[:70]}",
+        description=scan_desc,
         color=color,
         timestamp=datetime.now(timezone.utc),
     )
@@ -2230,11 +2258,11 @@ def build_embeds(
     bar_empty = 10 - bar_filled
     bar = "\u2588" * bar_filled + "\u2591" * bar_empty
     if score <= DETECTION_THRESHOLD:
-        risk_hint = "No significant threats detected"
+        risk_hint = "No significant threats detected \u2014 file appears safe"
     elif score <= 35:
-        risk_hint = "Minor flags \u2014 review details below"
+        risk_hint = "Minor flags detected \u2014 likely normal behavior from libraries or installers, review details below to confirm"
     elif score <= 60:
-        risk_hint = "Multiple suspicious indicators \u2014 exercise caution"
+        risk_hint = "Multiple suspicious indicators found \u2014 exercise caution and review the flagged behaviors before running"
     else:
         risk_hint = "Strong malware indicators \u2014 do not run this file"
     e.add_field(
@@ -2398,7 +2426,8 @@ def build_embeds(
             if not any(safe in u for safe in [
                 "minecraft.net", "mojang.com", "github.com", "googleapis.com",
                 "apache.org", "oracle.com", "java.com", "jetbrains.com",
-                "fabricmc.net", "spongepowered.org",
+                "fabricmc.net", "spongepowered.org", "curseforge.com",
+                "launchermeta.mojang.com", "modrinth.com",
             ])
         ][:10]
         if suspicious_urls:
@@ -2437,7 +2466,8 @@ def build_embeds(
                 text += f"\n*... and {len(threats) - 8} more*"
             _safe_add_field(e, budget, name="\U0001F6A8 Threat Indicators", value=_trunc(text), inline=False)
         if info_markers:
-            text = "\n".join(f"\u2022 {sanitize_path(m)}" for m in info_markers[:10])
+            text = "*These behaviors are common in legitimate software (installers, mods with native code) and do not necessarily indicate malware:*\n"
+            text += "\n".join(f"\u2022 {sanitize_path(m)}" for m in info_markers[:10])
             if len(info_markers) > 10:
                 text += f"\n*... and {len(info_markers) - 10} more*"
             _safe_add_field(e, budget, name="\U0001F50D Observed Behaviors", value=_trunc(text), inline=False)
@@ -2585,13 +2615,16 @@ def build_embeds(
     # — Suspicious bytecode overflow embed with context —
     if iocs:
         bytecode_markers = [m for m in iocs.get("behavioralMarkers", []) if m.startswith("Bytecode API ref:")]
-        # Categorize bytecode refs by risk level
+        # Split into non-library (interesting) vs library (noise)
+        non_lib_markers = [m for m in bytecode_markers if "[LIB]" not in m]
+        lib_markers = [m for m in bytecode_markers if "[LIB]" in m]
+        # Categorize non-library bytecode refs by risk level
         high_concern = []  # APIs that are almost always suspicious in mods
         moderate_concern = []  # APIs that are common but worth noting
         other_concern = []  # Everything else worth showing
         ALWAYS_SUSPICIOUS = ["defineClass", "URLClassLoader", "deleteOnExit", "setAccessible"]
         CONTEXT_DEPENDENT = ["Runtime.exec", "ProcessBuilder", "System.load", "System.loadLibrary"]
-        for m in bytecode_markers:
+        for m in non_lib_markers:
             if any(x in m for x in ALWAYS_SUSPICIOUS):
                 high_concern.append(m)
             elif any(x in m for x in CONTEXT_DEPENDENT):
@@ -2600,24 +2633,30 @@ def build_embeds(
                 other_concern.append(m)
         if high_concern or moderate_concern or other_concern:
             e2 = discord.Embed(title="\U0001F50E Bytecode API Analysis", color=color)
-            lines = []
+            lines = ["*Scanned Java bytecode for sensitive API calls. Known library code (LWJGL, FlatLaf, Fabric, etc.) is filtered out — only application code is shown below.*\n"]
             if high_concern:
                 lines.append("**Unusual for mods** (rarely needed by legitimate code):")
                 for m in high_concern[:10]:
-                    lines.append(f"\U0001F6A8 {sanitize_path(m)}")
+                    # Strip [LIB] tag for display (shouldn't be here but safety)
+                    lines.append(f"\U0001F6A8 {sanitize_path(m.replace('[LIB] ', ''))}")
             if moderate_concern:
-                lines.append("**Context-dependent** (used by installers/launchers, but also by malware):")
+                lines.append("**Context-dependent** (normal for installers/launchers, also used by malware):")
                 for m in moderate_concern[:10]:
-                    lines.append(f"\u26A0 {sanitize_path(m)}")
+                    lines.append(f"\u26A0 {sanitize_path(m.replace('[LIB] ', ''))}")
             if other_concern:
                 lines.append("**Other API references:**")
                 for m in other_concern[:8]:
-                    lines.append(f"\u2022 {sanitize_path(m)}")
+                    lines.append(f"\u2022 {sanitize_path(m.replace('[LIB] ', ''))}")
             total = len(high_concern) + len(moderate_concern) + len(other_concern)
             if total > 28:
                 lines.append(f"*... and {total - 28} more*")
+            if lib_markers:
+                lines.append(f"\n*{len(lib_markers)} additional API refs from known libraries were excluded from scoring*")
             e2.description = _trunc("\n".join(lines), 4000)
             embeds.append(e2)
+        elif lib_markers:
+            # Only library markers — don't show the embed at all (no suspicious non-library bytecode)
+            pass
 
     # Enforce Discord's 6000 total character limit across all embeds
     total_chars = sum(_embed_char_count(em) for em in embeds)
@@ -4304,6 +4343,7 @@ async def run_scan(
             zip_bomb_warning=zip_bomb_warning,
             format_analysis=format_analysis,
             deobfuscation=deobfuscation,
+            mb_result=mb_result,
         )
 
         if not is_zip and not format_analysis:

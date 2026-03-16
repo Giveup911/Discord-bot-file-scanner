@@ -1566,30 +1566,40 @@ public class JarAnalyzer {
         dangerousRefs.put("java/io/File\u0001delete", "File.delete() file deletion");
         dangerousRefs.put("java/io/File\u0001deleteOnExit", "File.deleteOnExit() deferred deletion (anti-forensics)");
 
+        // Track non-library hits separately for combo detection
+        boolean nonLibURLClassLoader = false, nonLibDefineClass = false;
+        boolean nonLibReflection = false, nonLibExec = false;
+
         for (Map.Entry<String, byte[]> classEntry : classes.entrySet()) {
+            boolean isLib = isLibraryClass(classEntry.getKey());
             byte[] data = classEntry.getValue();
             String ascii = new String(data, StandardCharsets.US_ASCII);
             for (Map.Entry<String, String> ref : dangerousRefs.entrySet()) {
                 String[] parts = ref.getKey().split("\u0001");
                 // Check if both the class ref and method name exist in constant pool strings
                 if (ascii.contains(parts[0]) && ascii.contains(parts[1])) {
-                    String m = "Bytecode API ref: " + ref.getValue() + " (in " + classEntry.getKey() + ")";
+                    // Tag library-origin markers so bot can filter them from scoring
+                    String tag = isLib ? "[LIB] " : "";
+                    String m = "Bytecode API ref: " + tag + ref.getValue() + " (in " + classEntry.getKey() + ")";
                     if (!findings.contains(m)) { findings.add(m); ilog("  [CPREF] " + m); }
+                    // Track non-library hits for combo detection
+                    if (!isLib) {
+                        String desc = ref.getValue();
+                        if (desc.contains("URLClassLoader")) nonLibURLClassLoader = true;
+                        if (desc.contains("defineClass")) nonLibDefineClass = true;
+                        if (desc.contains("Reflective method")) nonLibReflection = true;
+                        if (desc.contains("Runtime.exec") || desc.contains("ProcessBuilder")) nonLibExec = true;
+                    }
                 }
             }
         }
 
-        // Combo detection: URL loading + class definition + execution (strong infection indicator)
-        boolean hasURLClassLoader = findings.stream().anyMatch(f -> f.contains("URLClassLoader"));
-        boolean hasDefineClass = findings.stream().anyMatch(f -> f.contains("defineClass"));
-        boolean hasReflection = findings.stream().anyMatch(f -> f.contains("Reflective method"));
-        boolean hasExec = findings.stream().anyMatch(f -> f.contains("Runtime.exec") || f.contains("ProcessBuilder"));
-
-        if (hasURLClassLoader && (hasDefineClass || hasReflection)) {
+        // Combo detection: only flag HIGH RISK when dangerous combos appear in NON-library code
+        if (nonLibURLClassLoader && (nonLibDefineClass || nonLibReflection)) {
             String m = "HIGH RISK: URLClassLoader + dynamic class loading combo (stage2 download pattern)";
             if (!findings.contains(m)) { findings.add(m); warn(m); }
         }
-        if (hasExec && hasURLClassLoader) {
+        if (nonLibExec && nonLibURLClassLoader) {
             String m = "HIGH RISK: Command execution + URL class loading combo (dropper pattern)";
             if (!findings.contains(m)) { findings.add(m); warn(m); }
         }
