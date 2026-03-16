@@ -430,9 +430,62 @@ async def mb_lookup(sha256: str, session: aiohttp.ClientSession) -> Optional[dic
         return {"status": "error", "permalink": permalink}
 
 
+async def mb_upload(filepath: str, sha256: str, session: aiohttp.ClientSession,
+                    tags: list[str] = None, comment: str = None) -> Optional[dict]:
+    """Upload a flagged malware sample to MalwareBazaar."""
+    mb_auth = CFG.get("malwarebazaar", {}).get("auth_key", "")
+    if not mb_auth or not CFG.get("malwarebazaar", {}).get("enabled", True):
+        return None
+    permalink = f"https://bazaar.abuse.ch/sample/{sha256}/"
+    try:
+        json_meta = {"anonymous": 0}
+        if tags:
+            json_meta["tags"] = tags[:10]
+        if comment:
+            json_meta["context"] = {"comment": comment[:500]}
+
+        data = aiohttp.FormData()
+        data.add_field("json_data", json.dumps(json_meta), content_type="application/json")
+        data.add_field(
+            "file",
+            open(filepath, "rb"),
+            filename=os.path.basename(filepath),
+            content_type="application/octet-stream",
+        )
+        async with session.post(
+            MB_API,
+            headers={"Auth-Key": mb_auth},
+            data=data,
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
+            body = await resp.text()
+            if resp.status == 200:
+                try:
+                    result = json.loads(body)
+                except Exception:
+                    result = {}
+                status = result.get("query_status", "")
+                if status == "ok":
+                    log.info(f"MalwareBazaar: sample uploaded successfully ({sha256})")
+                    return {"status": "uploaded", "permalink": permalink,
+                            "sha256_hash": result.get("data", [{}])[0].get("sha256_hash", sha256)}
+                elif "already" in status.lower() or "exists" in body.lower():
+                    log.info(f"MalwareBazaar: sample already exists ({sha256})")
+                    return {"status": "already_exists", "permalink": permalink}
+                else:
+                    log.warning(f"MalwareBazaar upload query_status: {status} — {body[:200]}")
+                    return {"status": "upload_failed", "permalink": permalink, "detail": status}
+            else:
+                log.warning(f"MalwareBazaar upload returned {resp.status}: {body[:200]}")
+                return {"status": "upload_failed", "permalink": permalink, "detail": f"HTTP {resp.status}"}
+    except Exception as e:
+        log.warning(f"MalwareBazaar upload failed: {e}")
+        return {"status": "upload_failed", "permalink": permalink, "detail": str(e)}
+
+
 # ─── Hybrid Analysis ─────────────────────────────────────────────────────────
 
-HA_BASE = "https://www.hybrid-analysis.com/api/v2"
+HA_BASE = "https://hybrid-analysis.com/api/v2"
 
 
 async def ha_search(sha256: str, session: aiohttp.ClientSession) -> Optional[dict]:
@@ -443,7 +496,7 @@ async def ha_search(sha256: str, session: aiohttp.ClientSession) -> Optional[dic
     permalink = f"https://www.hybrid-analysis.com/sample/{sha256}"
     headers = {
         "api-key": api_key,
-        "User-Agent": "Falcon Sandbox",
+        "User-Agent": "Falcon",
         "accept": "application/json",
     }
     try:
@@ -499,7 +552,7 @@ async def ha_submit(filepath: str, sha256: str, session: aiohttp.ClientSession) 
     api_key = CFG.get("hybrid_analysis", {}).get("api_key", "")
     if not api_key or not CFG.get("hybrid_analysis", {}).get("enabled", True):
         return None
-    headers = {"api-key": api_key, "User-Agent": "Falcon Sandbox", "accept": "application/json"}
+    headers = {"api-key": api_key, "User-Agent": "Falcon", "accept": "application/json"}
     permalink = f"https://www.hybrid-analysis.com/sample/{sha256}"
     try:
         fh = open(filepath, "rb")
@@ -2427,6 +2480,20 @@ def build_mb_embed(mb_result: Optional[dict], sha256: str, scan_id: str) -> disc
             desc_parts.append(f"**Downloads:** {mb_result['downloads']}")
         desc_parts.append(f"\n**[View on MalwareBazaar]({permalink})**")
         e.description = _trunc("\n".join(desc_parts), 2000)
+    elif mb_result and mb_result.get("status") == "uploaded":
+        e = discord.Embed(
+            title="\U0001F9A0 MalwareBazaar",
+            description=f"Sample uploaded to abuse.ch database.\n\n**[View on MalwareBazaar]({permalink})**",
+            color=0xF39C12,
+            timestamp=datetime.now(timezone.utc),
+        )
+    elif mb_result and mb_result.get("status") == "already_exists":
+        e = discord.Embed(
+            title="\U0001F9A0 MalwareBazaar",
+            description=f"Sample already exists in abuse.ch database.\n\n**[View on MalwareBazaar]({permalink})**",
+            color=0xF39C12,
+            timestamp=datetime.now(timezone.utc),
+        )
     elif mb_result and mb_result.get("status") == "not_found":
         e = discord.Embed(
             title="\U0001F9A0 MalwareBazaar",
@@ -3727,6 +3794,26 @@ async def run_scan(
             entropy, extracted_strings, manifest, format_analysis,
             mb_result=mb_result, ha_result=ha_result,
         )
+
+        # ── Upload flagged files to MalwareBazaar ──
+        mb_upload_enabled = CFG.get("malwarebazaar", {}).get("upload_flagged", True)
+        if (score > DETECTION_THRESHOLD
+                and mb_result and mb_result.get("status") == "not_found"
+                and http_session and mb_enabled and mb_upload_enabled):
+            mb_tags = []
+            if all_iocs and all_iocs.get("variant", "").lower() != "unknown":
+                mb_tags.append(all_iocs["variant"])
+            if yara_matches:
+                mb_tags.extend(m["rule"] for m in yara_matches[:5])
+            comment = f"Auto-submitted by RATScanner (score {score}/100, {level})"
+            upload_result = await mb_upload(dl_path, sha256, http_session, tags=mb_tags, comment=comment)
+            if upload_result:
+                mb_result = upload_result
+                if mb_msg:
+                    try:
+                        await mb_msg.edit(embed=build_mb_embed(mb_result, sha256, scan_id))
+                    except discord.HTTPException:
+                        pass
 
         # ── Update stats ──
         if score > DETECTION_THRESHOLD:

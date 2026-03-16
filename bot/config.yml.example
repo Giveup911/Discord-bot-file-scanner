@@ -17,6 +17,8 @@ malwarebazaar:
   enabled: true
   auth_key: "YOUR_MB_AUTH_KEY_HERE"
   # Free auth key at https://bazaar.abuse.ch/account/ (login required)
+  # Auto-upload flagged malware samples to MalwareBazaar (only after detection)
+  upload_flagged: true
 
 hybrid_analysis:
   api_key: "YOUR_HA_API_KEY_HERE"
