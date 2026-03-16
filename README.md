@@ -14,7 +14,7 @@ Built for the Minecraft community but works on any file type.
 - **MalwareBazaar integration** — abuse.ch threat intel database (no API key needed)
 - **Hybrid Analysis integration** — CrowdStrike sandbox with automated submission
 - **Progressive scan updates** — live embed updates as each service completes with ETAs
-- **7,600+ YARA rules** from 40 public threat intelligence repositories
+- **7,800+ YARA rules** from 43 public threat intelligence repositories
 - **Discord webhook killing** — automatically DELETEs malicious webhooks found in samples
 - **AES config decryption** — dynamically cracks encrypted RAT configs without hardcoded keys
 - **Entropy analysis, string extraction, obfuscator detection, manifest inspection**
@@ -239,11 +239,11 @@ python bot.py
 
 ## YARA Rules
 
-7,600+ rules from 40 repositories (205 MB), plus custom Minecraft-specific rules:
+7,800+ rules from 43 repositories, plus custom Minecraft-specific rules:
 
 - `minecraft_rat.yar` — 10 rules for Weedhack, AdamRAT, Skyrage, Fractureiser, etc.
 - `minecraft_malware.yar` — 22 rules covering Fractureiser (all stages), Skyrage, Weedhack, WeirdUtils, Ectasy, Blurry, Comet, BaikalClub, Seroxen, BleedingPipe, Minegrief, GasAuth
-- **40 public repos** — Neo23x0/signature-base, Elastic, Malpedia, ReversingLabs, Mandiant, ESET, JPCERT, and more
+- **43 public repos** — Neo23x0/signature-base, Elastic, Malpedia, ReversingLabs, Mandiant, ESET, JPCERT, Yara-Rules, DarkenCode, and more
 
 Rules auto-load recursively from `bot/rules/`. Broken files are skipped gracefully.
 
@@ -274,7 +274,7 @@ master/
 │   ├── bot.py               # Discord bot (~3,000 lines)
 │   ├── config.yml.example   # Config template
 │   ├── requirements.txt     # Python dependencies
-│   └── rules/               # YARA rules (7,600+ files)
+│   └── rules/               # YARA rules (7,800+ files)
 │       ├── minecraft_rat.yar
 │       ├── minecraft_malware.yar
 │       └── <33 repo dirs>/
