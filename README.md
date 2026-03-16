@@ -35,36 +35,21 @@ cd master/bot
 pip install -r requirements.txt
 ```
 
-Edit `config.yml` (copy from `config.yml.example`). See `config.yml.example` for all available options.
+Run it — if there's no `config.yml`, the bot walks you through setup automatically:
+```bash
+python bot.py
+```
+It will ask for your bot token and API keys (press Enter to skip any). A `config.yml` is created for you.
 
 **Never share your project folder without deleting `config.yml` first** — it contains your bot token and API keys.
-```yaml
-discord:
-  token: "YOUR_BOT_TOKEN"
-  guild_id: "YOUR_SERVER_ID"     # optional, speeds up command registration
 
-virustotal:
-  api_key: "YOUR_VT_API_KEY"    # free at https://www.virustotal.com/gui/join-us
-
-hybrid_analysis:
-  api_key: "YOUR_HA_API_KEY"    # free at https://www.hybrid-analysis.com/signup
-
-malwarebazaar:
-  auth_key: "YOUR_MB_AUTH_KEY"  # free at https://bazaar.abuse.ch/account/
-```
-
-Alternatively, set environment variables (these override `config.yml`):
+You can also create `config.yml` manually (copy from `config.yml.example`) or set environment variables:
 ```
 DISCORD_TOKEN=your_token
 VT_API_KEY=your_key
 HA_API_KEY=your_key
 MB_AUTH_KEY=your_key
 DISCORD_GUILD_ID=your_guild_id   # optional
-```
-
-Run:
-```bash
-python bot.py
 ```
 
 Use `/giverat` in your Discord server — attach a file or paste a URL.
@@ -230,6 +215,30 @@ python bot.py
 | `/stats` | Show scan statistics |
 | `/save [true/false]` | Toggle saving scanned files to disk (admin only) |
 | `/reload` | Reload YARA rules (admin only) |
+
+### Getting Your API Keys
+
+All API keys are **free**. The bot works without them, but you'll miss out on threat intelligence lookups.
+
+#### VirusTotal
+1. Go to [virustotal.com](https://www.virustotal.com) and sign in (or create an account)
+2. Click the **three lines menu** (hamburger icon) in the top-left
+3. Click **API key**
+4. Copy your API key
+
+#### MalwareBazaar (abuse.ch)
+1. Go to [bazaar.abuse.ch](https://bazaar.abuse.ch) and create an account
+2. Go to your **Profile**
+3. In **Profile Settings**, click **Generate Key**
+4. Copy the auth key
+
+#### Hybrid Analysis (CrowdStrike)
+1. Go to [hybrid-analysis.com](https://www.hybrid-analysis.com) and create an account
+2. Go to your **Profile**
+3. Under **API key**, click **Create Key**
+4. Go to **User Data**, then **Personal Data**
+5. Click **Show** next to your personal data
+6. Download your API key
 
 ---
 
