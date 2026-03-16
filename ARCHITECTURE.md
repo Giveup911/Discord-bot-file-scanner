@@ -223,8 +223,9 @@ Final score clamped to 0-100. Thresholds: LOW (0-25), MEDIUM (26-60), HIGH (61-1
 - All text fields pass through `sanitize_path()`
 
 #### Log Packaging (lines 1715-1785)
-- `package_logs()` — creates ZIP files named after the mod (not generic names)
-- Splits at 9.5MB to stay under Discord's 10MB upload limit
+- `package_logs()` — creates `analysis-of-[name].zip` files
+- **Strips all binaries/malicious files** — only source code (.java, .xml, .json, etc.) and analysis text are included
+- Splits into `analysis-of-[name]-pt1.zip`, `-pt2.zip` etc. at 9.5MB (Discord's 10MB limit)
 - Priority ordering: analysis.txt first, then IOCs, configs, info logs, source
 - All log file contents are path-sanitized before being written to the ZIP
 
@@ -337,7 +338,7 @@ The bot loads all rules recursively via `rglob`. Broken files are compiled indiv
     │                      └── Not found? Upload + poll (up to 3 min)
     │
     ├── Magic byte check
-    │   ├── PK (ZIP) ──► Extract nested JARs ──► JarAnalyzer on each
+    │   ├── PK (ZIP) ──► Extract all scannable files (EXE, PDF, etc.) ──► analyze each
     │   ├── MZ (PE) ──► PE analyzer
     │   ├── %PDF ──► PDF analyzer
     │   ├── OLE2 ──► Office / MSI analyzer
@@ -345,7 +346,7 @@ The bot loads all rules recursively via `rglob`. Broken files are compiled indiv
     │   ├── Script ext ──► Script analyzer
     │   └── ISO sig ──► ISO analyzer
     │
-    ├── YARA scan (main file + nested JARs)
+    ├── YARA scan (main file + all extracted files)
     ├── Entropy analysis
     ├── String extraction (URLs, webhooks, tokens, IPs, ETH)
     ├── Obfuscator detection
@@ -357,7 +358,7 @@ The bot loads all rules recursively via `rglob`. Broken files are compiled indiv
     │
     ├── Build Discord embeds (color-coded, VT link always present)
     │
-    ├── Package logs into ZIP (named after the file, split at 9.5MB)
+    ├── Package logs into analysis-of-[name].zip (source only, binaries stripped)
     │
     └── Send public message with embeds + log attachments
 ```

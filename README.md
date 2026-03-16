@@ -234,6 +234,9 @@ python bot.py
 | **Scripts** (.bat/.ps1/.vbs/.js) | LOLBins, obfuscation (caret, concat, Chr(), base64), download cradles |
 | **MSI** | CustomActions, embedded PEs, script streams |
 | **ISO/IMG** | Dangerous files inside, autorun.inf, MOTW bypass delivery |
+| **ZIP archives** | Extracts and individually analyzes all embedded files (EXE, PDF, Office, scripts, etc.) |
+
+Output zips (`analysis-of-[name].zip`) contain only decompiled source code and analysis text — all binaries and malicious files are stripped. If output exceeds 9.5 MB, it splits into `analysis-of-[name]-pt1.zip`, `-pt2.zip`, etc.
 
 ---
 

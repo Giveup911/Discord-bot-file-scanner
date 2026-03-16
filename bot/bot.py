@@ -2463,24 +2463,45 @@ def _build_service_pending_embed(title: str, icon: str, eta: str, scan_id: str) 
 MAX_ENTRY_SIZE = 50 * 1024 * 1024  # 50MB per entry hard limit
 
 
-def extract_jars_from_zip(zip_path: str, extract_to: str, depth: int = 0, max_extract_bytes: int = 200 * 1024 * 1024) -> list[str]:
-    """Extract nested JARs with streaming decompression and size limits."""
+# File extensions worth extracting from zip archives for analysis
+SCANNABLE_EXTS = {
+    ".jar", ".zip", ".exe", ".dll", ".scr", ".com", ".pif",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".lnk", ".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".js", ".jse",
+    ".hta", ".wsf", ".msi", ".iso", ".img",
+}
+
+
+def _is_scannable_entry(name: str, data: bytes) -> bool:
+    """Check if a zip entry is worth extracting based on extension or magic bytes."""
+    ext = os.path.splitext(name)[1].lower()
+    if ext in SCANNABLE_EXTS:
+        return True
+    # Also check magic bytes for extensionless / misnamed files
+    if len(data) >= 4:
+        if data[:2] == b"PK":       return True   # JAR/ZIP
+        if data[:2] == b"MZ":       return True   # PE (EXE/DLL)
+        if data[:5] == b"%PDF-":    return True   # PDF
+        if data[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":  return True  # OLE2 (doc/xls)
+        if data[:4] == b"\x4c\x00\x00\x00":  return True  # LNK
+    return False
+
+
+def extract_files_from_zip(zip_path: str, extract_to: str, depth: int = 0, max_extract_bytes: int = 200 * 1024 * 1024) -> list[str]:
+    """Extract scannable files from zip with streaming decompression and size limits."""
     if depth > 3:
         return []
-    jars = []
+    extracted = []
     total_extracted = 0
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
             for entry in zf.namelist():
                 try:
                     info = zf.getinfo(entry)
-                    # Skip directories
                     if info.is_dir():
                         continue
-                    # Skip if reported size exceeds budget
                     if info.file_size > max_extract_bytes or info.file_size > MAX_ENTRY_SIZE:
                         continue
-                    # Stream-read with size enforcement (don't trust headers)
                     chunks = []
                     entry_size = 0
                     per_entry_limit = min(MAX_ENTRY_SIZE, max_extract_bytes - total_extracted)
@@ -2505,23 +2526,28 @@ def extract_jars_from_zip(zip_path: str, extract_to: str, depth: int = 0, max_ex
                     if total_extracted > max_extract_bytes:
                         log.warning(f"Extraction budget exceeded at {total_extracted} bytes")
                         break
-                    if len(data) > 4 and data[:2] == b"PK":
+                    if _is_scannable_entry(entry, data):
                         safe_name = re.sub(r"[^\w.\-]", "_", os.path.basename(entry))
                         if not safe_name:
-                            safe_name = f"nested_{depth}_{len(jars)}.jar"
+                            safe_name = f"nested_{depth}_{len(extracted)}"
                         dest = os.path.join(extract_to, f"depth{depth}_{safe_name}")
-                        if not dest.lower().endswith((".jar", ".zip")):
-                            dest += ".jar"
                         with open(dest, "wb") as dst:
                             dst.write(data)
-                        jars.append(dest)
-                        jars.extend(extract_jars_from_zip(dest, extract_to, depth + 1,
-                                                          max_extract_bytes - total_extracted))
+                        extracted.append(dest)
+                        # Recurse into nested zips/jars
+                        if len(data) >= 2 and data[:2] == b"PK":
+                            extracted.extend(extract_files_from_zip(dest, extract_to, depth + 1,
+                                                                     max_extract_bytes - total_extracted))
                 except Exception:
                     pass
     except zipfile.BadZipFile:
         pass
-    return jars
+    return extracted
+
+
+def extract_jars_from_zip(zip_path: str, extract_to: str, depth: int = 0, max_extract_bytes: int = 200 * 1024 * 1024) -> list[str]:
+    """Backward-compat wrapper — now extracts all scannable file types."""
+    return extract_files_from_zip(zip_path, extract_to, depth, max_extract_bytes)
 
 
 def is_valid_jar(filepath: str) -> bool:
@@ -2536,6 +2562,50 @@ def is_valid_jar(filepath: str) -> bool:
 
 MAX_ZIP_SIZE = 9.5 * 1024 * 1024
 
+# Only include source code and analysis text — never binaries or malicious files
+_SAFE_SOURCE_EXTS = {
+    ".java", ".kt", ".scala", ".groovy",  # JVM source
+    ".txt", ".log", ".json", ".xml", ".yml", ".yaml", ".toml",  # data/config
+    ".properties", ".cfg", ".conf", ".ini", ".csv",
+    ".md", ".rst", ".html", ".css",
+    ".py", ".rb", ".lua", ".sh",  # script source
+    ".gradle", ".maven", ".mf",  # build files
+    ".mcmeta", ".lang",  # Minecraft-specific
+}
+
+# Explicitly banned — never include these even if somehow text-readable
+_BANNED_EXTS = {
+    ".exe", ".dll", ".scr", ".com", ".pif", ".sys", ".drv",  # PE
+    ".jar", ".class", ".war", ".ear",  # compiled JVM
+    ".so", ".dylib",  # native libs
+    ".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".hta", ".wsf",  # scripts
+    ".msi", ".iso", ".img",  # installers/images
+    ".lnk", ".url",  # shortcuts
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",  # docs
+    ".zip", ".rar", ".7z", ".tar", ".gz",  # archives
+}
+
+
+def _is_safe_source_file(filepath: str) -> bool:
+    """Check if a file is safe source code / analysis output to include in results."""
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in _BANNED_EXTS:
+        return False
+    if ext in _SAFE_SOURCE_EXTS:
+        return True
+    # No extension — check if it looks like text (not binary)
+    if not ext:
+        try:
+            with open(filepath, "rb") as f:
+                sample = f.read(512)
+            # If more than 10% non-text bytes, treat as binary
+            non_text = sum(1 for b in sample if b < 0x09 or (0x0E <= b < 0x20 and b != 0x1B))
+            return len(sample) > 0 and (non_text / len(sample)) < 0.10
+        except Exception:
+            return False
+    # Unknown extension — skip to be safe
+    return False
+
 
 def sanitize_log_file(filepath: str) -> str:
     """Read a log file and strip sensitive paths. Returns sanitized content."""
@@ -2547,17 +2617,24 @@ def sanitize_log_file(filepath: str) -> str:
 
 
 def package_logs(log_dir: str, work_dir: str, mod_name: str) -> list[str]:
-    """Package logs into zip files named after the mod, splitting at Discord's limit."""
+    """Package source code & analysis into zip files, excluding all binaries/malware."""
     log_path = Path(log_dir)
     if not log_path.exists():
         return []
 
     all_files = []
+    skipped = []
     for root, dirs, files in os.walk(log_path):
         for f in files:
             fp = os.path.join(root, f)
             rel = os.path.relpath(fp, log_path)
-            all_files.append((fp, rel))
+            if _is_safe_source_file(fp):
+                all_files.append((fp, rel))
+            else:
+                skipped.append(rel)
+
+    if skipped:
+        log.info(f"Stripped {len(skipped)} binary/malicious file(s) from output: {skipped[:10]}")
 
     if not all_files:
         return []
@@ -2580,35 +2657,37 @@ def package_logs(log_dir: str, work_dir: str, mod_name: str) -> list[str]:
 
     all_files.sort(key=sort_key)
 
-    # Clean mod name for use in filename
+    # Name zip as "analysis-of-<name>"
     clean_name = re.sub(r"[^\w\-]", "_", mod_name)[:60]
     if not clean_name:
         clean_name = "scan_results"
+    zip_basename = f"analysis-of-{clean_name}"
 
     zips = []
     part = 1
     current_size = 0
-    total_parts = max(1, sum(os.path.getsize(fp) for fp, _ in all_files) // int(MAX_ZIP_SIZE) + 1)
-    suffix = f"_part{part}" if total_parts > 1 else ""
-    zip_path = os.path.join(work_dir, f"{clean_name}{suffix}.zip")
+    total_size = sum(os.path.getsize(fp) for fp, _ in all_files)
+    needs_split = total_size > MAX_ZIP_SIZE
+    # Only add -pt1 suffix if splitting is needed
+    zip_path = os.path.join(work_dir, f"{zip_basename}-pt{part}.zip" if needs_split else f"{zip_basename}.zip")
     zf = None
     try:
         zf = zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED)
 
         for fp, rel in all_files:
-            # Sanitize file content before adding to zip
             sanitized = sanitize_log_file(fp)
+            if not sanitized:
+                continue
 
             if current_size > 0 and current_size + len(sanitized.encode()) > MAX_ZIP_SIZE:
                 zf.close()
                 if os.path.getsize(zip_path) > 0:
                     zips.append(zip_path)
                 part += 1
-                zip_path = os.path.join(work_dir, f"{clean_name}_part{part}.zip")
+                zip_path = os.path.join(work_dir, f"{zip_basename}-pt{part}.zip")
                 zf = zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED)
                 current_size = 0
 
-            # Write sanitized content
             zf.writestr(rel, sanitized)
             current_size += len(sanitized.encode())
 
@@ -3349,6 +3428,9 @@ async def run_scan(
         except Exception:
             pass
 
+        # Collect all files to scan (extracted from zip or just the original)
+        extracted_files = []  # non-JAR files extracted from zip (EXE, PDF, etc.)
+
         if is_zip:
             jar_path = dl_path
             if not dl_path.lower().endswith((".jar", ".zip")):
@@ -3358,12 +3440,22 @@ async def run_scan(
             if is_valid_jar(jar_path):
                 jars_to_scan.append(jar_path)
 
-            nested = await asyncio.to_thread(extract_jars_from_zip, jar_path, work_dir)
-            for nj in nested:
-                if nj not in jars_to_scan and is_valid_jar(nj):
-                    jars_to_scan.append(nj)
+            nested = await asyncio.to_thread(extract_files_from_zip, jar_path, work_dir)
+            for nf in nested:
+                if nf in jars_to_scan:
+                    continue
+                # Check if it's a JAR/ZIP (PK magic) or another file type
+                try:
+                    with open(nf, "rb") as _f:
+                        _magic = _f.read(4)
+                    if _magic[:2] == b"PK" and is_valid_jar(nf):
+                        jars_to_scan.append(nf)
+                    else:
+                        extracted_files.append(nf)
+                except Exception:
+                    extracted_files.append(nf)
 
-            if not jars_to_scan:
+            if not jars_to_scan and not extracted_files:
                 jars_to_scan.append(jar_path)
         else:
             jars_to_scan.append(dl_path)
@@ -3391,17 +3483,40 @@ async def run_scan(
         # ── Manifest inspection ──
         manifest = await asyncio.to_thread(inspect_manifest, dl_path)
 
-        # ── Raw string extraction ──
+        # ── Raw string extraction (original file + extracted files) ──
         extracted_strings = await asyncio.to_thread(extract_strings, dl_path)
+        for ef in extracted_files:
+            ef_strings = await asyncio.to_thread(extract_strings, ef)
+            if ef_strings:
+                for key in ("discord_webhooks", "discord_tokens", "urls", "ipv4", "eth_addresses"):
+                    if ef_strings.get(key):
+                        extracted_strings.setdefault(key, []).extend(ef_strings[key])
 
         # ── Multi-format analysis (PE, PDF, Office, LNK, Script, MSI, ISO) ──
+        # Analyze original file + all extracted files, merge results
         format_analysis = await asyncio.to_thread(analyze_file_format, dl_path)
+        for ef in extracted_files:
+            ef_name = os.path.basename(ef)
+            ef_fmt = await asyncio.to_thread(analyze_file_format, ef)
+            if ef_fmt and ef_fmt.get("findings"):
+                # Prefix findings with the extracted filename
+                if format_analysis is None:
+                    format_analysis = {"type": "ZIP archive", "findings": []}
+                if not format_analysis.get("findings"):
+                    format_analysis["findings"] = []
+                format_analysis["findings"].append(f"--- Extracted: `{ef_name}` ({ef_fmt.get('type', 'unknown')}) ---")
+                format_analysis["findings"].extend(ef_fmt["findings"])
+                # Merge sub-fields
+                for subkey in ("suspicious_imports", "suspicious_sections", "suspicious_files"):
+                    if ef_fmt.get(subkey):
+                        format_analysis.setdefault(subkey, []).extend(ef_fmt[subkey])
 
-        # ── YARA ──
+        # ── YARA (original + all extracted files) ──
         yara_matches = await asyncio.to_thread(run_yara, dl_path)
-        for jar in jars_to_scan:
-            if jar != dl_path:
-                yara_matches.extend(await asyncio.to_thread(run_yara, jar))
+        all_scan_files = jars_to_scan + extracted_files
+        for sf in all_scan_files:
+            if sf != dl_path:
+                yara_matches.extend(await asyncio.to_thread(run_yara, sf))
         seen_rules = set()
         unique_yara = []
         for m in yara_matches:
