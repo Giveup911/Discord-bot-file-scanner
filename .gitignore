@@ -58,6 +58,9 @@ Thumbs.db
 .DS_Store
 desktop.ini
 
+# Large YARA repos (download separately — see download script in rules/)
+bot/rules/defender-yara/
+
 # YARA repo .git dirs (should already be removed)
 bot/rules/**/.git/
 bot/rules/**/.github/

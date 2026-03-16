@@ -14,7 +14,7 @@ Built for the Minecraft community but works on any file type.
 - **MalwareBazaar integration** — abuse.ch threat intel database (no API key needed)
 - **Hybrid Analysis integration** — CrowdStrike sandbox with automated submission
 - **Progressive scan updates** — live embed updates as each service completes with ETAs
-- **7,300+ YARA rules** from 34 public threat intelligence repositories
+- **7,600+ YARA rules** from 40 public threat intelligence repositories
 - **Discord webhook killing** — automatically DELETEs malicious webhooks found in samples
 - **AES config decryption** — dynamically cracks encrypted RAT configs without hardcoded keys
 - **Entropy analysis, string extraction, obfuscator detection, manifest inspection**
@@ -239,13 +239,24 @@ python bot.py
 
 ## YARA Rules
 
-7,300+ rules from 34 repositories (205 MB), plus custom Minecraft-specific rules:
+7,600+ rules from 40 repositories (205 MB), plus custom Minecraft-specific rules:
 
 - `minecraft_rat.yar` — 10 rules for Weedhack, AdamRAT, Skyrage, Fractureiser, etc.
 - `minecraft_malware.yar` — 22 rules covering Fractureiser (all stages), Skyrage, Weedhack, WeirdUtils, Ectasy, Blurry, Comet, BaikalClub, Seroxen, BleedingPipe, Minegrief, GasAuth
-- **34 public repos** — Neo23x0/signature-base, Elastic, Malpedia, ReversingLabs, Mandiant, ESET, JPCERT, and more
+- **40 public repos** — Neo23x0/signature-base, Elastic, Malpedia, ReversingLabs, Mandiant, ESET, JPCERT, and more
 
 Rules auto-load recursively from `bot/rules/`. Broken files are skipped gracefully.
+
+### Optional: Microsoft Defender YARA Rules (76,700+ additional rules)
+
+Too large to include in the repo (292 MB), but you can download them with one command:
+
+```bash
+cd master/bot/rules
+python download-defender-yara.py
+```
+
+The bot will auto-load them on next start or `/reload`.
 
 ---
 
@@ -263,7 +274,7 @@ master/
 │   ├── bot.py               # Discord bot (~3,000 lines)
 │   ├── config.yml.example   # Config template
 │   ├── requirements.txt     # Python dependencies
-│   └── rules/               # YARA rules (7,300+ files)
+│   └── rules/               # YARA rules (7,600+ files)
 │       ├── minecraft_rat.yar
 │       ├── minecraft_malware.yar
 │       └── <33 repo dirs>/

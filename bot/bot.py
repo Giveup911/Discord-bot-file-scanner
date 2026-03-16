@@ -1926,9 +1926,6 @@ def build_embeds(
     nested_count: int = 0,
     zip_bomb_warning: str = None,
     format_analysis: dict = None,
-    mb_result: dict = None,
-    ha_result: dict = None,
-    vt_sandbox: list = None,
 ) -> list[discord.Embed]:
     embeds = []
     emoji = LEVEL_EMOJI.get(level, "")
@@ -2015,54 +2012,6 @@ def build_embeds(
     elif CFG["virustotal"]["enabled"] and CFG["virustotal"]["api_key"]:
         vt_link = f"https://www.virustotal.com/gui/file/{hashes['sha256']}"
         e.add_field(name="\U0001F9EA VirusTotal", value=f"[Check on VirusTotal]({vt_link})", inline=False)
-
-    # VT Sandbox behavior reports
-    if vt_sandbox:
-        sb_lines = []
-        for sb in vt_sandbox[:2]:
-            sb_lines.append(f"**{sb['sandbox_name']}** \u2014 [View Behavior Report]({sb['link']})")
-        sb_lines.append(f"**[All Behavior Reports](https://www.virustotal.com/gui/file/{hashes['sha256']}/behavior)**")
-        e.add_field(name="\U0001F9EC VT Sandbox Analysis", value=_trunc("\n".join(sb_lines)), inline=False)
-    elif vt and CFG["virustotal"]["enabled"]:
-        sb_link = f"https://www.virustotal.com/gui/file/{hashes['sha256']}/behavior"
-        e.add_field(name="\U0001F9EC VT Sandbox", value=f"[View Sandbox Analysis]({sb_link}) (may still be processing)", inline=False)
-
-    # MalwareBazaar
-    if mb_result and mb_result.get("status") == "found":
-        mb_text = ""
-        if mb_result.get("signature"):
-            mb_text += f"**Signature:** `{mb_result['signature']}`\n"
-        if mb_result.get("tags"):
-            mb_text += f"**Tags:** {', '.join(f'`{t}`' for t in mb_result['tags'][:8])}\n"
-        if mb_result.get("first_seen"):
-            mb_text += f"**First seen:** {mb_result['first_seen']}\n"
-        if mb_result.get("delivery_method"):
-            mb_text += f"**Delivery:** `{mb_result['delivery_method']}`\n"
-        mb_text += f"**[View on MalwareBazaar]({mb_result['permalink']})**"
-        e.add_field(name="\U0001F9A0 MalwareBazaar", value=_trunc(mb_text), inline=False)
-    elif CFG.get("malwarebazaar", {}).get("enabled"):
-        mb_link = f"https://bazaar.abuse.ch/sample/{hashes['sha256']}/"
-        e.add_field(name="\U0001F9A0 MalwareBazaar", value=f"Not found in database | [Search]({mb_link})", inline=False)
-
-    # Hybrid Analysis
-    if ha_result:
-        ha_text = ""
-        ha_status = ha_result.get("status", "")
-        if ha_status == "found":
-            if ha_result.get("verdict"):
-                ha_text += f"**Verdict:** `{ha_result['verdict']}`\n"
-            if ha_result.get("threat_score") is not None:
-                ha_text += f"**Threat Score:** {ha_result['threat_score']}/100\n"
-            if ha_result.get("environment"):
-                ha_text += f"**Environment:** {ha_result['environment']}\n"
-            ha_text += f"**[View on Hybrid Analysis]({ha_result['permalink']})**"
-        elif ha_status == "submitted":
-            ha_text = f"Submitted for sandbox analysis (ETA ~5-10min)\n"
-            ha_text += f"**[View on Hybrid Analysis]({ha_result['permalink']})**"
-        elif ha_status in ("submit_failed", "error"):
-            ha_text = f"Submission failed \u2014 [check manually]({ha_result.get('permalink', '')})"
-        if ha_text:
-            e.add_field(name="\U0001F50D Hybrid Analysis", value=_trunc(ha_text), inline=False)
 
     # C2 infrastructure
     if iocs:
@@ -2325,6 +2274,187 @@ def build_embeds(
             main.set_field_at(len(main.fields) - 1, name=last.name, value=new_val, inline=last.inline)
 
     return embeds
+
+
+# ─── Service-Specific Embeds (each sent as its own message) ──────────────────
+
+def build_vt_embed(vt: dict, sha256: str, scan_id: str) -> discord.Embed:
+    """Build a standalone VirusTotal embed."""
+    vt_status = vt.get("status", "found")
+    if vt_status == "queued":
+        color = 0xF39C12
+        desc = "Uploaded \u2014 analysis still processing on VirusTotal\nResults will appear once scanning completes."
+    elif vt_status in ("upload_failed", "error"):
+        color = 0xE74C3C
+        desc = "Upload issue \u2014 check manually"
+    else:
+        detected = vt.get("detected", 0)
+        total = vt.get("total", 0)
+        if detected == 0:
+            color = 0x2ECC71
+        elif detected <= 5:
+            color = 0xF39C12
+        else:
+            color = 0xE74C3C
+        desc = f"**{detected}/{total}** engines detected this file"
+        if vt.get("meaningful_name"):
+            desc += f"\n**Name:** `{vt['meaningful_name']}`"
+        if vt.get("first_seen"):
+            try:
+                first = datetime.fromtimestamp(vt["first_seen"], tz=timezone.utc).strftime("%Y-%m-%d")
+                desc += f"\n**First seen:** {first}"
+            except Exception:
+                pass
+        if vt.get("detections"):
+            top = list(vt["detections"].items())[:12]
+            desc += "\n\n**Detections:**\n"
+            desc += " | ".join(f"`{name}`" for name, _ in top)
+            if len(vt["detections"]) > 12:
+                desc += f" +{len(vt['detections']) - 12} more"
+
+    e = discord.Embed(
+        title="\U0001F9EA VirusTotal",
+        description=_trunc(desc, 2000),
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+    if vt.get("permalink"):
+        e.add_field(name="Link", value=f"**[View Full Report on VirusTotal]({vt['permalink']})**", inline=False)
+    if vt.get("tags"):
+        e.add_field(name="Tags", value=" ".join(f"`{t}`" for t in vt["tags"][:10]), inline=False)
+    e.set_footer(text=f"Scan ID: {scan_id}")
+    return e
+
+
+def build_vt_sandbox_embed(vt_sandbox: list, sha256: str, scan_id: str) -> discord.Embed:
+    """Build a standalone VT Sandbox embed."""
+    e = discord.Embed(
+        title="\U0001F9EC VirusTotal Sandbox Analysis",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    if vt_sandbox:
+        desc_lines = []
+        for i, sb in enumerate(vt_sandbox[:2], 1):
+            desc_lines.append(f"**VM {i}: {sb['sandbox_name']}**")
+            desc_lines.append(f"[View Behavior Report]({sb['link']})")
+            if sb.get("analysis_date"):
+                desc_lines.append(f"Analyzed: {sb['analysis_date']}")
+            desc_lines.append("")
+        behavior_link = f"https://www.virustotal.com/gui/file/{sha256}/behavior"
+        desc_lines.append(f"**[View All Behavior Reports]({behavior_link})**")
+        e.description = "\n".join(desc_lines)
+    else:
+        behavior_link = f"https://www.virustotal.com/gui/file/{sha256}/behavior"
+        e.description = (
+            "Sandbox analysis may still be processing.\n"
+            f"**[Check Sandbox Results]({behavior_link})**\n\n"
+            "VT typically runs files in 2 sandbox environments. "
+            "Results appear within 5\u201310 minutes of upload."
+        )
+    e.set_footer(text=f"Scan ID: {scan_id}")
+    return e
+
+
+def build_mb_embed(mb_result: Optional[dict], sha256: str, scan_id: str) -> discord.Embed:
+    """Build a standalone MalwareBazaar embed."""
+    permalink = f"https://bazaar.abuse.ch/sample/{sha256}/"
+    if mb_result and mb_result.get("status") == "found":
+        e = discord.Embed(
+            title="\U0001F9A0 MalwareBazaar",
+            color=0xE74C3C,
+            timestamp=datetime.now(timezone.utc),
+        )
+        desc_parts = ["**Known malware sample found in database**\n"]
+        if mb_result.get("signature"):
+            desc_parts.append(f"**Signature:** `{mb_result['signature']}`")
+        if mb_result.get("file_type"):
+            desc_parts.append(f"**File Type:** `{mb_result['file_type']}`")
+        if mb_result.get("tags"):
+            desc_parts.append(f"**Tags:** {', '.join(f'`{t}`' for t in mb_result['tags'][:10])}")
+        if mb_result.get("first_seen"):
+            desc_parts.append(f"**First Seen:** {mb_result['first_seen']}")
+        if mb_result.get("delivery_method"):
+            desc_parts.append(f"**Delivery Method:** `{mb_result['delivery_method']}`")
+        if mb_result.get("reporter"):
+            desc_parts.append(f"**Reported By:** {mb_result['reporter']}")
+        if mb_result.get("downloads"):
+            desc_parts.append(f"**Downloads:** {mb_result['downloads']}")
+        desc_parts.append(f"\n**[View on MalwareBazaar]({permalink})**")
+        e.description = _trunc("\n".join(desc_parts), 2000)
+    else:
+        e = discord.Embed(
+            title="\U0001F9A0 MalwareBazaar",
+            description=f"Not found in abuse.ch database.\n\n**[Search MalwareBazaar]({permalink})**",
+            color=0x2ECC71,
+            timestamp=datetime.now(timezone.utc),
+        )
+    e.set_footer(text=f"Scan ID: {scan_id}")
+    return e
+
+
+def build_ha_embed(ha_result: Optional[dict], sha256: str, scan_id: str) -> discord.Embed:
+    """Build a standalone Hybrid Analysis embed."""
+    permalink = f"https://www.hybrid-analysis.com/sample/{sha256}"
+    if ha_result and ha_result.get("status") == "found":
+        threat_score = ha_result.get("threat_score")
+        if threat_score is not None and threat_score >= 80:
+            color = 0xE74C3C
+        elif threat_score is not None and threat_score >= 50:
+            color = 0xF39C12
+        else:
+            color = 0x2ECC71
+        e = discord.Embed(
+            title="\U0001F50D Hybrid Analysis",
+            color=color,
+            timestamp=datetime.now(timezone.utc),
+        )
+        desc_parts = []
+        if ha_result.get("verdict"):
+            desc_parts.append(f"**Verdict:** `{ha_result['verdict']}`")
+        if threat_score is not None:
+            bar_filled = threat_score // 10
+            bar_empty = 10 - bar_filled
+            bar = "\u2588" * bar_filled + "\u2591" * bar_empty
+            desc_parts.append(f"**Threat Score:** {threat_score}/100\n`{bar}`")
+        if ha_result.get("environment"):
+            desc_parts.append(f"**Environment:** {ha_result['environment']}")
+        if ha_result.get("analysis_start_time"):
+            desc_parts.append(f"**Analyzed:** {ha_result['analysis_start_time']}")
+        desc_parts.append(f"\n**[View Full Report on Hybrid Analysis]({permalink})**")
+        e.description = "\n".join(desc_parts)
+    elif ha_result and ha_result.get("status") == "submitted":
+        e = discord.Embed(
+            title="\U0001F50D Hybrid Analysis",
+            description=(
+                "File submitted for sandbox analysis.\n"
+                "**Environment:** Windows 10 64-bit\n"
+                "**ETA:** ~5\u201310 minutes\n\n"
+                f"**[View Results on Hybrid Analysis]({permalink})**\n"
+                "*(page will update when analysis completes)*"
+            ),
+            color=0xF39C12,
+            timestamp=datetime.now(timezone.utc),
+        )
+    else:
+        e = discord.Embed(
+            title="\U0001F50D Hybrid Analysis",
+            description=f"Lookup failed or unavailable.\n\n**[Check Manually]({permalink})**",
+            color=0x95A5A6,
+            timestamp=datetime.now(timezone.utc),
+        )
+    e.set_footer(text=f"Scan ID: {scan_id}")
+    return e
+
+
+def _build_service_pending_embed(title: str, icon: str, eta: str, scan_id: str) -> discord.Embed:
+    """Build a pending/loading embed for a service."""
+    return discord.Embed(
+        title=f"{icon} {title}",
+        description=f"\U0001F504 Scanning... (ETA {eta})",
+        color=0x3498DB,
+        timestamp=datetime.now(timezone.utc),
+    ).set_footer(text=f"Scan ID: {scan_id}")
 
 
 # ─── File Handling ───────────────────────────────────────────────────────────
@@ -3105,17 +3235,32 @@ async def run_scan(
             mb_result = None
             ha_result = None
             vt_sandbox = None
+
+            # VT — own message
             if http_session and vt_enabled:
                 stages["VirusTotal"] = "running"
                 await update_progress(stages, filename, file_size, hashes)
+                vt_msg = await ctx.channel.send(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "~30s", scan_id))
                 vt_result = await vt_lookup(sha256, http_session)
                 if vt_result is None:
-                    stages["VirusTotal"] = "running (uploading ~2-3min)"
-                    await update_progress(stages, filename, file_size, hashes)
+                    await vt_msg.edit(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "uploading ~2-3min", scan_id))
                     vt_result = await vt_upload(dl_path, sha256, http_session)
                 stages["VirusTotal"] = "complete"
+                if vt_result:
+                    await vt_msg.edit(embed=build_vt_embed(vt_result, sha256, scan_id))
 
-            # Run MB, HA, VT Sandbox concurrently
+            # Send pending messages for parallel services
+            vt_sb_msg = None
+            mb_msg = None
+            ha_msg = None
+            if http_session and vt_enabled:
+                vt_sb_msg = await ctx.channel.send(embed=_build_service_pending_embed("VT Sandbox Analysis", "\U0001F9EC", "~2s", scan_id))
+            if http_session and mb_enabled:
+                mb_msg = await ctx.channel.send(embed=_build_service_pending_embed("MalwareBazaar", "\U0001F9A0", "~2s", scan_id))
+            if http_session and ha_enabled:
+                ha_msg = await ctx.channel.send(embed=_build_service_pending_embed("Hybrid Analysis", "\U0001F50D", "~5s", scan_id))
+
+            # Launch concurrently
             api_tasks = {}
             if http_session and mb_enabled:
                 stages["MalwareBazaar"] = "running"
@@ -3126,20 +3271,38 @@ async def run_scan(
             if http_session and vt_enabled and vt_result:
                 stages["VT Sandbox"] = "running"
                 api_tasks["vt_sb"] = asyncio.create_task(vt_get_sandbox_links(sha256, http_session))
-            await update_progress(stages, filename, file_size, hashes)
 
             if "mb" in api_tasks:
                 mb_result = await api_tasks["mb"]
                 stages["MalwareBazaar"] = "complete"
                 if mb_result and mb_result.get("status") == "found":
                     await update_stats(mb_hits=1)
+                if mb_msg:
+                    try:
+                        await mb_msg.edit(embed=build_mb_embed(mb_result, sha256, scan_id))
+                    except discord.HTTPException:
+                        pass
             if "ha" in api_tasks:
                 ha_result = await api_tasks["ha"]
                 stages["Hybrid Analysis"] = "complete"
+                if ha_msg:
+                    try:
+                        await ha_msg.edit(embed=build_ha_embed(ha_result, sha256, scan_id))
+                    except discord.HTTPException:
+                        pass
             if "vt_sb" in api_tasks:
                 vt_sandbox = await api_tasks["vt_sb"]
                 stages["VT Sandbox"] = "complete"
-            await update_progress(stages, filename, file_size, hashes)
+                if vt_sb_msg:
+                    try:
+                        await vt_sb_msg.edit(embed=build_vt_sandbox_embed(vt_sandbox, sha256, scan_id))
+                    except discord.HTTPException:
+                        pass
+            elif vt_sb_msg:
+                try:
+                    await vt_sb_msg.edit(embed=build_vt_sandbox_embed(None, sha256, scan_id))
+                except discord.HTTPException:
+                    pass
 
             yara_matches = await asyncio.to_thread(run_yara, dl_path)
             seen_rules = set()
@@ -3166,7 +3329,6 @@ async def run_scan(
                 obfuscators=[], score=score, level=level, color=color,
                 scan_time=time.time() - start, scan_id=scan_id,
                 zip_bomb_warning=zip_bomb_warning,
-                mb_result=mb_result, ha_result=ha_result, vt_sandbox=vt_sandbox,
             )
             if scan_msg:
                 await scan_msg.edit(content=f"Scan requested by {ctx.author.mention}", embeds=embeds)
@@ -3251,25 +3413,49 @@ async def run_scan(
         stages["Local Analysis"] = "complete"
         await update_progress(stages, filename, file_size, hashes)
 
-        # ── External API lookups (run concurrently) ──
+        # ── External API lookups — each gets its own message ──
         vt_result = None
         mb_result = None
         ha_result = None
         vt_sandbox = None
 
-        # Start VT lookup
+        # Track per-service messages so we can edit them when results arrive
+        vt_msg = None
+        vt_sb_msg = None
+        mb_msg = None
+        ha_msg = None
+
+        # ── VirusTotal ──
         if http_session and vt_enabled:
             stages["VirusTotal"] = "running"
             await update_progress(stages, filename, file_size, hashes)
+            # Send pending VT message
+            vt_msg = await ctx.channel.send(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "~30s", scan_id))
             vt_result = await vt_lookup(sha256, http_session)
             if vt_result is None:
-                stages["VirusTotal"] = "running (uploading ~2-3min)"
-                await update_progress(stages, filename, file_size, hashes)
+                await vt_msg.edit(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "uploading ~2-3min", scan_id))
                 vt_result = await vt_upload(dl_path, sha256, http_session)
             stages["VirusTotal"] = "complete"
+            # Update VT message with results
+            if vt_result:
+                await vt_msg.edit(embed=build_vt_embed(vt_result, sha256, scan_id))
             await update_progress(stages, filename, file_size, hashes)
 
-        # Launch MB, HA, VT Sandbox concurrently
+        # ── Send pending messages for parallel services ──
+        if http_session and vt_enabled:
+            vt_sb_msg = await ctx.channel.send(
+                embed=_build_service_pending_embed("VT Sandbox Analysis", "\U0001F9EC", "~2s", scan_id)
+            )
+        if http_session and mb_enabled:
+            mb_msg = await ctx.channel.send(
+                embed=_build_service_pending_embed("MalwareBazaar", "\U0001F9A0", "~2s", scan_id)
+            )
+        if http_session and ha_enabled:
+            ha_msg = await ctx.channel.send(
+                embed=_build_service_pending_embed("Hybrid Analysis", "\U0001F50D", "~5s", scan_id)
+            )
+
+        # ── Launch MB, HA, VT Sandbox concurrently ──
         api_tasks = {}
         if http_session and mb_enabled:
             stages["MalwareBazaar"] = "running"
@@ -3283,25 +3469,45 @@ async def run_scan(
         if api_tasks:
             await update_progress(stages, filename, file_size, hashes)
 
-        # Collect results and update after each completes
+        # ── Collect results and update each message as it completes ──
         if "mb" in api_tasks:
             mb_result = await api_tasks["mb"]
             stages["MalwareBazaar"] = "complete"
             if mb_result and mb_result.get("status") == "found":
                 await update_stats(mb_hits=1)
-            await update_progress(stages, filename, file_size, hashes)
+            if mb_msg:
+                try:
+                    await mb_msg.edit(embed=build_mb_embed(mb_result, sha256, scan_id))
+                except discord.HTTPException:
+                    pass
 
         if "ha" in api_tasks:
             ha_result = await api_tasks["ha"]
             stages["Hybrid Analysis"] = "complete"
-            await update_progress(stages, filename, file_size, hashes)
+            if ha_msg:
+                try:
+                    await ha_msg.edit(embed=build_ha_embed(ha_result, sha256, scan_id))
+                except discord.HTTPException:
+                    pass
 
         if "vt_sb" in api_tasks:
             vt_sandbox = await api_tasks["vt_sb"]
             stages["VT Sandbox"] = "complete"
-            await update_progress(stages, filename, file_size, hashes)
+            if vt_sb_msg:
+                try:
+                    await vt_sb_msg.edit(embed=build_vt_sandbox_embed(vt_sandbox, sha256, scan_id))
+                except discord.HTTPException:
+                    pass
+        elif vt_sb_msg:
+            # No VT result to query sandbox for
+            try:
+                await vt_sb_msg.edit(embed=build_vt_sandbox_embed(None, sha256, scan_id))
+            except discord.HTTPException:
+                pass
 
-        # Mark skipped stages as complete if not applicable
+        await update_progress(stages, filename, file_size, hashes)
+
+        # Mark skipped stages
         for k in stages:
             if stages[k] == "pending":
                 stages[k] = "skipped"
@@ -3333,7 +3539,7 @@ async def run_scan(
         else:
             await update_stats(total_scans=1, clean=1)
 
-        # ── Build final embeds ──
+        # ── Build main results embed (local analysis + YARA + strings etc.) ──
         embeds = build_embeds(
             filename=filename,
             file_size=file_size,
@@ -3354,9 +3560,6 @@ async def run_scan(
             nested_count=max(0, len(jars_to_scan) - 1),
             zip_bomb_warning=zip_bomb_warning,
             format_analysis=format_analysis,
-            mb_result=mb_result,
-            ha_result=ha_result,
-            vt_sandbox=vt_sandbox,
         )
 
         if not is_zip and not format_analysis:
@@ -3371,7 +3574,7 @@ async def run_scan(
         for ld in all_log_dirs:
             zip_files.extend(package_logs(ld, work_dir, mod_name))
 
-        # ── Send final results — replace progress embed ──
+        # ── Send main results — replace progress embed ──
         files_to_send = []
         for zp in zip_files:
             if os.path.getsize(zp) > 0:
@@ -3379,9 +3582,7 @@ async def run_scan(
 
         try:
             if scan_msg:
-                # Edit progress message with final embeds
                 await scan_msg.edit(content=f"Scan requested by {ctx.author.mention}", embeds=embeds)
-                # Files must be sent separately (edit() can't add files)
                 if files_to_send:
                     await ctx.channel.send(files=files_to_send, reference=scan_msg)
             else:

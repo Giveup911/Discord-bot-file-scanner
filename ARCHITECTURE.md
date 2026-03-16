@@ -21,7 +21,7 @@ User uploads file via Discord (/giverat) or CLI (run.bat)
    │                                                   │
    │  ┌──────────────┐  ┌──────────┐  ┌───────────┐  │
    │  │ JarAnalyzer  │  │ VirusTotal│  │   YARA    │  │
-   │  │ (Java subprocess)│ (API)    │  │  (7,300+) │  │
+   │  │ (Java subprocess)│ (API)    │  │  (7,600+) │  │
    │  └──────────────┘  └──────────┘  └───────────┘  │
    │                                                   │
    │  ┌──────────────┐  ┌──────────┐  ┌───────────┐  │
@@ -72,7 +72,7 @@ The Discord bot and entire analysis orchestrator. Single-file design — no frag
 #### YARA Engine (lines 125-175)
 - `load_yara_rules()` — recursively discovers `.yar`/`.yara` files using `rglob`
 - Compiles each file individually first, skips broken ones, then batch-compiles the valid set
-- Uses relative-path namespacing to avoid rule name collisions across 34 repos
+- Uses relative-path namespacing to avoid rule name collisions across 40 repos
 - `run_yara()` — matches with 60s timeout per file
 
 #### VirusTotal Integration (lines 180-290)
@@ -312,11 +312,11 @@ Detection configuration with 80+ behavioral patterns, 13 variant hint definition
 
 ## File: `bot/rules/`
 
-YARA rule directory. Two custom files plus 34 cloned repositories:
+YARA rule directory. Two custom files plus 40 cloned repositories:
 
 - `minecraft_rat.yar` — 10 rules (Weedhack, AdamRAT, Skyrage, Fractureiser, Discord webhook exfil, Ethereum C2, etc.)
 - `minecraft_malware.yar` — 22 rules (all Fractureiser stages, Skyrage, Weedhack, WeirdUtils, Ectasy, Blurry, Comet, BaikalClub, Seroxen, BleedingPipe, Minegrief, GasAuth, generic session stealers, Force-OP backdoors, self-propagation worms)
-- 34 public repositories (Neo23x0/signature-base, Elastic, Malpedia, ReversingLabs, etc.)
+- 40 public repositories (Neo23x0/signature-base, Elastic, Malpedia, ReversingLabs, etc.)
 
 The bot loads all rules recursively via `rglob`. Broken files are compiled individually first and skipped if they fail, so one bad rule doesn't break the entire set.
 
