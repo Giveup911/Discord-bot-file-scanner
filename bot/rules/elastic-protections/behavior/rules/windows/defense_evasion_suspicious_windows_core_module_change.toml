@@ -1,0 +1,113 @@
+[rule]
+description = "Identifies attempts to change memory protection of a Windows Core Module often targeted for functions unhooking."
+id = "e6b77636-53e6-416f-81bb-863b74a896e8"
+license = "Elastic License v2"
+name = "Suspicious Windows Core Module Change"
+os_list = ["windows"]
+version = "1.0.6"
+
+query = '''
+api where process.Ext.api.name == "VirtualProtect" and
+ process.Ext.api.metadata.target_address_name in ("ntdll.dll", "kernel32.dll", "kernelbase.dll") and
+ process.Ext.token.integrity_level_name != "low" and process.thread.Ext.call_stack_final_user_module.hash.sha256 != null and
+ process.Ext.api.parameters.size >= 10000 and
+ not process.thread.Ext.call_stack_final_user_module.name in ("Kernel", "Unknown", "Undetermined") and
+ not process.thread.Ext.call_stack_final_user_module.protection_provenance like ("Kernel", "Unknown", "Kernel|*") and
+ not process.thread.Ext.call_stack_final_user_module.name in ("Kernel", "Unknown") and
+ not _arraysearch(process.thread.Ext.call_stack, $entry, $entry.symbol_info: ("*ntdll.dll!LdrLoadDll*", "*ntdll.dll!LdrUnloadDll*")) and 
+ not process.thread.Ext.call_stack_final_user_module.path like ("c:\\program files\\*", "c:\\program files (x86)\\*",
+                                                                "c:\\windows\\assembly\\nativeimages_*.ni.dll",
+                                                                "c:\\windows\\system32\\ntdll.dll",
+                                                                "c:\\windows\\syswow64\\ntdll.dll",
+                                                                "c:\\windows\\syswow64\\msvbvm??.dll") and
+ not process.thread.Ext.call_stack_final_hook_module.path like ("c:\\program files\\*", "c:\\program files (x86)\\*") and
+ not (process.thread.Ext.call_stack_final_user_module.path in ("c:\\windows\\system32\\apphelp.dll", "c:\\windows\\syswow64\\apphelp.dll") and
+      process.Ext.api.metadata.target_address_name in ("kernel32.dll", "kernelbase.dll")) and
+ not (process.Ext.api.parameters.protection == "R--" and process.Ext.api.metadata.target_address_name == "kernel32.dll") and
+ not process.thread.Ext.call_stack_final_user_module.hash.sha256 in ("b27b7d2ac43c6c734aa9e370afc987704f4bd8ba11bc5199a8c3bc5b07b2600c",
+                                                                    "85f238fb7ace3cbdf7c29c72b01307c440f13491b07a509cbc5b9f257a637164",
+                                                                    "7f6f5855d4968235163d75c62ab82e8fdc7cf3c83de34e3c5a0666e2d08a0001",
+                                                                    "36b45f919f856e3eb8115cb883c38b62c653e8d46af147551a7d6efc1708de23",
+                                                                    "46c861b688fe129552920c62985e662b6789bb7a646ab65ae8fee4a8a82d7bc5",
+                                                                    "148a2e5cffd3c30f9647d8bdf8a6d0a891f4dfdca459fef9629db6ccd985fe02",
+                                                                    "bc3d667b3e2a6ff84031c839e5cb9e93ab558f339646d34f0419f51788929eda",
+                                                                    "f12898b6f0536b90561b9309b03afd3c4f83ff51fc50d0bcaa39110a3fbce359",
+                                                                    "eff09cb37f0e0ea6de0f5b1ee499ceb612b36a9229caf9a0f464a53c66735646",
+                                                                    "f0eb8747d3499416873892700d6d7d1fe24ccc4d461cb68fa93d1f8030d747a0",
+                                                                    "447e50302f0aa72add1866e4115d363497b82aa38bd47be8310d688194fb1b2d",
+                                                                    "92cf0c5c9248ec17b408a37021ea89144a9aeb71317e3c61b767eced3265d5af",
+                                                                    "685774f56983b22fbd1f84880fe60f149ccf0322abe8dd09b7a0d81f4a5dd1f1",
+                                                                    "da8c6bcefb5397d1763987dff1d99ff374c9643b27c1f8285d66fb99494b253b",
+                                                                    "bd5c092be2d1d5856041a743c90e64ba232badc3b1c3d063539cb328a91bd9ae",
+                                                                    "48cefaab52832b85dda4dd16b56d8dd97d433601bb4a72aec9affc2723588a4c",
+                                                                    "bd5c092be2d1d5856041a743c90e64ba232badc3b1c3d063539cb328a91bd9ae",
+                                                                    "1bb34f11b79fad256ca2e72ea7bcc618815632d585538e1e601c7fc5512ba72d",
+                                                                    "4c92f5bcefdec3e38aa8c30f14379c723e573587abe7e8c4fc77f1fae2a0d270",
+                                                                    "fe498b13e464d26beacdcba32bc3b26d356b52f9b251546831e3d86923a35d6b",
+                                                                    "8a882e25b9a7d49feee49c70ddc816720f82dccf0691076c098959fb3b2f4711",
+                                                                    "d0fdfd7102505692385d4061e2a73504727802594434d31136ff4e75cd5072d5",
+                                                                    "d3813940007faa5f2b15bd53ac9c1d28032252133257c2f3d8ef87563ae55301",
+                                                                    "028f848c8a44b4831741e01e27624fee9c408f63d859021fff533e87ce19f129",
+                                                                    "cee9a6ff8026dde09eda9f892c57cc928d42e4a4d22bb740fe38ee6e91797a28") and
+ not (_arraysearch(process.thread.Ext.call_stack_final_user_module.code_signature, $entry, $entry.trusted == true and $entry.subject_name in ("Microsoft Windows", "Microsoft Corporation", ".NET")) and not process.Ext.api.behaviors == "image_rop") and
+ not _arraysearch(process.thread.Ext.call_stack_final_user_module.code_signature, $entry, $entry.trusted == true and
+                  $entry.subject_name in ("Microsoft Windows Hardware Compatibility Publisher",
+                                          "Microsoft Windows Software Compatibility Publisher",
+                                          "ESET, spol. s r.o.",
+                                          "Activision Publishing Inc",
+                                          "Sony Interactive Entertainment LLC",
+                                          "Electronic Arts, Inc.",
+                                          "KRAFTON, Inc.",
+                                          "WIBU-SYSTEMS AG",
+                                          "The TWAIN Working Group",
+                                          "Twain Working Group",
+                                          "LEAD Technologies, Inc",
+                                          "Roblox Corporation",
+                                          "Vectric Ltd.",
+                                          "Cylance, Inc.",
+                                          "Hyland Software Inc.",
+                                          "COGNOSPHERE PTE. LTD.",
+                                          "Code Systems Corporation",
+                                          "Tencent Technology (Shenzhen) Company Limited",
+                                          "Windows Phone",
+                                          "Adobe Inc.",
+                                          "Viber Media S.a r.l.",
+                                          "SentinelOne Inc.",
+                                          "Spotify AB",
+                                          "TEAMDEV LTD.",
+                                          "miHoYo Co.,Ltd.",
+                                          "Google LLC",
+                                          "AO Kaspersky Lab",
+                                          "Mozilla Corporation",
+                                          "SignPath Foundation",
+                                          "Palo Alto Networks",
+                                          "Duncan Ogilvie",
+                                          "combit Software GmbH",
+                                          "Cisco Systems, Inc.",
+                                          "MetaQuotes Ltd")) and
+ not (process.thread.Ext.call_stack_final_user_module.protection_provenance_path like "c:\\windows\\assembly\\nativeimages_*.ni.dll" and
+      process.thread.Ext.call_stack_final_user_module.path == "c:\\windows\\system32\\ntdll.dll")
+'''
+
+min_endpoint_version = "8.16.0"
+optional_actions = []
+[[actions]]
+action = "kill_process"
+field = "process.entity_id"
+state = 0
+
+[[threat]]
+framework = "MITRE ATT&CK"
+[[threat.technique]]
+id = "T1620"
+name = "Reflective Code Loading"
+reference = "https://attack.mitre.org/techniques/T1620/"
+
+
+[threat.tactic]
+id = "TA0005"
+name = "Defense Evasion"
+reference = "https://attack.mitre.org/tactics/TA0005/"
+
+[internal]
+min_endpoint_version = "8.16.0"

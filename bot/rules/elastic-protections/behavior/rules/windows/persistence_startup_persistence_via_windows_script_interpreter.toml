@@ -1,0 +1,140 @@
+[rule]
+description = """
+Identifies modification of startup persistence locations (registry run keys and startup folder) by a Windows script
+interpreter. Adversaries may use this technique to maintain persistence.
+"""
+id = "a85000c8-3eac-413b-8353-079343c2b6f0"
+license = "Elastic License v2"
+name = "Startup Persistence via Windows Script Interpreter"
+os_list = ["windows"]
+reference = ["https://docs.microsoft.com/en-us/previous-versions/technet-magazine/ee851671(v=msdn.10)"]
+version = "1.0.42"
+
+query = '''
+sequence by process.entity_id with maxspan=2m
+ [process where event.action : "start" and
+  (
+   process.pe.original_file_name : ("wscript.exe", "powershell.exe", "mshta.exe", "pwsh.exe") or
+   process.parent.name : ("wscript.exe", "powershell.exe", "mshta.exe", "pwsh.exe") or
+   (process.name : "javaw.exe" and process.args : "-jar" and process.args_count == 3)
+   ) and
+   /* noisy patterns */
+  not process.Ext.token.integrity_level_name == "system" and
+  not (process.command_line : ("*:\\Program Files\\*.exe", "*:\\Program Files (x86)\\*.exe", "*\\\\*\\SYSVOL\\*") and not process.name : "javaw.exe") and
+  not process.executable : "?:\\Users\\*\\AppData\\Local\\Microsoft\\OneDrive\\OneDrive.exe" and
+  not (process.name : "powershell.exe" and process.command_line : ("*$env:APPDATA*Browser Assistant*", "*MicrosoftEdgeAutoLaunch*GoogleChromeAutoLaunch*")) and
+  not (process.pe.original_file_name : "Teams.exe" and process.code_signature.trusted == true) and
+  not (process.name : "cscript.exe" and process.args : "?:\\Program Files\\Nextech\\NxTSAddin\\InstallNXTSAddinForCurrentUser.vbs") and
+  not (process.parent.name : "powershell.exe" and process.parent.args : "'C:\\ProgramData\\CentraStage\\Packages\\*.ps1'") and
+  not process.executable :
+                 ("C:\\Program Files (x86)\\Exclaimer Ltd\\Cloud Signature Update Agent\\Exclaimer.CloudSignatureAgent.exe",
+                  "C:\\Windows\\System32\\wsl.exe",
+                  "C:\\Program Files\\Microsoft OneDrive\\OneDrive.exe",
+                  "C:\\Program Files\\Microsoft Office\\root\\Office??\\ONENOTE.EXE",
+                  "C:\\Program Files\\WindowsApps\\MSTeams_*\\ms-teams.exe",
+                  "C:\\Program Files\\Nextcloud\\nextcloud.exe",
+                  "C:\\Program Files\\WindowsApps\\MSTeams_*\\ms-teams.exe") and
+  not (process.code_signature.subject_name in ("CrashPlan Group LLC", "Red Hat, Inc", "d7xTech, Inc", "Code42 Software Inc",
+       "Galactic Advisors, Inc.", "Hamilton Bonaduz AG", "epostbox epb GmbH", "FastTrack Software ApS", "AnyDesk Software GmbH",
+       "Dassault Systemes SolidWorks Corp.") and
+       process.code_signature.trusted == true) and
+  not process.parent.executable :
+                      ("C:\\Program Files (x86)\\BigFix Enterprise\\BES Client\\BESClient.exe",
+                       "C:\\Program Files (x86)\\Microsoft Intune Management Extension\\agentexecutor.exe",
+                       "C:\\Program Files\\Produce8-Agent\\Produce8-Agent.exe",
+                       "C:\\WINDOWS\\_ScriptingFramework\\Modul\\Engine.exe") and
+  process.hash.sha256 != null and
+  not process.hash.sha256 in ("7b2ba9a849427f8cafac26fe3c522a62287b70dd05de3464e673706a8871552d",
+                             "a22895e55b26202eae166838edbe2ea6aad00d7ea600c11f8a31ede5cbce2048",
+                             "b924ad8062eaf4e70437c8be50fa612162795ff0839479546ce907ffa8d6e386",
+                             "e554425243e3e8ca1cd5fe550db41e6fa58a007c74fad400274b128452f38fb8") and
+  not (process.name : "wscript.exe" and process.args : "C:\\MININT\\Scripts\\LiteTouch.wsf")
+  ]
+ [any where event.category : ("registry", "file") and event.action != "deletion" and
+   (
+    (file.name != null and file.path : "?:\\*\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\*" and
+     file.name != "desktop.ini") or
+    (registry.data.strings != null and
+     registry.path : (
+      "H*\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\*",
+      "H*\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\*",
+      "H*\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnceEx\\*",
+      "H*\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run\\*",
+      "H*\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\*",
+      "H*\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run\\*",
+      "H*\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run\\*",
+      "HKEY_USERS\\*Classes\\*\\InprocServer32\\*",
+      "HKEY_USERS\\*Classes\\*\\LocalServer32\\*") and
+     not (process.name : "powershell.exe" and registry.path : "H*\\*\\RunOnce\\Update*") and
+     not (process.name : "powershell.exe" and file.path : "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp\\KnowledgeLake *.lnk") and
+     not registry.data.strings :
+                   ("*%ProgramFiles%*",
+                    "*:\\Program Files\\*",
+                    "*:\\Program Files (x86)\\*",
+                    "ctfmon.exe /n", "\"\\\\*",
+                    "rundll32.exe C:\\WINDOWS\\system32\\advpack.dll,DelNodeRunDLL32*",
+                    "\"C:\\Users\\*\\AppData\\Local\\Microsoft\\OneDrive\\OneDrive.exe\"  /background",
+                    "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -ToastActivated",
+                    "Powershell.exe -NoProfile -ExecutionPolicy ByPass -WindowStyle Hidden -file C:\\*\\RunOnce\\Logon.ps1"))
+   )
+  ]
+'''
+
+min_endpoint_version = "7.15.0"
+[[actions]]
+action = "kill_process"
+field = "process.entity_id"
+state = 0
+
+[[optional_actions]]
+action = "rollback"
+field = "process.entity_id"
+state = 0
+
+[[threat]]
+framework = "MITRE ATT&CK"
+[[threat.technique]]
+id = "T1059"
+name = "Command and Scripting Interpreter"
+reference = "https://attack.mitre.org/techniques/T1059/"
+[[threat.technique.subtechnique]]
+id = "T1059.001"
+name = "PowerShell"
+reference = "https://attack.mitre.org/techniques/T1059/001/"
+
+[[threat.technique.subtechnique]]
+id = "T1059.005"
+name = "Visual Basic"
+reference = "https://attack.mitre.org/techniques/T1059/005/"
+
+[[threat.technique.subtechnique]]
+id = "T1059.007"
+name = "JavaScript"
+reference = "https://attack.mitre.org/techniques/T1059/007/"
+
+
+
+[threat.tactic]
+id = "TA0002"
+name = "Execution"
+reference = "https://attack.mitre.org/tactics/TA0002/"
+[[threat]]
+framework = "MITRE ATT&CK"
+[[threat.technique]]
+id = "T1547"
+name = "Boot or Logon Autostart Execution"
+reference = "https://attack.mitre.org/techniques/T1547/"
+[[threat.technique.subtechnique]]
+id = "T1547.001"
+name = "Registry Run Keys / Startup Folder"
+reference = "https://attack.mitre.org/techniques/T1547/001/"
+
+
+
+[threat.tactic]
+id = "TA0003"
+name = "Persistence"
+reference = "https://attack.mitre.org/tactics/TA0003/"
+
+[internal]
+min_endpoint_version = "7.15.0"

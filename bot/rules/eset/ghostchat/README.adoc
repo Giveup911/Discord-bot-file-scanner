@@ -1,0 +1,19 @@
+= Love? Actually: Fake dating app used as lure in targeted spyware campaign in Pakistan - Indicators of Compromise
+
+The blog post on Android GhostSpy is available on WeLiveSecurity at
+https://www.welivesecurity.com/en/eset-research/
+
+== Files
+
+----
+B15B1F3F2227EBA4B69C85BDB638DF34B9D30B6A
+8B103D0AA37E5297143E21949471FD4F6B2ECBAA
+----
+
+== Network indicators
+
+=== C&C server domains
+
+----
+hitpak[.]org
+----

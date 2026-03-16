@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+
+# Terraform backup and internal cache
+*.tfstate*
+*.terraform
+
+# Lambda packages
+lambda_*.zip
+
+# Virtualenv
+venv/
+
+# Compiled YARA rules
+compiled_yara_rules.bin
+
+# IDE
+.idea/
+
+# Coverage
+.coverage
+
+# Mypy
+.mypy_cache/
+
+# MacOS artifacts
+Thumbs.db
+.DS_Store
+*.swp
+terminal.glue
+
+# Documentation build
+docs/build/

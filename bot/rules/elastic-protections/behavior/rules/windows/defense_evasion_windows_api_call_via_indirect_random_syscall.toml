@@ -1,0 +1,156 @@
+[rule]
+description = """
+Identifies calls to Windows memory APIs from unusual modules or NTDLL offsets. This may indicate an attempt to bypass
+API monitoring by jumping directly to syscall instructions.
+"""
+id = "9bc5d4cd-5748-4425-a4f3-7a704a11029d"
+license = "Elastic License v2"
+name = "Windows API Call via Indirect Random Syscall"
+os_list = ["windows"]
+version = "1.0.10"
+
+query = '''
+api where
+
+ process.Ext.api.name : ("VirtualAlloc", "VirtualAllocEx", "VirtualProtect", "VirtualProtectEx", "MapViewOfFile", "MapViewOfFile2", "WriteProcessMemory") and process.executable != null and
+
+ process.thread.Ext.call_stack_summary :("ntdll.dll|*", "win32*", "kernel*") and
+
+ process.thread.Ext.call_stack_final_user_module.path != null and
+
+ _arraysearch(process.thread.Ext.call_stack, $entry, $entry.symbol_info: "?:\\windows\\system32\\ntdll.dll!*+0x14") and
+
+ not _arraysearch(process.thread.Ext.call_stack, $entry, $entry.symbol_info:
+                                                                 ("*ntdll.dll!*ProtectVirtualMemory*",
+                                                                  "*ntdll.dll!*MapViewOfSection*",
+                                                                  "*ntdll.dll!*AllocateVirtualMemory*",
+                                                                  "*ntdll.dll!*CreateUserProcess*",
+                                                                  "*ntdll.dll!*CreateProcess*",
+                                                                  "*ntdll.dll!*DeviceIoControlFile*",
+                                                                  "*ntdll.dll!*AssignProcessToJobObject*",
+                                                                  "*ntdll.dll!ZwQuerySystemInformation*",
+                                                                  "*ntdll.dll!NtFsControlFile*",
+                                                                  "*ntdll.dll!ZwFsControlFile*",
+                                                                  "*ntdll.dll!ZwCancelIoFile*",
+                                                                  "*ntdll.dll!NtQuerySection*",
+                                                                  "*ntdll.dll!*CreateThread*",
+                                                                  "*kernelbase.dll!SetProcessDynamicEnforcedCetCompatibleRanges*",
+                                                                  "*ntdll.dll!RtlCaptureContext*",
+                                                                  "*kernelbase.dll!VirtualProtect*",
+                                                                  "*ntdll.dll!LdrShutdownProcess*",
+                                                                  "*ntdll.dll!NtdllDialogWndProc_W*",
+                                                                  "*ntdll.dll!*WriteRequestData*",
+                                                                  "*ntdll.dll!KiUserInvertedFunctionTable*",
+                                                                  "*ntdll.dll!*DeleteAtom*",
+                                                                  "*ntdll.dll!*QuerySection*",
+                                                                  "*ntdll.dll!*TerminateThread*",
+                                                                  "*kernelbase.dll*!CreateProcess*",
+                                                                  "*ntdll.dll*!*AlpcOpenSenderProcess*",
+                                                                  "*ntdll.dll*!*AlpcCreateResourceReserve*",
+                                                                  "ntdll.dll*!*IsProcessInJob*",
+                                                                  "*ntdll.dll*!*SetInformationFile*",
+                                                                  "*ntdll.dll*!NtSetEvent*",
+                                                                  "*ntdll.dll*!RtlGetNativeSystemInformation*",
+                                                                  "*ntdll.dll*!KiUserApcDispatcher*",
+                                                                  "*ntdll.dll!LdrLoadDll*",
+                                                                  "*ntdll.dll*!NtReadRequestData*",
+                                                                  "*ntdll.dll!RtlVirtualUnwind*",
+                                                                  "\\device\\+0*",
+                                                                  "*ntdll.dll+0x*",
+                                                                  "*ntdll.dll*!*CreateLowBoxToken*",
+                                                                  "*kernelbase.dll!DeviceIoControl*",
+                                                                  "*ntdll.dll!KiRaiseUserExceptionDispatcher*",
+                                                                  "*ntdll.dll!*IsProcessInJob*",
+                                                                  "*ntdll.dll!*PowerInformation*",
+                                                                  "*\\ntdll.dll!NtWriteVirtualMemory*",
+                                                                  "*\\ntdll.dll!ZwWriteVirtualMemory*",
+                                                                  "*\\windows\\winsxs\\temp\\pendingdeletes\\$$deletemekernelbase.dll*!WriteProcessMemory*",
+                                                                  "*\\kernelbase.dll+0x*",
+                                                                  "*kernelbase.dll!TestReport*",
+                                                                  "*\\kernelbase.dll!WriteProcessMemory*",
+                                                                  "*kernelbase.dll!RegEnumValueW*",
+                                                                  "*\\ntdll.dll!ZwOpenProcess*",
+                                                                  "*\\ntdll.dll!ZwQueryDefaultLocale*",
+                                                                  "*\\kernelbase.dll!CreateProcessInternalW*",
+                                                                  "*ntdll.dll!ZwWaitForSingleObject*",
+                                                                  "*ntdll.dll!NtIsProcessInJob*",
+                                                                  "*ntdll.dll!ZwDeviceIoControlFile*",
+                                                                  "*ntdll.dll!ZwQueryDirectoryFile*",
+                                                                  "*ntdll.dll!ZwDelayExecution*",
+                                                                  "*ntdll.dll!ZwAcceptConnectPort*",
+                                                                  "*kernelbase.dll!VirtualAllocExNuma*",
+                                                                  "*ntdll.dll!ZwQueryDefaultUILanguage*",
+                                                                  "*\\ntdll.dll!NtWaitForKeyedEvent*",
+                                                                  "*\\kernelbase.dll!OpenProcess*",
+                                                                  "*\\kernelbase.dll!GetFileSize*",
+                                                                  "*\\ntdll.dll!NtWaitForKeyedEvent*",
+                                                                  "*\\kernelbase.dll!EqualDomainSid*",
+                                                                  "*\\kernelbase.dll!LoadLibrary*",
+                                                                  "*\\rpcrt4.dll!I_RpcSend*",
+                                                                  "*\\kernelbase.dll!GetPhysicallyInstalledSystemMemory*",
+                                                                  "*\\kernelbase.dll!CallbackMayRunLong*",
+                                                                  "*\\kernelbase.dll!RegisterWaitForSingleObjec*",
+                                                                  "*\\kernelbase.dll!GetModuleFileName*",
+                                                                  "*\\ntdll.dll!NtReleaseWorkerFactoryWorker*",
+                                                                  "*\\ntdll.dll!NtSetInformationWorkerFactory*",
+                                                                  "*\\kernelbase.dll!AddExtensionProgId*",
+                                                                  "*\\ntdll.dll!NtAllocateReserveObject*",
+                                                                  "*\\ntdll.dll!ZwRestoreKey*",
+                                                                  "*\\kernelbase.dll!ProcessIdToSessionId*",
+                                                                  "c:\\windows\\system32\\ntdll.dll!NtOpenSection*",
+                                                                  "c:\\windows\\system32\\ntdll.dll!NtImpersonateClientOfPort*",
+                                                                  "*\\ntdll.dll!NtReleaseMutant+0x14",
+                                                                  "*\\ntdll.dll!NtQueryKey+0x14*",
+                                                                  "*\\ntdll.dll!NtQueryKey+0x14*",
+                                                                  "*\\ntdll.dll!NtEnumerateKey+0x14*",
+                                                                  "*\\ntdll.dll!NtQueryTimer+0x14*",
+                                                                  "*\\ntdll.dll!ZwDuplicateToken+0x14*",
+                                                                  "*\\ntdll.dll!NtDuplicateToken*",
+                                                                  "*\\ntdll.dll!NtdllDefWindowProc_W*",
+                                                                  "*\\ntdll.dll!NtEnumerateKey+0x14*")) and
+
+ not (process.thread.Ext.call_stack_summary : "ntdll.dll|Unknown|ntdll.dll*" and
+      _arraysearch(process.thread.Ext.call_stack, $entry, $entry.symbol_info : "*ntdll.dll!*TestAlert*")) and
+
+ not process.thread.Ext.call_stack_final_user_module.protection_provenance like ("Kernel", "Unknown", "Kernel|*", "Undetermined") and
+ not process.thread.Ext.call_stack_final_user_module.name in ("Kernel", "Unknown", "clr.dll", "coreclr.dll") and
+ not process.thread.Ext.call_stack_final_user_module.path like ("c:\\windows\\system32\\umppc*.dll", "c:\\windows\\syswow64\\ntdll.dll", "c:\\windows\\syswow64\\windows.storage.dll") and
+ not _arraysearch(process.thread.Ext.call_stack_final_user_module.code_signature,
+                  $entry, $entry.subject_name: ("Mozilla Corporation", "Google LLC", "Microsoft Windows Hardware Compatibility Publisher", "Activision Publishing Inc", "baramundi software GmbH", "Matrix42 GmbH") and $entry.status == "trusted") and
+ not process.thread.Ext.call_stack_final_user_module.hash.sha256 in
+                                              ("47178fac2c375587e1d971b9a095167e573985cbdf72ea8f32113f0b90f26b22",
+                                               "d1e49681e09cedf8a5751538273bc69d2c78d50469e8bc95203fc2643fa17a5f",
+                                               "00e8784a6e1e1dce13d49e2e978adaccfed74f9846d43feb1ad94c1aff52dfc3",
+                                               "574d3ef726c6ba1f7af31823c3820af7d86892b7e760de6817dbc3be0a09fbc4",
+                                               "7280f4d256bde0d274492ec489a31d3e7c43e8747cc0dd726dce8fe26b39acaf",
+                                               "1634d01728fe36029198587a173406ac9120a71101ff3d88dce8adcfbb1ec739",
+                                               "574d3ef726c6ba1f7af31823c3820af7d86892b7e760de6817dbc3be0a09fbc4",
+                                               "3be418a691f37d8648e0821bdb1c5fda99bf6f9dca9da4e6c4b5fa675788692f")
+'''
+
+min_endpoint_version = "8.10.0"
+[[actions]]
+action = "kill_process"
+field = "process.entity_id"
+state = 0
+
+[[optional_actions]]
+action = "rollback"
+field = "process.entity_id"
+state = 0
+
+[[threat]]
+framework = "MITRE ATT&CK"
+[[threat.technique]]
+id = "T1055"
+name = "Process Injection"
+reference = "https://attack.mitre.org/techniques/T1055/"
+
+
+[threat.tactic]
+id = "TA0005"
+name = "Defense Evasion"
+reference = "https://attack.mitre.org/tactics/TA0005/"
+
+[internal]
+min_endpoint_version = "8.10.0"

@@ -1,0 +1,78 @@
+[rule]
+description = """
+Identifies the execution of a recently created file that is unsigned or untrusted and from a remote network logon. This
+may indicate lateral movement via remote services.
+"""
+id = "642b43ad-67bf-476b-9581-a434535395f2"
+license = "Elastic License v2"
+name = "Unsigned File Execution via Network Logon"
+os_list = ["windows"]
+version = "1.0.27"
+
+query = '''
+process where event.action == "start" and
+ process.Ext.relative_file_creation_time <= 600 and
+ process.Ext.session_info.logon_type == "Network" and
+ process.Ext.session_info.relative_logon_time <= 5 and
+ (process.code_signature.exists == false or process.code_signature.trusted == false) and
+ not process.pe.imphash in ("106bf7f7567dfeec85f3670da6d1c029", "6e7f9a29f2c85394521a08b9f31f6275") and
+ not process.hash.sha256 in
+                ("f1d3489e0af0c498103df0433cee9f36f5d28d34dfe94aac510f7d32d0da5495",
+                 "d57875f09a33cda2dc1030a4f82405f1de56b5536b6b87329323dfb2042b5e1c",
+                 "31f692eaa4a205f52235f43ee69b23c6789b45ed11e5a831e9b9b460c3985867",
+                 "8d9b5190aace52a1db1ac73a65ee9999c329157c8e88f61a772433323d6b7a4a", 
+                 "fc18fbb2b4e54c25ea3fdcdd9682735a636dd61127da451a2c19fd7e8d154285", 
+                 "1cf0f867dec12c8a6c5caceeec86222e5c9af19a162c2ace0a33b2f5468e0c2a", 
+                 "9f2181f0bb4e411702856555cb2005e0775338b444fd4ec46a48bf189ad30b61", 
+                 "2eab645570d72158a6fa793dd461f3db21ca256321d61238808cb2b31c29aae0",
+                 "fc41e0c5941b69a28a751c8429fd377db2f4a3553c2141e4e5edc510ef71a3f0",
+                 "6a377f345bc9b5551a1d3126c4ebc4c259f59a63a511bdbe36f3a9a6902c1054",
+                 "16881253329482b8a0032888f78fd2cb9e2215da2fe2f69630d5fd0b16dabc91",
+                 "294751675ed1c48230d78fcf23c0bbcef66f376f125e1770467870f65c5b22e6",
+                 "076079608e56236409e5638ad617c8284d9fc1194c858c5dea6ff65e964e6979",
+                 "d092825db8bef574796fc863d6023d36abe37de6a2c4518162eaf1f47889960b",
+                 "b4abd97f03f0c8c4de84f91315bbc5610fd51b926941eb39625ed27667d558e9",
+                 "95aa3007399d1b9116ea8d1e1a6e76945f0d9c4ba73ef5021c4995728cef5722",
+                 "9c86d5f9a7a50a37d46a93b851dc1ca4a473134aafd9a0db654f8e3c100e54b6",
+                 "39adf69d9a231bd572f1c70a510c40b54939e8edd31511ce7100a579592634f4",
+                 "b7e0698740f3ddca92a093e19d1c41db4fe46cb6cd748ca7ca0d4af9949f3273",
+                 "b6c85a7c7134cc2748069ea6339af553ce8c4ef28b5807b64209009ae0e85c20",
+                 "d8b3c7eaa1e0b2788ee65ce9be002b875f8b128c7df2ea7b4f9f8b2eb6ff4c65",
+                 "7b5b071975a394a2d4ef2192cfd2cebe3b732b05134663274204885a198caa7f",
+                 "dfe85716d2bca3047b8eff311583de17ec2bef35cbaedff72a7802c185c32ba6",
+                 "8560aaad29f8310b4a743b445b9a930a40b52d0be77ce0c845a657db5c6a5d84") and
+ not (process.pe.original_file_name == "Source.DBVersionControl.dll" and
+      process.parent.executable : "C:\\Program Files\\PowerShell\\7\\pwsh.exe") and
+ not (process.code_signature.subject_name == "LLC Breakthrough Technologies" and process.code_signature.status == "errorExpired") and
+ not (process.executable : ("C:\\ProgramData\\chocolatey\\bin\\wacs.exe", "C:\\tools\\win-acme\\wacs.exe") and
+      process.args : "--certificatestore" and process.parent.name : ("wacs.exe", "powershell.exe")) and
+ not process.executable : "C:\\Program Files\\Mozilla Firefox\\uninstall\\uninstaller.exe"
+'''
+
+min_endpoint_version = "8.6.0"
+optional_actions = []
+[[actions]]
+action = "kill_process"
+field = "process.entity_id"
+state = 0
+
+[[threat]]
+framework = "MITRE ATT&CK"
+[[threat.technique]]
+id = "T1021"
+name = "Remote Services"
+reference = "https://attack.mitre.org/techniques/T1021/"
+[[threat.technique.subtechnique]]
+id = "T1021.002"
+name = "SMB/Windows Admin Shares"
+reference = "https://attack.mitre.org/techniques/T1021/002/"
+
+
+
+[threat.tactic]
+id = "TA0008"
+name = "Lateral Movement"
+reference = "https://attack.mitre.org/tactics/TA0008/"
+
+[internal]
+min_endpoint_version = "8.6.0"

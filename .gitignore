@@ -1,0 +1,63 @@
+# Config with secrets
+bot/config.yml
+bot/stats.json
+
+# Environment and secrets
+.env
+*.env
+.env.*
+*.pem
+*.key
+*.p12
+*.jks
+credentials.json
+service-account.json
+
+# Logs and scan output
+logs/
+scanned/
+scanner.log
+scanner.log.*
+webhook.log
+
+# Uploaded samples
+PUT_JAR_HERE/*.jar
+PUT_JAR_HERE/*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Java build artifacts (except tools/ which ships compiled)
+target/
+build/
+out/
+*.war
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Tor binary (users download separately — see README)
+tor/
+
+# Audit reports (dev-only)
+bot/code-review-*.md
+bot/security-audit-*.md
+bot/docs-audit-*.md
+tools/code-review-*.md
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# YARA repo .git dirs (should already be removed)
+bot/rules/**/.git/
+bot/rules/**/.github/

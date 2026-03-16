@@ -1,0 +1,80 @@
+== GhostRedirector poisons Windows servers: Backdoors with a side of Potatoes – Indicators of Compromise
+
+The blog post on GhostRedirector poisons Windows servers is available on
+WeLiveSecurity at https://www.welivesecurity.com/en/
+
+=== Files
+
+[width="100%",cols="25%,25%,25%,25%",options="header",]
+|===
+|SHA-1 |Filename |Detection |Description
+|`+EE22BA5453ED577F8664CA390EB311D067E47786+` |SitePut.exe |MSIL/Agent.FEZ |Zunput, information collector and webshell installer
+|`+677B3F9D780BE184528DE5967936693584D9769A+` |EfsNetAutoUser.exe |MSIL/HackTool.Agent.QJ |A custom tool using the EfsPotato exploit to create a new user on the compromised server
+|`+5D4D7C96A9E302053BDFAF2449F9A2AB3C806E63+` |NetAutoUser.exe |MSIL/AddUser.S |A custom tool using the BadPotato exploit to create a new user on the compromised server
+|`+28140A5A29EBA098BC6215DDAC8E56EACBB29B69+` |miniscreen.dll |Win64/Agent.ELA |Rungan, a passive C++ backdoor
+|`+371818BDC20669DF3CA44BE758200872D583A3B8+` |auto.exe |Generik.KJWBIPC |A tool to create a new user on the compromised server
+|`+9DD282184DDFA796204C1D90A46CAA117F46C8E1+` |auto_sign.exe |MSIL/Agent.XQL |A tool to create a new user or deploy webshells on the compromised server
+|`+87F354EAA1A6ED5AE51C4B1A1A801B6CF818DAFC+` |EfsNetAutoUser.exe |MSIL/HackTool.Agent.QJ |A custom tool using the EfsPotato exploit to create a new user on the compromised server
+|`+5A01981D3F31AF47614E51E6C216BED70D921D60+` |DotNet4.5.exe |MSIL/AddUser.S |A custom tool using BadPotato exploit to elevate privileges of an existing user
+|`+6EBD7498FC3B744CED371C379BA537077DD97036+` |NetAUtoUser_sign.exe |MSIL/AddUser.S |A custom tool using BadPotato exploit to elevated privileges of an existing user
+|`+0EE926E29874324E52DE816B74B12069529BB556+` |link.exe |Win64/RemoteAdmin.GotoHTTP.A |GoToHTTP tool
+|`+373BD3CED51E19E88876B80225ECA65A5C01413F+` |N/A |PHP/Webshell.NWE |Webshell
+|`+5CFFC4B3B96256A45FB45056AE0A9DC76329C25A+` |N/A |ASP/Webshell.MP |Webshell
+|`+B017CEE02D74C92B2C65517101DC72AFA7D18F16+` |N/A |PHP/Webshell.OHB |Webshell
+|`+A8EE056799BFEB709C08D0E41D9511CED5B1F19D+` |N/A |ASP/Webshell.UV |Webshell
+|`+C4681F768622BD613CBF46B218CDA06F87559825+` |N/A |ASP/Webshell.KU |Webshell
+|`+E69E4E5822A81F68107B933B7653C487D055C51B+` |N/A |ASP/Webshell.UZ |Webshell
+|`+A3A55E4C1373E8287E4E4D5D3350AC665E1411A7+` |N/A |ASP/Webshell.UY |Webshell
+|`+E6E4634CE5AFDA0688E73A2C21A2ECDABD5E155D+` |N/A |ASP/Webshell.UY |Webshell
+|`+5DFC2D0858DD7E811CD19938B8C28468BE494CB6+` |N/A |ASP/Webshell.UX |Webshell
+|`+08AB5CC8618FA593D2DF91900067DB464DC72B3E+` |ManagedEngine32_v2.dll |Win32/BadIIS.AG |Gamshen, a malicious IIS module
+|`+871A4DF66A8BAC3E640B2D1C0AFC075BB3761954+` |ManagedEngine64_v2.dll |Win64/BadIIS.CY |Gamshen, a malicious IIS module
+|`+049C343A9DAAF3A93756562ED73375082192F5A8+` |N/A |MSIL/Agent.FFZ |Comdai, a malicious multipurpose DLL used to create a malicious user
+|===
+
+==== Network
+
+[width="100%",cols="20%,20%,20%,20%,20%",options="header",]
+|===
+|IP |Domain |Hosting provider |First seen |Details
+|N/A |`+xzs.868id.com+` |N/A |2024-12-03 |GhostRedirector staging server, hosted on Cloudflare.
+|`+104.233.192.1+` |`+xz.868id.com+` |PEG TECH INC |2024-12-03 |GhostRedirector staging server.
+|`+104.233.210.229+` |`+www.881vn.com+` |PEG TECH INC |2023-10-06 |GhostRedirector staging server.
+|`+104.233.210.229+` |`+q.822th.com+`|PEG TECH INC |2023-10-06 |GhostRedirector staging server.
+|N/A |`+gobr.868id.com+` |N/A |2024-08-25 |Gamshen C&C server, hosted on Cloudflare.
+|N/A |`+brproxy.868id.com+` |N/A |2024-08-25 |Gamshen C&C server, hosted on Cloudflare.
+|`+43.228.126.4+` |`+www.cs01.shop+` |XIMBO Internet Limited |2024-04-01 |Comdai C&C server.
+|`+103.251.112.11+` |N/A |IRT-HK-ANS |N/A |GhostRedirector staging server.
+|===
+
+== MITRE ATT&CK TECHNIQUES
+
+[width="100%",cols="25%,25%,25%",options="header",]
+|===
+|Tactic |ID |Name
+|*Resource Development* |T1588.002 |Obtain Capabilities: Tool
+| |T1587.001 |Develop Capabilities: Malware
+| |T1608.006 |Stage Capabilities: SEO Poisoning
+| |T1583.001 |Acquire Infrastructure: Domains
+| |T1583.004 |Acquire Infrastructure: Server
+| |T1608.001 |Stage Capabilities: Upload Malware
+| |T1608.002 |Stage Capabilities: Upload Tool
+| |T1588.003 |Obtain Capabilities: Code Signing Certificates
+|*Initial Access* |T1190 |Exploit Public-Facing Application
+|*Execution* |T1106 |Native API
+| |T1059.001 |Command and Scripting Interpreter: PowerShell
+| |T1059.003 |Command and Scripting Interpreter: Windows Command Shell
+| |T1559 |Inter-Process Communication
+|*Privilege Escalation* |T1546 |Event Triggered Execution
+|*Defense Evasion* |T1134 |Access Token Manipulation
+| |T1112 |Modify Registry
+| |T1027 |Obfuscated Files or Information
+| |T1027.009 |Obfuscated Files or Information: Embedded Payloads
+| |T1140 |Deobfuscate/Decode Files or Information
+|*Discovery* |T1083 |File and Directory Discovery
+|*Command and Control* |T1105 |Ingress Tool Transfer
+| |T1219 |Remote Access Software
+| |T1071.001 |Application Layer Protocol: Web Protocols
+| |T1008 |Fallback Channels
+|*Impact* |T1565 |Data Manipulation
+|===
