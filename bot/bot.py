@@ -26,12 +26,21 @@ import tempfile
 import time
 import uuid
 import zipfile
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 import yaml
+
+# ─── Deobfuscation ──────────────────────────────────────────────────────────
+# Add tools/ to path so we can import deobfuscate_dasho
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+try:
+    from deobfuscate_dasho import deobfuscate_jar as _deobfuscate_jar
+    DEOBFUSCATOR_AVAILABLE = True
+except ImportError:
+    DEOBFUSCATOR_AVAILABLE = False
 
 # ─── Logging ────────────────────────────────────────────────────────────────
 
@@ -539,7 +548,7 @@ async def mb_lookup(sha256: str, session: aiohttp.ClientSession) -> Optional[dic
     try:
         mb_headers = {}
         mb_auth = CFG.get("malwarebazaar", {}).get("auth_key", "")
-        if mb_auth:
+        if mb_auth and not mb_auth.startswith("YOUR_"):
             mb_headers["Auth-Key"] = mb_auth
         async with session.post(
             MB_API,
@@ -575,7 +584,7 @@ async def mb_lookup(sha256: str, session: aiohttp.ClientSession) -> Optional[dic
                 "status": "found",
             }
     except Exception as e:
-        log.warning(f"MalwareBazaar lookup failed: {e}")
+        log.warning(f"MalwareBazaar lookup failed: {type(e).__name__}: {e}")
         return {"status": "error", "permalink": permalink}
 
 
@@ -583,7 +592,7 @@ async def mb_upload(filepath: str, sha256: str, session: aiohttp.ClientSession,
                     tags: list[str] = None, comment: str = None) -> Optional[dict]:
     """Upload a flagged malware sample to MalwareBazaar."""
     mb_auth = CFG.get("malwarebazaar", {}).get("auth_key", "")
-    if not mb_auth or not CFG.get("malwarebazaar", {}).get("enabled", True):
+    if not mb_auth or mb_auth.startswith("YOUR_") or not CFG.get("malwarebazaar", {}).get("enabled", True):
         return None
     permalink = f"https://bazaar.abuse.ch/sample/{sha256}/"
     try:
@@ -1754,6 +1763,11 @@ OBFUSCATORS = {
     "Branchlock": [b"branchlock", b"me/iris/"],
     "ProGuard": [b"proguard", b"ProGuard"],
     "JNIC": [b"jnic", b"JNICLoader"],
+    "DashO": [b"DashO", b"PreEmptive", b"com/preemptive"],
+    "Skidfuscator": [b"skidfuscator", b"Skidfuscator"],
+    "Caesium": [b"caesium", b"Caesium"],
+    "Radon": [b"radon", b"Radon Obfuscator"],
+    "Paramorphism": [b"paramorphism", b"Paramorphism"],
 }
 
 
@@ -1779,7 +1793,13 @@ def detect_obfuscators(jar_path: str) -> list[str]:
 
             unicode_names = sum(1 for n in class_names if any(ord(c) > 127 for c in n))
             if unicode_names > 5:
-                found.add("Unicode class names")
+                # Check for DashO's combining character pattern (U+0300-U+036F, zero-width)
+                dasho_chars = sum(1 for n in class_names if any(
+                    0x0300 <= ord(c) <= 0x036F or ord(c) in (0x200B, 0x200C, 0x200D, 0xFEFF) for c in n))
+                if dasho_chars > 3:
+                    found.add("DashO (Unicode combining chars)")
+                else:
+                    found.add("Unicode class names")
 
             dat_files = [n for n in names if n.endswith((".dat", ".bin")) and "jnic" not in n.lower()]
             if dat_files:
@@ -1933,11 +1953,13 @@ def compute_risk_score(
 
         non_library_markers = [
             m for m in markers
-            if not m.startswith("Bytecode API ref:")
-            or any(x in m for x in [
-                "Runtime.exec", "ProcessBuilder", "defineClass",
-                "URLClassLoader", "System.load",
-            ])
+            if m not in high_risk_markers and (
+                not m.startswith("Bytecode API ref:")
+                or any(x in m for x in [
+                    "Runtime.exec", "ProcessBuilder", "defineClass",
+                    "URLClassLoader", "System.load",
+                ])
+            )
         ]
         score += min(len(non_library_markers), 10)
 
@@ -2008,8 +2030,8 @@ def compute_risk_score(
                 score += 30
             elif format_analysis.get("js_found"):
                 score += 15
-            critical = sum(1 for f in format_analysis.get("findings", []) if f.get("severity") == "critical")
-            high = sum(1 for f in format_analysis.get("findings", []) if f.get("severity") == "high")
+            critical = sum(1 for f in format_analysis.get("findings", []) if isinstance(f, dict) and f.get("severity") == "critical")
+            high = sum(1 for f in format_analysis.get("findings", []) if isinstance(f, dict) and f.get("severity") == "high")
             score += min(critical * 10 + high * 5, 25)
 
         elif fa_type == "Office":
@@ -2190,6 +2212,7 @@ def build_embeds(
     nested_count: int = 0,
     zip_bomb_warning: str = None,
     format_analysis: dict = None,
+    deobfuscation: dict = None,
 ) -> list[discord.Embed]:
     embeds = []
     emoji = LEVEL_EMOJI.get(level, "")
@@ -2202,13 +2225,21 @@ def build_embeds(
         timestamp=datetime.now(timezone.utc),
     )
 
-    # risk score
+    # risk score with context
     bar_filled = score // 10
     bar_empty = 10 - bar_filled
     bar = "\u2588" * bar_filled + "\u2591" * bar_empty
+    if score <= DETECTION_THRESHOLD:
+        risk_hint = "No significant threats detected"
+    elif score <= 35:
+        risk_hint = "Minor flags \u2014 review details below"
+    elif score <= 60:
+        risk_hint = "Multiple suspicious indicators \u2014 exercise caution"
+    else:
+        risk_hint = "Strong malware indicators \u2014 do not run this file"
     e.add_field(
         name="Risk Score",
-        value=f"**{score}/100** ({level})\n`{bar}`",
+        value=f"**{score}/100** ({level})\n`{bar}`\n{risk_hint}",
         inline=True,
     )
 
@@ -2384,17 +2415,62 @@ def build_embeds(
         eth_text = "\n".join(f"`{a}`" for a in extracted_strings["eth_addresses"][:5])
         e.add_field(name="\U0001F4B0 Ethereum Addresses", value=eth_text, inline=False)
 
-    # behavioral markers
+    # behavioral markers — split into threats vs informational
     if iocs:
         markers = iocs.get("behavioralMarkers", [])
         important = [m for m in markers if not m.startswith("Bytecode API ref:")]
-        high_risk = [m for m in markers if "HIGH RISK" in m]
-        show = high_risk + [m for m in important if m not in high_risk]
-        if show:
-            text = "\n".join(f"{'**\U0001F6A8** ' if 'HIGH RISK' in m else '- '}{sanitize_path(m)}" for m in show[:12])
-            if len(show) > 12:
-                text += f"\n*... and {len(show) - 12} more*"
-            e.add_field(name="\U0001F50D Behavioral Markers", value=_trunc(text), inline=False)
+        high_risk = [m for m in important if "HIGH RISK" in m]
+        # Markers with " — " contain our detailed descriptions
+        threats = high_risk[:]
+        info_markers = []
+        for m in important:
+            if m in high_risk:
+                continue
+            # Known malicious domains/infra are always threats
+            if any(x in m.lower() for x in ["known malicious", "confirmed", "c2", "exfil", "stealer"]):
+                threats.append(m)
+            else:
+                info_markers.append(m)
+        if threats:
+            text = "\n".join(f"\U0001F6A8 {sanitize_path(m)}" for m in threats[:8])
+            if len(threats) > 8:
+                text += f"\n*... and {len(threats) - 8} more*"
+            _safe_add_field(e, budget, name="\U0001F6A8 Threat Indicators", value=_trunc(text), inline=False)
+        if info_markers:
+            text = "\n".join(f"\u2022 {sanitize_path(m)}" for m in info_markers[:10])
+            if len(info_markers) > 10:
+                text += f"\n*... and {len(info_markers) - 10} more*"
+            _safe_add_field(e, budget, name="\U0001F50D Observed Behaviors", value=_trunc(text), inline=False)
+
+    # ── Deobfuscated strings ──
+    if deobfuscation and deobfuscation.get("detected"):
+        deob_lines = [f"**DashO string encryption cracked** — {deobfuscation['total_decrypted']} strings "
+                      f"from {deobfuscation['classes_with_strings']} classes"]
+        algos = deobfuscation.get("algorithms", [])
+        if algos:
+            deob_lines.append(f"Algorithms: {', '.join(algos)}")
+        # Show interesting decrypted strings (URLs, domains, paths, tokens)
+        interesting = []
+        mundane = []
+        for s in deobfuscation.get("strings", []):
+            d = s["decrypted"]
+            if any(x in d.lower() for x in ["http", "://", ".com", ".net", ".ru", ".shop",
+                    "webhook", "token", "password", "discord", "minecraft", "session",
+                    "appdata", "roaming", ".exe", ".dll", ".jar", "launcher_accounts"]):
+                interesting.append(d)
+            elif len(d) > 3:
+                mundane.append(d)
+        if interesting:
+            deob_lines.append("**Notable decrypted strings:**")
+            for s in interesting[:8]:
+                deob_lines.append(f"  `{sanitize_path(s[:80])}`")
+            if len(interesting) > 8:
+                deob_lines.append(f"  *... and {len(interesting) - 8} more*")
+        elif mundane:
+            deob_lines.append("**Sample decrypted strings:**")
+            for s in mundane[:5]:
+                deob_lines.append(f"  `{sanitize_path(s[:80])}`")
+        _safe_add_field(e, budget, name="\U0001F513 Deobfuscated Strings", value=_trunc("\n".join(deob_lines)), inline=False)
 
     # ── Format-specific analysis ──
     if format_analysis:
@@ -2425,8 +2501,11 @@ def build_embeds(
         elif fa_type == "PDF":
             pdf_lines = [f"**{format_analysis.get('version', 'PDF')}** | {format_analysis.get('stream_count', 0)} stream(s)"]
             for f_item in format_analysis.get("findings", [])[:8]:
-                sev_icon = "\U0001F6A8" if f_item["severity"] == "critical" else "\u26A0" if f_item["severity"] == "high" else "\u2139"
-                pdf_lines.append(f"{sev_icon} `{f_item['keyword']}` \u00d7{f_item['count']}")
+                if isinstance(f_item, dict):
+                    sev_icon = "\U0001F6A8" if f_item.get("severity") == "critical" else "\u26A0" if f_item.get("severity") == "high" else "\u2139"
+                    pdf_lines.append(f"{sev_icon} `{f_item.get('keyword', '?')}` \u00d7{f_item.get('count', '?')}")
+                else:
+                    pdf_lines.append(f"\u2022 {f_item}")
             for w in format_analysis.get("warnings", [])[:3]:
                 pdf_lines.append(f"\U0001F6A8 {w}")
             e.add_field(name="\U0001F4C4 PDF Analysis", value=_trunc("\n".join(pdf_lines[:12])), inline=False)
@@ -2477,7 +2556,10 @@ def build_embeds(
             for w in format_analysis.get("warnings", [])[:5]:
                 msi_lines.append(f"\u26A0 {sanitize_path(w)}")
             for f_item in format_analysis.get("findings", [])[:3]:
-                msi_lines.append(f"- {f_item}")
+                if isinstance(f_item, dict):
+                    msi_lines.append(f"- {f_item.get('keyword', f_item)}")
+                else:
+                    msi_lines.append(f"- {f_item}")
             e.add_field(name="\U0001F4E6 MSI Analysis", value=_trunc("\n".join(msi_lines[:10]) or "No issues found"), inline=False)
 
         elif fa_type == "ISO":
@@ -2500,23 +2582,41 @@ def build_embeds(
 
     embeds.append(e)
 
-    # — Suspicious bytecode overflow embed —
+    # — Suspicious bytecode overflow embed with context —
     if iocs:
         bytecode_markers = [m for m in iocs.get("behavioralMarkers", []) if m.startswith("Bytecode API ref:")]
-        suspicious_bytecode = [
-            m for m in bytecode_markers
-            if any(x in m for x in [
-                "Runtime.exec", "ProcessBuilder", "defineClass",
-                "URLClassLoader", "System.load", "deleteOnExit",
-                "ClassLoader", "setAccessible",
-            ])
-        ]
-        if suspicious_bytecode:
-            e2 = discord.Embed(title="\U0001F50E Suspicious Bytecode References", color=color)
-            text = "\n".join(f"- {sanitize_path(m)}" for m in suspicious_bytecode[:25])
-            if len(suspicious_bytecode) > 25:
-                text += f"\n*... and {len(suspicious_bytecode) - 25} more*"
-            e2.description = _trunc(text, 4000)
+        # Categorize bytecode refs by risk level
+        high_concern = []  # APIs that are almost always suspicious in mods
+        moderate_concern = []  # APIs that are common but worth noting
+        other_concern = []  # Everything else worth showing
+        ALWAYS_SUSPICIOUS = ["defineClass", "URLClassLoader", "deleteOnExit", "setAccessible"]
+        CONTEXT_DEPENDENT = ["Runtime.exec", "ProcessBuilder", "System.load", "System.loadLibrary"]
+        for m in bytecode_markers:
+            if any(x in m for x in ALWAYS_SUSPICIOUS):
+                high_concern.append(m)
+            elif any(x in m for x in CONTEXT_DEPENDENT):
+                moderate_concern.append(m)
+            else:
+                other_concern.append(m)
+        if high_concern or moderate_concern or other_concern:
+            e2 = discord.Embed(title="\U0001F50E Bytecode API Analysis", color=color)
+            lines = []
+            if high_concern:
+                lines.append("**Unusual for mods** (rarely needed by legitimate code):")
+                for m in high_concern[:10]:
+                    lines.append(f"\U0001F6A8 {sanitize_path(m)}")
+            if moderate_concern:
+                lines.append("**Context-dependent** (used by installers/launchers, but also by malware):")
+                for m in moderate_concern[:10]:
+                    lines.append(f"\u26A0 {sanitize_path(m)}")
+            if other_concern:
+                lines.append("**Other API references:**")
+                for m in other_concern[:8]:
+                    lines.append(f"\u2022 {sanitize_path(m)}")
+            total = len(high_concern) + len(moderate_concern) + len(other_concern)
+            if total > 28:
+                lines.append(f"*... and {total - 28} more*")
+            e2.description = _trunc("\n".join(lines), 4000)
             embeds.append(e2)
 
     # Enforce Discord's 6000 total character limit across all embeds
@@ -2667,6 +2767,14 @@ def build_mb_embed(mb_result: Optional[dict], sha256: str, scan_id: str) -> disc
             color=0x2ECC71,
             timestamp=datetime.now(timezone.utc),
         )
+    elif mb_result and mb_result.get("status") == "upload_failed":
+        detail = mb_result.get("detail", "unknown error")
+        e = discord.Embed(
+            title="\U0001F9A0 MalwareBazaar",
+            description=f"Upload failed: {detail}\n\n**[Search MalwareBazaar]({permalink})**",
+            color=0x95A5A6,
+            timestamp=datetime.now(timezone.utc),
+        )
     elif mb_result and mb_result.get("status") == "error":
         e = discord.Embed(
             title="\U0001F9A0 MalwareBazaar",
@@ -2677,7 +2785,7 @@ def build_mb_embed(mb_result: Optional[dict], sha256: str, scan_id: str) -> disc
     else:
         e = discord.Embed(
             title="\U0001F9A0 MalwareBazaar",
-            description=f"Lookup skipped or unavailable.\n\n**[Search MalwareBazaar]({permalink})**",
+            description=f"Lookup returned no results — API may be unreachable.\n\n**[Search MalwareBazaar]({permalink})**",
             color=0x95A5A6,
             timestamp=datetime.now(timezone.utc),
         )
@@ -2860,11 +2968,6 @@ def extract_files_from_zip(zip_path: str, extract_to: str, depth: int = 0, max_e
     except zipfile.BadZipFile:
         pass
     return extracted
-
-
-def extract_jars_from_zip(zip_path: str, extract_to: str, depth: int = 0, max_extract_bytes: int = 200 * 1024 * 1024) -> list[str]:
-    """Backward-compat wrapper — now extracts all scannable file types."""
-    return extract_files_from_zip(zip_path, extract_to, depth, max_extract_bytes)
 
 
 def is_valid_jar(filepath: str) -> bool:
@@ -3816,7 +3919,11 @@ async def run_scan(
                 api_tasks["vt_sb"] = asyncio.create_task(vt_get_sandbox_links(sha256, http_session))
 
             if "mb" in api_tasks:
-                mb_result = await api_tasks["mb"]
+                try:
+                    mb_result = await api_tasks["mb"]
+                except Exception as exc:
+                    log.warning(f"MalwareBazaar task failed: {exc}")
+                    mb_result = {"status": "error", "permalink": f"https://bazaar.abuse.ch/sample/{sha256}/"}
                 stages["MalwareBazaar"] = "complete"
                 if mb_result and mb_result.get("status") == "found":
                     await update_stats(mb_hits=1)
@@ -3825,8 +3932,17 @@ async def run_scan(
                         await mb_msg.edit(embed=build_mb_embed(mb_result, sha256, scan_id))
                     except discord.HTTPException:
                         pass
+            elif mb_msg:
+                try:
+                    await mb_msg.edit(embed=build_mb_embed(None, sha256, scan_id))
+                except discord.HTTPException:
+                    pass
             if "ha" in api_tasks:
-                ha_result = await api_tasks["ha"]
+                try:
+                    ha_result = await api_tasks["ha"]
+                except Exception as exc:
+                    log.warning(f"Hybrid Analysis task failed: {exc}")
+                    ha_result = None
                 stages["Hybrid Analysis"] = "complete"
                 if ha_msg:
                     try:
@@ -3941,6 +4057,21 @@ async def run_scan(
         # ── Obfuscator detection ──
         obfuscators = await asyncio.to_thread(detect_obfuscators, dl_path)
 
+        # ── DashO string deobfuscation ──
+        deobfuscation = None
+        if DEOBFUSCATOR_AVAILABLE and is_zip:
+            try:
+                deobfuscation = await asyncio.to_thread(_deobfuscate_jar, str(dl_path))
+                if deobfuscation and deobfuscation.get("detected"):
+                    log.info(f"DashO deobfuscation: {deobfuscation['total_decrypted']} strings from "
+                             f"{deobfuscation['classes_with_strings']} classes")
+                    if "DashO" not in obfuscators:
+                        obfuscators.append("DashO (string encryption cracked)")
+                else:
+                    deobfuscation = None
+            except Exception as exc:
+                log.warning(f"Deobfuscation failed: {exc}")
+
         # ── Entropy analysis ──
         entropy = await asyncio.to_thread(analyze_entropy, dl_path)
 
@@ -4051,7 +4182,11 @@ async def run_scan(
 
         # ── Collect results and update each message as it completes ──
         if "mb" in api_tasks:
-            mb_result = await api_tasks["mb"]
+            try:
+                mb_result = await api_tasks["mb"]
+            except Exception as exc:
+                log.warning(f"MalwareBazaar task failed: {exc}")
+                mb_result = {"status": "error", "permalink": f"https://bazaar.abuse.ch/sample/{sha256}/"}
             stages["MalwareBazaar"] = "complete"
             if mb_result and mb_result.get("status") == "found":
                 await update_stats(mb_hits=1)
@@ -4060,9 +4195,18 @@ async def run_scan(
                     await mb_msg.edit(embed=build_mb_embed(mb_result, sha256, scan_id))
                 except discord.HTTPException:
                     pass
+        elif mb_msg:
+            try:
+                await mb_msg.edit(embed=build_mb_embed(None, sha256, scan_id))
+            except discord.HTTPException:
+                pass
 
         if "ha" in api_tasks:
-            ha_result = await api_tasks["ha"]
+            try:
+                ha_result = await api_tasks["ha"]
+            except Exception as exc:
+                log.warning(f"Hybrid Analysis task failed: {exc}")
+                ha_result = None
             stages["Hybrid Analysis"] = "complete"
             if ha_msg:
                 try:
@@ -4159,6 +4303,7 @@ async def run_scan(
             nested_count=max(0, len(jars_to_scan) - 1),
             zip_bomb_warning=zip_bomb_warning,
             format_analysis=format_analysis,
+            deobfuscation=deobfuscation,
         )
 
         if not is_zip and not format_analysis:

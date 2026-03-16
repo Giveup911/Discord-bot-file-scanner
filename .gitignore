@@ -61,6 +61,9 @@ desktop.ini
 # Large YARA repos (download separately — see download script in rules/)
 bot/rules/defender-yara/
 
+# Testing / scratch work
+testing/
+
 # YARA repo .git dirs (should already be removed)
 bot/rules/**/.git/
 bot/rules/**/.github/

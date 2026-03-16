@@ -83,7 +83,7 @@ rule Skyrage_RAT
         $pkg = "de/skyrage" ascii
 
     condition:
-        uint16(0) == 0x504B and any of them
+        uint16(0) == 0x4B50 and any of them
 }
 
 rule Fractureiser
@@ -102,7 +102,7 @@ rule Fractureiser
         $c2_ip2 = "107.189.3.101" ascii
 
     condition:
-        uint16(0) == 0x504B and ($fract1 or ($stage0_class and $stage0_pkg) or $stage1_class or any of ($c2_ip*))
+        uint16(0) == 0x4B50 and ($fract1 or ($stage0_class and $stage0_pkg) or $stage1_class or any of ($c2_ip*))
 }
 
 rule MSHTA_Dropper

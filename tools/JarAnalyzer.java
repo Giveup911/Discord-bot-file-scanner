@@ -362,12 +362,14 @@ public class JarAnalyzer {
     }
 
     // Convenience accessors
-    static String   cfg(String key)      { return CFG.getProperty(key); }
+    static String   cfg(String key)      { String v = CFG.getProperty(key); return v != null ? v : ""; }
     static int      cfgInt(String key)   {
-        try { return Integer.parseInt(CFG.getProperty(key).trim()); }
+        String v = CFG.getProperty(key);
+        if (v == null || v.isBlank()) return 0;
+        try { return Integer.parseInt(v.trim()); }
         catch (NumberFormatException e) { System.err.println("WARNING: invalid int for config key '" + key + "', defaulting to 0"); return 0; }
     }
-    static String[] cfgArr(String key)   { return CFG.getProperty(key).split("\\|"); }
+    static String[] cfgArr(String key)   { String v = CFG.getProperty(key); return v != null ? v.split("\\|") : new String[0]; }
 
     // Dropper constant accessors (read live from CFG so config.properties overrides take effect)
     static String   DROPPER_ETH_CONTRACT()  { return cfg("dropper.eth.contract"); }
@@ -889,11 +891,16 @@ public class JarAnalyzer {
         ok("Full decompilation complete (used: " + decompilerUsed + ")");
 
         // Also build the in-memory source string for pattern matching
+        final long MAX_SOURCE_CHARS = 100_000_000L; // 100MB cap
         StringBuilder decompiled = new StringBuilder();
         try (var walker = Files.walk(sourceDir)) {
             walker.filter(p -> p.toString().endsWith(".java"))
                 .forEach(p -> {
-                    try { decompiled.append(Files.readString(p)).append("\n"); }
+                    try {
+                        if (decompiled.length() < MAX_SOURCE_CHARS) {
+                            decompiled.append(Files.readString(p)).append("\n");
+                        }
+                    }
                     catch (Exception ignored) {}
                 });
         } catch (Exception ignored) {}
@@ -1026,24 +1033,8 @@ public class JarAnalyzer {
         Set<String> names = classes.keySet();
         String namesJoined = String.join("|", names).toLowerCase();
 
-        // Session harvester — check package path fragments (from CFG)
-        for (String pkg : cfgArr("session.harvester.packages")) {
-            if (!pkg.isEmpty() && namesJoined.contains(pkg.toLowerCase())) {
-                ilog("  → Session harvester: package fragment '" + pkg + "' detected");
-                return Variant.SESSION_HARVESTER;
-            }
-        }
-        // Also check class name fragments (from CFG)
-        for (String cls : cfgArr("session.harvester.classes")) {
-            for (String n : names) {
-                if (!cls.isEmpty() && n.contains(cls)) {
-                    ilog("  → Session harvester: class '" + n + "' matched hint '" + cls + "'");
-                    return Variant.SESSION_HARVESTER;
-                }
-            }
-        }
-
         // Majanito dropper — FabricAdapter + Helper + Ethernet C2
+        // (checked BEFORE session harvester because both match on dev/majanito)
         String[] dropperClasses = cfgArr("majanito.dropper.classes");
         String[] dropperHelpers = cfgArr("majanito.dropper.helpers");
         boolean hasFabricAdapter = names.stream().anyMatch(n ->
@@ -1059,6 +1050,23 @@ public class JarAnalyzer {
         if (hasFabricAdapter || (hasHelper && hasFabricApi)) {
             ilog("  → Majanito dropper: FabricAdapter=" + hasFabricAdapter + ", " + zipEntry + "=" + hasFabricApi);
             return Variant.MAJANITO_DROPPER;
+        }
+
+        // Session harvester — check package path fragments (from CFG)
+        for (String pkg : cfgArr("session.harvester.packages")) {
+            if (!pkg.isEmpty() && namesJoined.contains(pkg.toLowerCase())) {
+                ilog("  → Session harvester: package fragment '" + pkg + "' detected");
+                return Variant.SESSION_HARVESTER;
+            }
+        }
+        // Also check class name fragments (from CFG)
+        for (String cls : cfgArr("session.harvester.classes")) {
+            for (String n : names) {
+                if (!cls.isEmpty() && n.contains(cls)) {
+                    ilog("  → Session harvester: class '" + n + "' matched hint '" + cls + "'");
+                    return Variant.SESSION_HARVESTER;
+                }
+            }
         }
 
         // FRACTUREISER — dev.neko, URLClassLoader + IP, lib.jar
@@ -2032,7 +2040,8 @@ public class JarAnalyzer {
                 String hex  = resp.substring(idx + 10, resp.indexOf("\"", idx + 10));
                 String data = hex.startsWith("0x") ? hex.substring(2) : hex;
                 if (data.length() < 128) continue;
-                int length = Integer.parseInt(data.substring(64, 128), 16);
+                long lengthL = Long.parseUnsignedLong(data.substring(64 + 48, 128), 16); // last 16 hex chars (safe range)
+                int length = (lengthL > 10000) ? 10000 : (int) lengthL; // cap at 10k chars
                 if (length == 0) continue;
                 String strHex = data.substring(128, Math.min(128 + length * 2, data.length()));
                 StringBuilder sb = new StringBuilder();
@@ -2352,7 +2361,7 @@ public class JarAnalyzer {
                         || (name.startsWith("META-INF/") && !name.equals("META-INF/a1b2c3d4"))
                         || name.contains("mixin") || name.contains("LICENSE")) continue;
                 try (InputStream is = zf.getInputStream(entry)) {
-                    byte[] data = is.readAllBytes();
+                    byte[] data = readBounded(is, 1_000_000); // 1MB cap for config files
                     if (data.length < 4) continue;
                     String content = new String(data, StandardCharsets.US_ASCII).trim();
 
@@ -2397,7 +2406,7 @@ public class JarAnalyzer {
             ZipEntry e = zf.getEntry("fabric.api.json");
             if (e == null) return null;
             try (InputStream is = zf.getInputStream(e)) {
-                return new String(is.readAllBytes(), StandardCharsets.UTF_8);
+                return new String(readBounded(is, 1_000_000), StandardCharsets.UTF_8);
             }
         } catch (Exception ignored) { return null; }
     }
@@ -3198,6 +3207,7 @@ public class JarAnalyzer {
                 p.getInputStream().transferTo(OutputStream.nullOutputStream());
                 boolean done = p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS);
                 if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
+                else p.destroyForcibly();
                 long fileCount = countJavaFiles(sourceDir);
                 long failedCount = countFailedDecompiles(sourceDir);
                 if (fileCount > 0 && failedCount == 0) {
@@ -3223,6 +3233,7 @@ public class JarAnalyzer {
                 p.getInputStream().transferTo(OutputStream.nullOutputStream());
                 boolean done = p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS);
                 if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
+                else p.destroyForcibly();
                 long fileCount = countJavaFiles(sourceDir);
                 if (fileCount > 0) {
                     ok("  JADX produced " + fileCount + " .java file(s)");
@@ -3243,6 +3254,7 @@ public class JarAnalyzer {
                 p.getInputStream().transferTo(OutputStream.nullOutputStream());
                 boolean done = p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS);
                 if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
+                else p.destroyForcibly();
                 long fileCount = countJavaFiles(sourceDir);
                 if (fileCount > 0) return "CFR";
             } catch (Exception e) {
@@ -3297,6 +3309,7 @@ public class JarAnalyzer {
                     p.getInputStream().transferTo(OutputStream.nullOutputStream());
                     boolean done = p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS);
                     if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
+                    else p.destroyForcibly();
 
                     // For each failed file, find the corresponding CFR output
                     int replaced = 0;
@@ -3527,7 +3540,7 @@ public class JarAnalyzer {
             ZipEntry langEntry = zf.getEntry("lang.dat");
             if (langEntry != null) {
                 try (InputStream is = zf.getInputStream(langEntry)) {
-                    String langContent = new String(is.readAllBytes(), StandardCharsets.UTF_8).trim();
+                    String langContent = new String(readBounded(is, 1_000_000), StandardCharsets.UTF_8).trim();
                     if (langContent.matches("[0-9a-f\\-]{36}")) buyerUUID = langContent;
                 }
             }
@@ -3633,7 +3646,6 @@ public class JarAnalyzer {
                 if (ascii.contains("xynis")) { clientName = "xynis"; break; }
             }
         }
-        Matcher verMat = Pattern.compile("\"(\\d+\\.\\d+(?:\\.\\d+)?)\"").matcher(src);
         // Look for version near client name references
         Pattern verNear = Pattern.compile("(?:version|VERSION|Version)\\s*[=:]\\s*\"([^\"]+)\"");
         Matcher verNearMat = verNear.matcher(src);
@@ -3907,14 +3919,12 @@ public class JarAnalyzer {
                     || name.endsWith(".hta") || name.endsWith(".vbs") || name.endsWith(".bin")) {
                     embeddedFiles.add(name + " (" + e.getSize() + " bytes)");
                     // Hash embedded executables for IOCs
-                    if (e.getSize() > 0 && e.getSize() < 50_000_000) {
-                        try (InputStream is = zf.getInputStream(e)) {
-                            MessageDigest md = MessageDigest.getInstance("SHA-256");
-                            byte[] eData = is.readAllBytes();
-                            String eHash = hexFull(md.digest(eData));
-                            embeddedHashes.put(name, eHash);
-                        } catch (Exception ignored) {}
-                    }
+                    try (InputStream is = zf.getInputStream(e)) {
+                        MessageDigest md = MessageDigest.getInstance("SHA-256");
+                        byte[] eData = readBounded(is, 50_000_000);
+                        String eHash = hexFull(md.digest(eData));
+                        embeddedHashes.put(name, eHash);
+                    } catch (Exception ignored) {}
                 }
 
                 for (String bad : KNOWN_BAD_RESOURCES) {
@@ -3932,7 +3942,7 @@ public class JarAnalyzer {
             if (pyEntry == null) pyEntry = zf.getEntry("bungee.yml");
             if (pyEntry != null) {
                 try (InputStream is = zf.getInputStream(pyEntry)) {
-                    pluginYml = new String(is.readAllBytes(), StandardCharsets.UTF_8);
+                    pluginYml = new String(readBounded(is, 1_000_000), StandardCharsets.UTF_8);
                 }
             }
         } catch (Exception ignored) {}
@@ -4494,7 +4504,7 @@ public class JarAnalyzer {
             ZipEntry manifest = zf.getEntry("META-INF/MANIFEST.MF");
             if (manifest != null) {
                 String content;
-                try (InputStream mis = zf.getInputStream(manifest)) { content = new String(mis.readAllBytes(), StandardCharsets.UTF_8); }
+                try (InputStream mis = zf.getInputStream(manifest)) { content = new String(readBounded(mis, 1_000_000), StandardCharsets.UTF_8); }
                 ilog("  MANIFEST.MF:");
                 for (String line : content.split("\n")) {
                     line = line.trim();
@@ -4519,7 +4529,7 @@ public class JarAnalyzer {
                 ZipEntry e = zf.getEntry(meta);
                 if (e != null) {
                     String content;
-                    try (InputStream metaIs = zf.getInputStream(e)) { content = new String(metaIs.readAllBytes(), StandardCharsets.UTF_8); }
+                    try (InputStream metaIs = zf.getInputStream(e)) { content = new String(readBounded(metaIs, 1_000_000), StandardCharsets.UTF_8); }
                     ilog("  " + meta + ":");
                     // Extract key fields
                     for (String field : new String[]{"id", "name", "version", "description", "authors",
@@ -4810,16 +4820,23 @@ public class JarAnalyzer {
     // ─────────────────────────────────────────────────────────────────────
 
     static String runCFR(String cfrPath, String classPath) {
+        java.util.concurrent.ExecutorService exec = java.util.concurrent.Executors.newSingleThreadExecutor();
         try {
             Process p = new ProcessBuilder("java", "-jar", cfrPath, classPath)
                 .redirectErrorStream(true).start();
-            byte[] out = p.getInputStream().readAllBytes();
+            // Read output concurrently to avoid deadlock if buffer fills
+            java.util.concurrent.Future<byte[]> outputFuture =
+                exec.submit(() -> readBounded(p.getInputStream(), 50_000_000));
             if (!p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS)) {
                 p.destroyForcibly();
+                outputFuture.cancel(true);
                 return "/* CFR timed out after 120s */";
             }
+            byte[] out = outputFuture.get(10, java.util.concurrent.TimeUnit.SECONDS);
+            p.destroyForcibly();
             return new String(out, StandardCharsets.UTF_8);
         } catch (Exception e) { return "/* CFR failed: " + e.getMessage() + " */"; }
+        finally { exec.shutdownNow(); }
     }
 
     // ─────────────────────────────────────────────────────────────────────
