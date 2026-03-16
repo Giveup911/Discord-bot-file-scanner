@@ -544,7 +544,7 @@ async def mb_lookup(sha256: str, session: aiohttp.ClientSession) -> Optional[dic
         async with session.post(
             MB_API,
             headers=mb_headers,
-            data=f"query=get_info&hash={sha256}",
+            data={"query": "get_info", "hash": sha256},
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
             if resp.status == 401:
@@ -3531,11 +3531,17 @@ async def giverat_command(
 
     if scan_queue.active >= scan_queue._sem._value:
         # Scan will be queued — send a live-updating queue position message
+        queue_text = (
+            f"Scan `{display_name}` by {ctx.author.mention} is queued — "
+            f"position **{scan_queue.pending + 1}**, {scan_queue.active} active scan(s)."
+        )
         try:
-            queue_msg = await send_channel.send(
-                f"Scan `{display_name}` by {ctx.author.mention} is queued — "
-                f"position **{scan_queue.pending + 1}**, {scan_queue.active} active scan(s)."
-            )
+            queue_msg = await send_channel.send(queue_text)
+        except discord.Forbidden:
+            try:
+                queue_msg = await ctx.followup.send(queue_text)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -3587,13 +3593,15 @@ async def giverat_command(
             except Exception:
                 pass
         try:
-            await send_channel.send(
-                embed=discord.Embed(
-                    title="Scan Failed",
-                    description=f"```{sanitize_path(str(e)[:1000])}```",
-                    color=0xE74C3C,
-                )
+            err_embed = discord.Embed(
+                title="Scan Failed",
+                description=f"```{sanitize_path(str(e)[:1000])}```",
+                color=0xE74C3C,
             )
+            try:
+                await send_channel.send(embed=err_embed)
+            except discord.Forbidden:
+                await ctx.followup.send(embed=err_embed)
         except Exception:
             pass
 
@@ -3658,6 +3666,23 @@ async def run_scan(
     start = time.time()
     work_dir = tempfile.mkdtemp(prefix="scan_")
     scan_msg = None  # The public progress message we'll edit
+    _use_followup = [False]  # Flag: True if ctx.channel.send fails (user-install in external server)
+
+    async def safe_send(**kwargs) -> Optional[discord.Message]:
+        """Send to channel, falling back to followup if bot lacks channel access (user-install)."""
+        if not _use_followup[0]:
+            try:
+                return await ctx.channel.send(**kwargs)
+            except discord.Forbidden:
+                _use_followup[0] = True
+                log.info(f"[{scan_id}] No channel access — falling back to followup responses")
+            except discord.HTTPException:
+                pass
+        # Fallback: use interaction followup (always works for the invoking user)
+        try:
+            return await ctx.followup.send(**kwargs)
+        except Exception:
+            return None
 
     async def progress(msg: str):
         try:
@@ -3677,7 +3702,7 @@ async def run_scan(
         try:
             embed = build_progress_embed(filename, file_size, hashes, scan_id, stages)
             if scan_msg is None:
-                scan_msg = await ctx.channel.send(
+                scan_msg = await safe_send(
                     content=f"Scan requested by {ctx.author.mention}",
                     embed=embed,
                 )
@@ -3707,7 +3732,7 @@ async def run_scan(
             try:
                 dl_path, filename = await download_from_url(url, work_dir)
             except ValueError as ve:
-                await ctx.channel.send(
+                await safe_send(
                     embed=discord.Embed(
                         title="Download Failed",
                         description=sanitize_path(str(ve)),
@@ -3757,13 +3782,14 @@ async def run_scan(
             if http_session and vt_enabled:
                 stages["VirusTotal"] = "running"
                 await update_progress(stages, filename, file_size, hashes)
-                vt_msg = await ctx.channel.send(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "~30s", scan_id))
+                vt_msg = await safe_send(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "~30s", scan_id))
                 vt_result = await vt_lookup(sha256, http_session)
                 if vt_result is None:
-                    await vt_msg.edit(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "uploading ~2-3min", scan_id))
+                    if vt_msg:
+                        await vt_msg.edit(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "uploading ~2-3min", scan_id))
                     vt_result = await vt_upload(dl_path, sha256, http_session)
                 stages["VirusTotal"] = "complete"
-                if vt_result:
+                if vt_result and vt_msg:
                     await vt_msg.edit(embed=build_vt_embed(vt_result, sha256, scan_id))
 
             # Send pending messages for parallel services
@@ -3771,11 +3797,11 @@ async def run_scan(
             mb_msg = None
             ha_msg = None
             if http_session and vt_enabled:
-                vt_sb_msg = await ctx.channel.send(embed=_build_service_pending_embed("VT Sandbox Analysis", "\U0001F9EC", "~2s", scan_id))
+                vt_sb_msg = await safe_send(embed=_build_service_pending_embed("VT Sandbox Analysis", "\U0001F9EC", "~2s", scan_id))
             if http_session and mb_enabled:
-                mb_msg = await ctx.channel.send(embed=_build_service_pending_embed("MalwareBazaar", "\U0001F9A0", "~2s", scan_id))
+                mb_msg = await safe_send(embed=_build_service_pending_embed("MalwareBazaar", "\U0001F9A0", "~2s", scan_id))
             if http_session and ha_enabled:
-                ha_msg = await ctx.channel.send(embed=_build_service_pending_embed("Hybrid Analysis", "\U0001F50D", "~5s", scan_id))
+                ha_msg = await safe_send(embed=_build_service_pending_embed("Hybrid Analysis", "\U0001F50D", "~5s", scan_id))
 
             # Launch concurrently
             api_tasks = {}
@@ -3850,7 +3876,7 @@ async def run_scan(
             if scan_msg:
                 await scan_msg.edit(content=f"Scan requested by {ctx.author.mention}", embeds=embeds)
             else:
-                await ctx.channel.send(content=f"Scan requested by {ctx.author.mention}", embeds=embeds)
+                await safe_send(content=f"Scan requested by {ctx.author.mention}", embeds=embeds)
             return
 
         # ── Determine what to scan ──
@@ -3983,28 +4009,29 @@ async def run_scan(
             stages["VirusTotal"] = "running"
             await update_progress(stages, filename, file_size, hashes)
             # Send pending VT message
-            vt_msg = await ctx.channel.send(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "~30s", scan_id))
+            vt_msg = await safe_send(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "~30s", scan_id))
             vt_result = await vt_lookup(sha256, http_session)
             if vt_result is None:
-                await vt_msg.edit(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "uploading ~2-3min", scan_id))
+                if vt_msg:
+                    await vt_msg.edit(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "uploading ~2-3min", scan_id))
                 vt_result = await vt_upload(dl_path, sha256, http_session)
             stages["VirusTotal"] = "complete"
             # Update VT message with results
-            if vt_result:
+            if vt_result and vt_msg:
                 await vt_msg.edit(embed=build_vt_embed(vt_result, sha256, scan_id))
             await update_progress(stages, filename, file_size, hashes)
 
         # ── Send pending messages for parallel services ──
         if http_session and vt_enabled:
-            vt_sb_msg = await ctx.channel.send(
+            vt_sb_msg = await safe_send(
                 embed=_build_service_pending_embed("VT Sandbox Analysis", "\U0001F9EC", "~2s", scan_id)
             )
         if http_session and mb_enabled:
-            mb_msg = await ctx.channel.send(
+            mb_msg = await safe_send(
                 embed=_build_service_pending_embed("MalwareBazaar", "\U0001F9A0", "~2s", scan_id)
             )
         if http_session and ha_enabled:
-            ha_msg = await ctx.channel.send(
+            ha_msg = await safe_send(
                 embed=_build_service_pending_embed("Hybrid Analysis", "\U0001F50D", "~5s", scan_id)
             )
 
@@ -4156,9 +4183,12 @@ async def run_scan(
             if scan_msg:
                 await scan_msg.edit(content=f"Scan requested by {ctx.author.mention}", embeds=embeds)
                 if files_to_send:
-                    await ctx.channel.send(files=files_to_send, reference=scan_msg)
+                    try:
+                        await safe_send(files=files_to_send, reference=discord.MessageReference.from_message(scan_msg))
+                    except (TypeError, Exception):
+                        await safe_send(files=files_to_send)
             else:
-                await ctx.channel.send(
+                await safe_send(
                     content=f"Scan requested by {ctx.author.mention}",
                     embeds=embeds,
                     files=files_to_send,
@@ -4194,9 +4224,9 @@ async def run_scan(
             try:
                 await scan_msg.edit(embed=error_embed)
             except discord.HTTPException:
-                await ctx.channel.send(embed=error_embed)
+                await safe_send(embed=error_embed)
         else:
-            await ctx.channel.send(embed=error_embed)
+            await safe_send(embed=error_embed)
     finally:
         try:
             shutil.rmtree(work_dir, ignore_errors=True)
