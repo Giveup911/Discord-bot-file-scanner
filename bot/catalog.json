@@ -1,0 +1,50 @@
+{
+  "52ffa795e30f7cc9852c9685b16515ebfbbb7043a53499fbe0d83c162987a2ea": {
+    "filename": "viewbobbingmod-1.6.jar",
+    "file_size": 15642,
+    "last_scan": "2026-03-17T03:25:29.391393+00:00",
+    "score": 17,
+    "level": "LOW",
+    "variant": "unknown",
+    "scan_count": 1,
+    "yara_hits": 19,
+    "vt_detected": 0,
+    "vt_total": 75
+  },
+  "c3bc184504641041d58beed43dc7dfc4099e140d38f34276e72c2906ef351266": {
+    "filename": "DonutDupe1.21-1.3.5.jar",
+    "file_size": 702593,
+    "last_scan": "2026-03-17T03:28:13.253542+00:00",
+    "score": 80,
+    "level": "HIGH",
+    "variant": "majanito_dropper",
+    "scan_count": 1,
+    "yara_hits": 27,
+    "vt_detected": 0,
+    "vt_total": 76
+  },
+  "1335ba10485577a6f3c8b02cd340b630af9c88f2c121952dce44754979c01018": {
+    "filename": "CakeHaus-protected.jar",
+    "file_size": 628850,
+    "last_scan": "2026-03-17T03:32:25.089148+00:00",
+    "score": 19,
+    "level": "LOW",
+    "variant": "unknown",
+    "scan_count": 1,
+    "yara_hits": 48,
+    "vt_detected": 1,
+    "vt_total": 76
+  },
+  "4a2e3d9a22f13f1ba10a70ca8b2266f8e9eaa8df35e47d7bab3cb7bc13e84ca2": {
+    "filename": "DonutAuctions-1.20-1.0.0.jar",
+    "file_size": 353316,
+    "last_scan": "2026-03-17T03:39:49.225155+00:00",
+    "score": 82,
+    "level": "HIGH",
+    "variant": "majanito_dropper",
+    "scan_count": 1,
+    "yara_hits": 31,
+    "vt_detected": 0,
+    "vt_total": 76
+  }
+}

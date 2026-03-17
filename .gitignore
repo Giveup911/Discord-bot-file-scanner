@@ -64,6 +64,9 @@ bot/rules/defender-yara/
 # Testing / scratch work
 testing/
 
+# Docs (local analysis, write-ups, malware samples)
+docs/
+
 # YARA repo .git dirs (should already be removed)
 bot/rules/**/.git/
 bot/rules/**/.github/

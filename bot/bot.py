@@ -2599,6 +2599,15 @@ def build_embeds(
         if c2_parts:
             e.add_field(name="\U0001F310 C2 Infrastructure", value=_trunc("\n".join(c2_parts)), inline=False)
 
+    # Extracted IDs — Weedhack/Majanito campaign + operator routing IDs
+    if iocs and iocs.get("variant") == "majanito_dropper" and iocs.get("campaignId"):
+        campaign_uuid = iocs["campaignId"]
+        # In Weedhack, the campaign UUID doubles as the operator userId on the C2 platform
+        # It's sent as "minecraftInfo" in direct exfil and "userId" in Stage 2 context
+        ids_text = f"```\n{campaign_uuid} : {campaign_uuid}\n```"
+        ids_text += "*Campaign UUID (left) : Operator User ID (right) — same value, used as routing key on C2*"
+        e.add_field(name="\U0001F50D Extracted IDs", value=ids_text, inline=False)
+
     # webhooks (with kill status)
     if iocs or (extracted_strings and extracted_strings.get("discord_webhooks")):
         wh_lines = []
@@ -3300,6 +3309,366 @@ def is_valid_jar(filepath: str) -> bool:
             return any(n.endswith(".class") for n in zf.namelist())
     except Exception:
         return False
+
+
+# ─── Full Report Writer ──────────────────────────────────────────────────────
+
+
+def write_full_report(log_dir: str, **kwargs):
+    """Write full_report.txt and decrypted_strings.txt into the log directory.
+
+    Includes everything shown in Discord embeds plus all deobfuscated data.
+    """
+    ld = Path(log_dir)
+    if not ld.exists():
+        return
+
+    filename = kwargs.get("filename", "unknown")
+    file_size = kwargs.get("file_size", 0)
+    hashes = kwargs.get("hashes", {})
+    iocs = kwargs.get("iocs")
+    vt = kwargs.get("vt")
+    yara_matches = kwargs.get("yara_matches", [])
+    obfuscators = kwargs.get("obfuscators", [])
+    score = kwargs.get("score", 0)
+    level = kwargs.get("level", "LOW")
+    scan_id = kwargs.get("scan_id", "")
+    scan_time = kwargs.get("scan_time", 0)
+    entropy = kwargs.get("entropy")
+    extracted_strings = kwargs.get("extracted_strings")
+    manifest = kwargs.get("manifest")
+    webhook_kills = kwargs.get("webhook_kills", {})
+    format_analysis = kwargs.get("format_analysis")
+    deobfuscation = kwargs.get("deobfuscation")
+    mb_result = kwargs.get("mb_result")
+    ha_result = kwargs.get("ha_result")
+    vt_sandbox = kwargs.get("vt_sandbox")
+
+    try:
+        lines = []
+        lines.append("=" * 70)
+        lines.append("  FULL SCAN REPORT")
+        lines.append("=" * 70)
+        lines.append("")
+        lines.append(f"File:       {filename}")
+        lines.append(f"Size:       {file_size:,} bytes")
+        lines.append(f"SHA-256:    {hashes.get('sha256', '')}")
+        lines.append(f"MD5:        {hashes.get('md5', '')}")
+        lines.append(f"SHA-1:      {hashes.get('sha1', '')}")
+        lines.append(f"Scan ID:    {scan_id}")
+        lines.append(f"Scan Time:  {scan_time:.1f}s")
+        lines.append(f"Score:      {score}/100 ({level})")
+        lines.append("")
+
+        # Variant
+        if iocs:
+            v = iocs.get("variant", "")
+            if v and v.lower() != "unknown":
+                lines.append(f"Variant:    {v.upper()}")
+                if iocs.get("subtype"):
+                    lines.append(f"Sub-type:   {iocs['subtype']}")
+                if iocs.get("campaignId"):
+                    lines.append(f"Campaign:   {iocs['campaignId']}")
+            lines.append("")
+
+        # C2 Infrastructure
+        if iocs:
+            c2_fields = [("c2Base", "C2 Base"), ("ethContract", "ETH Contract"),
+                         ("ethMethod", "ETH Method"), ("exfilUrl", "Exfil URL"),
+                         ("stage2Url", "Stage 2 URL"), ("stage2Class", "Stage 2 Class"),
+                         ("stage2Method", "Stage 2 Method")]
+            c2_lines = []
+            for key, label in c2_fields:
+                if iocs.get(key):
+                    c2_lines.append(f"  {label:16s}: {iocs[key]}")
+            if c2_lines:
+                lines.append("── C2 INFRASTRUCTURE ──")
+                lines.extend(c2_lines)
+                lines.append("")
+
+        # Webhooks
+        all_wh = set()
+        if iocs:
+            for key in ("webhook", "webhookUrl"):
+                if iocs.get(key):
+                    all_wh.add(iocs[key])
+        if extracted_strings and extracted_strings.get("discord_webhooks"):
+            all_wh.update(extracted_strings["discord_webhooks"])
+        if all_wh:
+            lines.append("── DISCORD WEBHOOKS ──")
+            for wh in all_wh:
+                status = ""
+                if webhook_kills and wh in webhook_kills:
+                    status = f"  [{webhook_kills[wh]}]"
+                lines.append(f"  {wh}{status}")
+            lines.append("")
+
+        # VirusTotal
+        lines.append("── VIRUSTOTAL ──")
+        sha256 = hashes.get("sha256", "")
+        vt_link = f"https://www.virustotal.com/gui/file/{sha256}"
+        if vt:
+            vt_status = vt.get("status", "found")
+            if vt_status == "queued":
+                lines.append("  Status: Uploaded — analysis still processing")
+            elif vt_status in ("upload_failed", "error"):
+                lines.append("  Status: Upload issue")
+            else:
+                lines.append(f"  Detections: {vt['detected']}/{vt['total']}")
+                if vt.get("meaningful_name"):
+                    lines.append(f"  Name: {vt['meaningful_name']}")
+                if vt.get("first_seen"):
+                    try:
+                        first = datetime.fromtimestamp(vt["first_seen"], tz=timezone.utc).strftime("%Y-%m-%d")
+                        lines.append(f"  First seen: {first}")
+                    except Exception:
+                        pass
+                if vt.get("detections"):
+                    lines.append(f"  Engines: {', '.join(vt['detections'].keys())}")
+            if vt.get("permalink"):
+                lines.append(f"  Link: {vt['permalink']}")
+            else:
+                lines.append(f"  Link: {vt_link}")
+        else:
+            lines.append(f"  Link: {vt_link}")
+        lines.append("")
+
+        # MalwareBazaar
+        lines.append("── MALWAREBAZAAR ──")
+        mb_link = f"https://bazaar.abuse.ch/sample/{sha256}/"
+        if mb_result:
+            status = mb_result.get("status", "unknown")
+            if status == "found":
+                lines.append(f"  Status: FOUND in database")
+                if mb_result.get("signature"):
+                    lines.append(f"  Signature: {mb_result['signature']}")
+                if mb_result.get("first_seen"):
+                    lines.append(f"  First seen: {mb_result['first_seen']}")
+                if mb_result.get("tags"):
+                    lines.append(f"  Tags: {', '.join(mb_result['tags'])}")
+            else:
+                lines.append(f"  Status: {status}")
+            lines.append(f"  Link: {mb_result.get('permalink', mb_link)}")
+        else:
+            lines.append(f"  Link: {mb_link}")
+        lines.append("")
+
+        # Hybrid Analysis
+        if ha_result:
+            lines.append("── HYBRID ANALYSIS ──")
+            if ha_result.get("verdict"):
+                lines.append(f"  Verdict: {ha_result['verdict']}")
+            if ha_result.get("threat_score") is not None:
+                lines.append(f"  Threat Score: {ha_result['threat_score']}/100")
+            lines.append(f"  Link: {ha_result.get('permalink', '')}")
+            lines.append("")
+
+        # VT Sandbox
+        if vt_sandbox and vt_sandbox.get("sandbox_links"):
+            lines.append("── VT SANDBOX REPORTS ──")
+            for sb in vt_sandbox["sandbox_links"]:
+                lines.append(f"  {sb.get('name', 'Unknown')}: {sb.get('link', '')}")
+            lines.append("")
+
+        # YARA
+        if yara_matches:
+            lines.append("── YARA MATCHES ──")
+            for m in yara_matches:
+                sev = m.get("meta", {}).get("severity", "unknown")
+                desc = m.get("meta", {}).get("description", "")
+                lines.append(f"  [{sev.upper()}] {m['rule']}")
+                if desc:
+                    lines.append(f"    {desc}")
+            lines.append("")
+
+        # Obfuscators
+        if obfuscators:
+            lines.append("── OBFUSCATORS ──")
+            for o in obfuscators:
+                lines.append(f"  {o}")
+            lines.append("")
+
+        # Entropy
+        if entropy:
+            lines.append("── ENTROPY ──")
+            lines.append(f"  Overall: {entropy.get('overall', 0):.2f}/8.0")
+            if entropy.get("max_class_entropy", 0) > 0:
+                lines.append(f"  Max class: {entropy['max_class_entropy']:.2f}")
+            if entropy.get("suspicious_entries"):
+                lines.append(f"  High-entropy entries ({len(entropy['suspicious_entries'])}):")
+                for se in entropy["suspicious_entries"]:
+                    lines.append(f"    {se['name']} — {se['entropy']:.2f} ({se['size']} bytes)")
+            lines.append("")
+
+        # Manifest
+        if manifest and manifest.get("suspicious_keys"):
+            lines.append("── MANIFEST ENTRIES ──")
+            for k in manifest["suspicious_keys"]:
+                lines.append(f"  {k}")
+            lines.append("")
+
+        # Extracted URLs
+        if extracted_strings:
+            if extracted_strings.get("urls"):
+                lines.append("── EXTRACTED URLS ──")
+                for u in extracted_strings["urls"][:50]:
+                    lines.append(f"  {u}")
+                if len(extracted_strings["urls"]) > 50:
+                    lines.append(f"  ... and {len(extracted_strings['urls']) - 50} more")
+                lines.append("")
+
+            if extracted_strings.get("ipv4"):
+                lines.append("── EXTRACTED IPS ──")
+                for ip in extracted_strings["ipv4"]:
+                    lines.append(f"  {ip}")
+                lines.append("")
+
+            if extracted_strings.get("eth_addresses"):
+                lines.append("── ETHEREUM ADDRESSES ──")
+                for a in extracted_strings["eth_addresses"]:
+                    lines.append(f"  {a}")
+                lines.append("")
+
+            if extracted_strings.get("discord_tokens"):
+                lines.append("── DISCORD TOKENS ──")
+                lines.append(f"  {len(extracted_strings['discord_tokens'])} token(s) found (redacted)")
+                lines.append("")
+
+        # Behavioral markers with details
+        if iocs:
+            markers = iocs.get("behavioralMarkers", [])
+            marker_details = iocs.get("markerDetails", {})
+            if markers:
+                lines.append("── BEHAVIORAL MARKERS ──")
+                for m in markers:
+                    lines.append(f"  - {m}")
+                    details = marker_details.get(m, [])
+                    for d in details:
+                        f_name = d.get("file", "")
+                        f_line = d.get("line", "0")
+                        ctx = d.get("context", "").strip()
+                        if f_name:
+                            loc = f"    @ {f_name}"
+                            if f_line and f_line != "0":
+                                loc += f":{f_line}"
+                            if ctx:
+                                loc += f"  →  {ctx}"
+                            lines.append(loc)
+                lines.append("")
+
+        # Deobfuscated strings summary
+        if deobfuscation and deobfuscation.get("detected"):
+            lines.append("── DEOBFUSCATED STRINGS ──")
+            lines.append(f"  Method: DashO string encryption")
+            lines.append(f"  Total decrypted: {deobfuscation['total_decrypted']}")
+            lines.append(f"  Classes: {deobfuscation['classes_with_strings']}")
+            if deobfuscation.get("algorithms"):
+                lines.append(f"  Algorithms: {', '.join(deobfuscation['algorithms'])}")
+            lines.append(f"  See decrypted_strings.txt for full list")
+            lines.append("")
+
+        # Format analysis
+        if format_analysis:
+            lines.append("── FORMAT ANALYSIS ──")
+            lines.append(f"  Type: {format_analysis.get('type', 'unknown')}")
+            for w in format_analysis.get("warnings", []):
+                lines.append(f"  WARNING: {w}")
+            for f_item in format_analysis.get("findings", []):
+                if isinstance(f_item, dict):
+                    lines.append(f"  [{f_item.get('severity', '?')}] {f_item.get('keyword', '?')} x{f_item.get('count', '?')}")
+                else:
+                    lines.append(f"  {f_item}")
+            lines.append("")
+
+        lines.append("=" * 70)
+        lines.append("  END OF REPORT")
+        lines.append("=" * 70)
+
+        (ld / "full_report.txt").write_text("\n".join(lines), encoding="utf-8")
+
+    except Exception as e:
+        log.warning(f"Failed to write full_report.txt: {e}")
+
+    # Write decrypted_strings.txt
+    try:
+        str_lines = []
+
+        # DashO deobfuscated strings
+        if deobfuscation and deobfuscation.get("detected"):
+            str_lines.append("=" * 60)
+            str_lines.append("  DECRYPTED / DEOBFUSCATED STRINGS")
+            str_lines.append("=" * 60)
+            str_lines.append("")
+            str_lines.append(f"Source: DashO string encryption")
+            str_lines.append(f"Total: {deobfuscation['total_decrypted']} strings from {deobfuscation['classes_with_strings']} classes")
+            if deobfuscation.get("algorithms"):
+                str_lines.append(f"Algorithms: {', '.join(deobfuscation['algorithms'])}")
+            str_lines.append("")
+            for s in deobfuscation.get("strings", []):
+                cls = s.get("class", "unknown")
+                dec = s.get("decrypted", "")
+                method = s.get("method", "")
+                line = f"[{cls}]"
+                if method:
+                    line += f" ({method})"
+                line += f"  {dec}"
+                str_lines.append(line)
+            str_lines.append("")
+
+        # Extracted strings from raw scan
+        if extracted_strings:
+            if extracted_strings.get("discord_webhooks"):
+                str_lines.append("── Discord Webhooks ──")
+                for wh in extracted_strings["discord_webhooks"]:
+                    str_lines.append(f"  {wh}")
+                str_lines.append("")
+            if extracted_strings.get("urls"):
+                str_lines.append("── URLs ──")
+                for u in extracted_strings["urls"]:
+                    str_lines.append(f"  {u}")
+                str_lines.append("")
+            if extracted_strings.get("ipv4"):
+                str_lines.append("── IP Addresses ──")
+                for ip in extracted_strings["ipv4"]:
+                    str_lines.append(f"  {ip}")
+                str_lines.append("")
+            if extracted_strings.get("eth_addresses"):
+                str_lines.append("── Ethereum Addresses ──")
+                for a in extracted_strings["eth_addresses"]:
+                    str_lines.append(f"  {a}")
+                str_lines.append("")
+
+        # IOC-extracted URLs and domains
+        if iocs:
+            ioc_urls = iocs.get("urls", [])
+            ioc_extra = iocs.get("extraUrls", [])
+            ioc_domains = iocs.get("domains", [])
+            if ioc_urls:
+                str_lines.append("── IOC URLs ──")
+                for u in ioc_urls:
+                    str_lines.append(f"  {u}")
+                str_lines.append("")
+            if ioc_extra:
+                str_lines.append("── Extra URLs (from config) ──")
+                for u in ioc_extra:
+                    str_lines.append(f"  {u}")
+                str_lines.append("")
+            if ioc_domains:
+                str_lines.append("── Domains ──")
+                for d in ioc_domains:
+                    str_lines.append(f"  {d}")
+                str_lines.append("")
+            # Decrypted config (AdamRat)
+            if iocs.get("decryptedConfig"):
+                str_lines.append("── Decrypted Config (AdamRat) ──")
+                str_lines.append(iocs["decryptedConfig"])
+                str_lines.append("")
+
+        if str_lines:
+            (ld / "decrypted_strings.txt").write_text("\n".join(str_lines), encoding="utf-8")
+
+    except Exception as e:
+        log.warning(f"Failed to write decrypted_strings.txt: {e}")
 
 
 # ─── Log Packaging ───────────────────────────────────────────────────────────
@@ -4721,6 +5090,35 @@ async def run_scan(
                 value="Unknown file type. VT, YARA, and string extraction results only.",
                 inline=False,
             )
+
+        # ── Write full report + decrypted strings into each log dir ──
+        for ld in all_log_dirs:
+            try:
+                write_full_report(
+                    ld,
+                    filename=filename,
+                    file_size=file_size,
+                    hashes=hashes,
+                    iocs=all_iocs,
+                    vt=vt_result,
+                    yara_matches=yara_matches,
+                    obfuscators=obfuscators,
+                    score=score,
+                    level=level,
+                    scan_id=scan_id,
+                    scan_time=time.time() - start,
+                    entropy=entropy,
+                    extracted_strings=extracted_strings,
+                    manifest=manifest,
+                    webhook_kills=webhook_kills,
+                    format_analysis=format_analysis,
+                    deobfuscation=deobfuscation,
+                    mb_result=mb_result,
+                    ha_result=ha_result,
+                    vt_sandbox=vt_sandbox,
+                )
+            except Exception as e:
+                log.debug(f"write_full_report failed for {ld}: {e}")
 
         # ── Package logs (named after mod, sanitized) ──
         zip_files = []
