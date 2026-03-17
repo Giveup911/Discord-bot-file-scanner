@@ -38,7 +38,7 @@ public class JarAnalyzer {
     // ── Shared HttpClient (reused across all HTTP calls) ──────────
     static final HttpClient SHARED_HTTP = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(10))
-        .followRedirects(HttpClient.Redirect.NEVER)
+        .followRedirects(HttpClient.Redirect.NORMAL)
         .build();
 
     // ── Log file writers ───────────────────────────────────────────
@@ -46,6 +46,9 @@ public class JarAnalyzer {
     static PrintWriter configLog;
     static String jarName  = "output";
     static Path   outDir   = Paths.get(".");   // set per-JAR in analyzeJar()
+
+    /** Per-marker location details: marker label → list of {file, line, context} */
+    static Map<String, List<Map<String, String>>> markerDetails = new LinkedHashMap<>();
 
     /** Resolve a file path inside the per-JAR output directory. */
     static Path out(String filename) { return outDir.resolve(filename); }
@@ -83,7 +86,6 @@ public class JarAnalyzer {
         "whreceiverrrrrrrr.ru", "remotev2.whrc.ru", "mclauncher.su"
     ));
     static final Set<String> KNOWN_BAD_RESOURCES = new LinkedHashSet<>(Arrays.asList(
-        "plugin-config.bin",    // SkyRage indicator
         ".ref",                 // Fractureiser Stage 2 marker
         "hook.dll",             // Fractureiser native payload
         "discord_rpc.dll",      // SkyRage Discord theft DLL
@@ -139,7 +141,7 @@ public class JarAnalyzer {
 
         // DONUT_DUPE detection
         CFG.setProperty("donut.dupe.packages", "com_libmod|com/libmod");
-        CFG.setProperty("donut.dupe.classes", "Libmod|RpcHelper|LangProvider");
+        CFG.setProperty("donut.dupe.classes", "Libmod");
         CFG.setProperty("donut.dupe.rawstrings", "polygon-rpc.com|epqfgikdhiuzuybl|cwmhwqsenglvcost|glcqksioqxlglmmb");
 
         // VAPE_CURIUM detection
@@ -157,7 +159,7 @@ public class JarAnalyzer {
         CFG.setProperty("fractureiser.manifest", "Premain-Class|Agent-Class");
 
         // SKYRAGE detection
-        CFG.setProperty("skyrage.rawstrings", "skyrage.de|connect.skyrage.de|vmd-gnu|MicrosoftEdgeUpdateTaskMachineVM|discord_rpc.dll|plugin-config.bin");
+        CFG.setProperty("skyrage.rawstrings", "skyrage.de|connect.skyrage.de|vmd-gnu|MicrosoftEdgeUpdateTaskMachineVM|discord_rpc.dll");
         CFG.setProperty("skyrage.classes", "skyrage|SkyRage");
 
         // WEIRDUTILS detection
@@ -174,7 +176,7 @@ public class JarAnalyzer {
 
         // SERVER_CRASHER detection (2Packets, xynis, etc.)
         CFG.setProperty("server.crasher.packages", "us/whitedev|us\\whitedev");
-        CFG.setProperty("server.crasher.classes", "Main2PacketsClient|CrashManager|ExploitManager|PacketHelper");
+        CFG.setProperty("server.crasher.classes", "Main2PacketsClient|CrashManager|ExploitManager");
         CFG.setProperty("server.crasher.rawstrings", "2PacketsClient|2Packets Client|main2packets|xynis|us.whitedev|accXynisMap");
 
         // MCLAUNCHER_LOADER detection (me/mclauncher / Weedhack family)
@@ -195,127 +197,37 @@ public class JarAnalyzer {
             "com_google_|org_apache_|kotlin_|io_netty_|com_mojang_|org_slf4j_|javax_|java_|org_objectweb_");
 
         // Behavioral source patterns: "srcPattern=label" entries, pipe-separated
+        // IMPORTANT: These defaults are the fallback when config.properties is missing.
+        // Only include patterns that are KNOWN MALICIOUS — never patterns that fire on
+        // legitimate Minecraft mods/clients (e.g., HttpURLConnection, ProcessBuilder,
+        // accessToken, ModInitializer, minecraftservices.com, Thread.sleep, etc.)
         CFG.setProperty("behavioral.patterns",
-            "Runtime.getRuntime().exec(=Command execution capability|" +
-            "ProcessBuilder=Process spawning capability|" +
-            ".minecraft=Minecraft directory access|" +
-            "launcher_accounts=Minecraft launcher account access|" +
-            "accessToken=Session/auth token access|" +
-            "HttpURLConnection=HTTP networking|" +
-            "discord.com/api/webhooks=Discord webhook exfiltration|" +
+            // Known malicious domains/infrastructure
+            "discord.com/api/webhooks=Contains Discord webhook URL — commonly used to exfiltrate stolen data|" +
             "adamrat.shop=Known malicious domain (adamrat.shop)|" +
             "whnewreceive.ru=Known malicious domain (whnewreceive.ru)|" +
             "whereceiver.ru=Known malicious domain (whereceiver.ru)|" +
             "weedhack=Known malicious infrastructure (weedhack)|" +
-            "FileOutputStream=File write capability|" +
-            "System.getenv=Environment variable enumeration|" +
             "initializeWeedhack=Majanito Stage 2 invocation|" +
+            "initializeWeedhack2=Weedhack Stage 2 alternate entry|" +
             "eth_call=Ethereum RPC call (EtherHiding C2)|" +
             "FabricAdapter=Majanito dropper component|" +
-            "minecraftservices.com=Minecraft session API access|" +
-            "Authorization=Bearer token / API authentication|" +
-            "javaw.exe=Windowless Java relaunch (console hiding)|" +
+            "launcher_accounts=Reads launcher_accounts.json — contains Minecraft session tokens|" +
             "LegitRigController=Casino rig cheat module|" +
             "writeDigitValue=Item NBT manipulation (casino cheating)|" +
-            "mshta=MSHTA dropper execution|" +
             "polygon-rpc.com=Polygon blockchain RPC (EtherHiding C2)|" +
             "boobility.online=Known C2 domain (Vape Curium)|" +
             "curium.cfg=Curium malware config|" +
-            "ModInitializer=Fabric mod entry point|" +
             "com.libmod=DonutDupe malware package|" +
             "sltnnt.ru=Known C2 domain (DonutDupe)|" +
-            "URLClassLoader=Dynamic class loading from URL (stage2)|" +
-            "defineClass=Dynamic class definition (code injection)|" +
-            "Robot=Screen capture or input simulation (java.awt.Robot)|" +
-            "Clipboard=Clipboard access (credential/crypto theft)|" +
-            "getenv=Environment variable enumeration|" +
-            "ScreenCapture=Screen capture functionality|" +
-            "KeyLogger=Keylogging functionality|" +
             "api.donutsmp.net=Known C2 domain (DonutSMP/ADAMRAT)|" +
             "feathermc.com=Known infrastructure (FeatherMC decoy)|" +
-            "grabber=Token/credential grabber|" +
-            "stealer=Data stealer|" +
-            "inject=Code injection capability|" +
-            "persistence=Persistence mechanism|" +
-            "startup=Startup/autorun persistence|" +
-            "APPDATA=AppData directory access (persistence/config)|" +
-            "chrome=Browser data access (Chrome)|" +
-            "firefox=Browser data access (Firefox)|" +
-            "opera=Browser data access (Opera)|" +
-            "brave=Browser data access (Brave)|" +
-            "Login Data=Browser credential database access|" +
-            "Cookies=Browser cookie database access|" +
-            "api.telegram.org=Telegram bot exfiltration|" +
-            "pastebin.com=Pastebin exfiltration|" +
-            "hastebin.com=Hastebin exfiltration|" +
-            "paste.ee=Paste.ee exfiltration|" +
-            "ngrok=Ngrok tunnel (dynamic C2)|" +
-            "trycloudflare=Cloudflare tunnel (dynamic C2)|" +
-            "schtasks=Scheduled task persistence|" +
-            "reg add=Registry modification|" +
-            "Preferences=Java Preferences API (registry persistence)|" +
-            "Startup=Startup folder persistence|" +
-            "availableProcessors=VM detection (CPU count)|" +
-            "java.vm.name=VM detection (JVM name)|" +
-            "getInputArguments=Debugger detection (JVM args)|" +
-            "isHeadless=Sandbox detection (headless)|" +
-            "MouseInfo=User interaction check (sandbox evasion)|" +
-            "Thread.sleep=Potential sandbox evasion (time delay)|" +
-            "launcher_accounts=Minecraft launcher account file|" +
-            "launcher_profiles=Minecraft launcher profiles|" +
-            "discord_rpc=Discord RPC library (token theft)|" +
-            "leveldb=LevelDB access (browser data extraction)|" +
-            ".ssh=SSH key directory access|" +
-            "ssh-rsa=SSH key reference|" +
-            "Premain-Class=Java agent injection|" +
-            "agentmain=Java agent runtime attachment|" +
-            "Instrumentation=Java instrumentation API|" +
-            "defineClass=Dynamic class definition|" +
-            "reverse()=String reversal (deobfuscation)|" +
             "owouwu.tk=Known C2 domain (WeirdUtils)|" +
             "ectasy.club=Known C2 domain (Ectasy)|" +
-            "replit.dev=Replit-hosted C2 (Comet)|" +
-            "replit.app=Replit-hosted C2 (Comet)|" +
-            "System.loadLibrary=Native library loading (DLL injection)|" +
-            "System.load=Native library loading|" +
-            "NativeLibrary=Native library access|" +
-            "Player.setOp=OP privilege escalation|" +
-            "setOp(true)=OP privilege escalation (Bukkit/Spigot)|" +
-            "dispatchCommand=Server command injection (Bukkit)|" +
-            "ServerCommandEvent=Server command interception|" +
-            "PluginCommand=Plugin command registration|" +
-            "WDAGUtilityAccount=Windows Sandbox detection (anti-analysis)|" +
             "neko.run=Fractureiser reinfection flag|" +
-            "Allatori=Allatori obfuscator watermark|" +
             "DOMStore=SkyRage persistence path|" +
             "microsoft-vm-core=SkyRage payload filename|" +
             "MicrosoftEdgeUpdateTaskMachineVM=SkyRage scheduled task persistence|" +
-            "Cipher.getInstance=Cryptographic operations (config decryption)|" +
-            "SecretKeySpec=AES/symmetric key usage|" +
-            "AES/CBC=AES-CBC encryption mode|" +
-            "pastebin.com/raw=Pastebin raw C2 config fetch|" +
-            "dl.dropboxusercontent=Dropbox C2 payload hosting|" +
-            "raw.githubusercontent=GitHub raw C2 payload hosting|" +
-            "anonfiles.com=Anonfiles C2 hosting|" +
-            "transfer.sh=Transfer.sh C2 hosting|" +
-            "Bukkit.getServer=Bukkit server access|" +
-            "OperatingSystemMXBean=System info enumeration|" +
-            "InetAddress.getLocalHost=Local host info enumeration|" +
-            "NetworkInterface=Network interface enumeration|" +
-            "ManagementFactory=JVM management info enumeration|" +
-            "CrashManager=Server crasher module manager|" +
-            "ExploitManager=Server exploit module manager|" +
-            "ForceOpExploit=ForceOp privilege escalation exploit|" +
-            "Log4JExploit=Log4Shell exploitation capability|" +
-            "BungeeExploit=BungeeCord/Velocity exploit|" +
-            "accXynisMap=2Packets/xynis account storage|" +
-            "warp-cli=Cloudflare WARP VPN integration|" +
-            "2PacketsClient=2Packets server crasher client|" +
-            "Main2PacketsClient=2Packets client entry point|" +
-            "api.ipify.org=External IP lookup service|" +
-            "login.live.com=Xbox Live authentication (cookie theft)|" +
-            "sisu.xboxlive.com=Xbox Live SISU auth (token chain)|" +
-            "api.minecraftservices.com=Minecraft services API (auth/profile)|" +
             "receiver.cy=Known Weedhack C2 domain|" +
             "whrc.ru=Known Weedhack C2 domain|" +
             "whreceiverrrrrrrr.ru=Known Weedhack C2 domain|" +
@@ -324,16 +236,39 @@ public class JarAnalyzer {
             "$jnicLoader=JNIC obfuscation loader (Weedhack)|" +
             "$jnicClinit=JNIC static initializer (Weedhack)|" +
             "dev.jnic=JNIC obfuscation package (Weedhack)|" +
-            "initializeWeedhack2=Weedhack Stage 2 alternate entry|" +
             "addDefenderExclusions=Windows Defender exclusion bypass|" +
             "Add-MpPreference=Windows Defender exclusion (PowerShell)|" +
             "RuntimeBroker=Fake RuntimeBroker process (Weedhack native payload)|" +
-            "cmstp=CMSTP UAC bypass technique|" +
-            "Elevator=Privilege escalation module|" +
             "TelemetryHelper=Weedhack telemetry/exfil module|" +
             "submitData=Data exfiltration API endpoint|" +
             "submitFile=File exfiltration API endpoint|" +
-            "submitLogs=Log exfiltration API endpoint");
+            "submitLogs=Log exfiltration API endpoint|" +
+            // Exploitation capabilities
+            "WDAGUtilityAccount=Windows Sandbox detection (anti-analysis)|" +
+            "Player.setOp=OP privilege escalation|" +
+            "setOp(true)=OP privilege escalation (Bukkit/Spigot)|" +
+            "ForceOpExploit=ForceOp privilege escalation exploit|" +
+            "Log4JExploit=Log4Shell exploitation capability|" +
+            "BungeeExploit=BungeeCord/Velocity exploit|" +
+            "CrashManager=Server crasher module manager|" +
+            "ExploitManager=Server exploit module manager|" +
+            "accXynisMap=2Packets/xynis account storage|" +
+            "2PacketsClient=2Packets server crasher client|" +
+            "Main2PacketsClient=2Packets client entry point|" +
+            // Credential/data theft indicators (specific enough to not FP)
+            "Login Data=Browser credential database access|" +
+            "leveldb=LevelDB access (browser data extraction)|" +
+            ".ssh=SSH key directory access|" +
+            "KeyLogger=Keylogging functionality|" +
+            "ScreenCapture=Screen capture functionality|" +
+            // C2/exfil hosting
+            "api.telegram.org=Telegram bot exfiltration|" +
+            "pastebin.com/raw=Pastebin raw C2 config fetch|" +
+            "ngrok=Ngrok tunnel (dynamic C2)|" +
+            "trycloudflare=Cloudflare tunnel (dynamic C2)|" +
+            // Persistence/evasion
+            "schtasks=Scheduled task persistence|" +
+            "cmstp=CMSTP UAC bypass technique");
 
         // Raw-byte patterns: "bytesPattern=label" entries, pipe-separated
         CFG.setProperty("raw.patterns",
@@ -355,9 +290,6 @@ public class JarAnalyzer {
             "$jnicLoader=JNIC obfuscation in class data|" +
             "b8c7315a-c159-4497-8e4c-2eb1c2319335=Weedhack JNIC payload UUID|" +
             "cf48e453-190a-490c-b102-f7719ec11734=Weedhack telemetry UUID|" +
-            "ClassLoader=Dynamic class loading capability|" +
-            "HKEY_=Windows registry access|" +
-            "powershell=PowerShell execution|" +
             "certutil=Certificate utility (download/decode)|" +
             "bitsadmin=BITS download utility");
     }
@@ -571,7 +503,6 @@ public class JarAnalyzer {
         String[][] skyPaths = {
             {appdata + "/Microsoft/DOMStore/microsoft-vm-core", "SkyRage persistence payload"},
             {appdata + "/Microsoft/DOMStore/discord_rpc.dll", "SkyRage Discord token stealer DLL"},
-            {localAppdata + "/Temp/plugin-config.bin", "SkyRage config artifact"},
             {userHome + "/../LocalLow/Microsoft/Internet Explorer/DOMStore/microsoft-vm-core", "SkyRage DOMStore payload"},
             // Linux paths
             {"/bin/vmd-gnu", "SkyRage Linux binary"},
@@ -786,9 +717,11 @@ public class JarAnalyzer {
     // ─────────────────────────────────────────────────────────────────────
 
     static void analyzeJar(String jarPath) throws Exception {
+        markerDetails.clear(); // Clear before any work to prevent stale data on exceptions
         jarName = Paths.get(jarPath).getFileName().toString()
             .replaceAll("\\.(jar|zip)(\\.zip)?$", "")
             .replaceAll("[^a-zA-Z0-9_\\-]", "_");
+        if (jarName.isEmpty()) jarName = "unnamed";
         // Create a dedicated output folder named after the JAR inside logs/
         outDir = Paths.get("logs", jarName);
         Files.createDirectories(outDir);
@@ -891,15 +824,19 @@ public class JarAnalyzer {
         decompilerUsed = decompileFullJar(decompileTarget, sourceDir, vineflowerPath, jadxPath, cfrPath);
         ok("Full decompilation complete (used: " + decompilerUsed + ")");
 
-        // Also build the in-memory source string for pattern matching
+        // Also build the in-memory source string + per-file map for pattern matching
         final long MAX_SOURCE_CHARS = 100_000_000L; // 100MB cap
         StringBuilder decompiled = new StringBuilder();
+        Map<String, String> sourceFiles = new LinkedHashMap<>(); // relative path → content
         try (var walker = Files.walk(sourceDir)) {
             walker.filter(p -> p.toString().endsWith(".java"))
                 .forEach(p -> {
                     try {
                         if (decompiled.length() < MAX_SOURCE_CHARS) {
-                            decompiled.append(Files.readString(p)).append("\n");
+                            String content = Files.readString(p);
+                            decompiled.append(content).append("\n");
+                            String relPath = sourceDir.relativize(p).toString().replace('\\', '/');
+                            sourceFiles.put(relPath, content);
                         }
                     }
                     catch (Exception ignored) {}
@@ -914,14 +851,17 @@ public class JarAnalyzer {
                 Path classFile = tempDir.resolve(e.getKey());
                 Files.createDirectories(classFile.getParent());
                 Files.write(classFile, e.getValue());
-                decompiled.append(runCFR(cfrPath, classFile.toString())).append("\n");
+                String cfrSrc = runCFR(cfrPath, classFile.toString());
+                decompiled.append(cfrSrc).append("\n");
+                sourceFiles.put(e.getKey().replace(".class", ".java"), cfrSrc);
             }
         }
         String src = decompiled.toString();
 
         // ── Step 6: Behavioral markers ───────────────────────────────
         step("Scanning for behavioral markers...");
-        List<String> markers = detectBehavioralMarkers(src, classes, jarPath);
+        markerDetails.clear();
+        List<String> markers = detectBehavioralMarkers(src, classes, jarPath, sourceFiles);
         if (markers.isEmpty()) ok("No behavioral markers detected");
         else {
             ok("Detected " + markers.size() + " behavioral marker(s):");
@@ -1053,21 +993,28 @@ public class JarAnalyzer {
             return Variant.MAJANITO_DROPPER;
         }
 
-        // Session harvester — check package path fragments (from CFG)
+        // Session harvester — MUST match package first, then class names confirm
+        boolean hasHarvesterPackage = false;
         for (String pkg : cfgArr("session.harvester.packages")) {
             if (!pkg.isEmpty() && namesJoined.contains(pkg.toLowerCase())) {
+                hasHarvesterPackage = true;
                 ilog("  → Session harvester: package fragment '" + pkg + "' detected");
-                return Variant.SESSION_HARVESTER;
+                break;
             }
         }
-        // Also check class name fragments (from CFG)
-        for (String cls : cfgArr("session.harvester.classes")) {
-            for (String n : names) {
-                if (!cls.isEmpty() && n.contains(cls)) {
-                    ilog("  → Session harvester: class '" + n + "' matched hint '" + cls + "'");
-                    return Variant.SESSION_HARVESTER;
+        if (hasHarvesterPackage) {
+            // Only check class name fragments if the package was found
+            for (String cls : cfgArr("session.harvester.classes")) {
+                for (String n : names) {
+                    if (!cls.isEmpty() && n.contains(cls)) {
+                        ilog("  → Session harvester: class '" + n + "' matched hint '" + cls + "' (with package match)");
+                        return Variant.SESSION_HARVESTER;
+                    }
                 }
             }
+            // Package alone is enough if it's a very specific namespace
+            ilog("  → Session harvester: package matched but no class hints — classifying anyway");
+            return Variant.SESSION_HARVESTER;
         }
 
         // FRACTUREISER — dev.neko, URLClassLoader + IP, lib.jar
@@ -1120,6 +1067,7 @@ public class JarAnalyzer {
         }
 
         // COMET — *auth command, MD5 default password, Replit C2
+        // Require class name match OR 2+ raw signature hits (single raw sig too generic)
         for (String cls : cfgArr("comet.classes")) {
             for (String n : names) {
                 if (!cls.isEmpty() && n.contains(cls)) {
@@ -1128,13 +1076,21 @@ public class JarAnalyzer {
                 }
             }
         }
-        for (byte[] classData : classes.values()) {
-            String ascii = new String(classData, StandardCharsets.US_ASCII);
-            for (String sig : cfgArr("comet.rawstrings")) {
-                if (!sig.isEmpty() && ascii.contains(sig)) {
-                    ilog("  → Comet (raw sig '" + sig + "' in class data)");
-                    return Variant.COMET;
+        {
+            int cometRawHits = 0;
+            for (byte[] classData : classes.values()) {
+                String ascii = new String(classData, StandardCharsets.US_ASCII);
+                for (String sig : cfgArr("comet.rawstrings")) {
+                    if (!sig.isEmpty() && ascii.contains(sig)) {
+                        ilog("  → Comet candidate: raw sig '" + sig + "' in class data");
+                        cometRawHits++;
+                        break; // one hit per class
+                    }
                 }
+            }
+            if (cometRawHits >= 2) {
+                ilog("  → Comet: " + cometRawHits + " raw signature hits — classifying");
+                return Variant.COMET;
             }
         }
 
@@ -1182,30 +1138,52 @@ public class JarAnalyzer {
             }
         }
 
-        // MCLAUNCHER_LOADER — me/mclauncher package with IMCL, MEntrypoint, etc.
+        // MCLAUNCHER_LOADER — package match is definitive; class names require 2+ hits
+        boolean hasMclauncherPkg = false;
         for (String pkg : cfgArr("mclauncher.packages")) {
             if (!pkg.isEmpty() && namesJoined.contains(pkg.toLowerCase())) {
+                hasMclauncherPkg = true;
                 ilog("  → MCLauncher Loader: package fragment '" + pkg + "' detected");
+                break;
+            }
+        }
+        if (hasMclauncherPkg) {
+            return Variant.MCLAUNCHER_LOADER;
+        }
+        {
+            int mclauncherClassHits = 0;
+            for (String cls : cfgArr("mclauncher.classes")) {
+                for (String n : names) {
+                    if (!cls.isEmpty() && n.contains(cls)) {
+                        mclauncherClassHits++;
+                        ilog("  → MCLauncher candidate: class '" + n + "' matched hint '" + cls + "'");
+                        break;
+                    }
+                }
+            }
+            if (mclauncherClassHits >= 2) {
+                ilog("  → MCLauncher Loader: " + mclauncherClassHits + " class hits — classifying");
                 return Variant.MCLAUNCHER_LOADER;
             }
         }
-        for (String cls : cfgArr("mclauncher.classes")) {
-            for (String n : names) {
-                if (!cls.isEmpty() && n.contains(cls)) {
-                    ilog("  → MCLauncher Loader: class '" + n + "' matched hint '" + cls + "'");
-                    return Variant.MCLAUNCHER_LOADER;
+
+        // MSHTA dropper — require 2+ raw signature hits to avoid single-keyword FP
+        {
+            int mshtaHits = 0;
+            Set<String> mshtaMatched = new LinkedHashSet<>();
+            for (byte[] classData : classes.values()) {
+                String ascii = new String(classData, StandardCharsets.US_ASCII).toLowerCase();
+                for (String sig : cfgArr("mshta.dropper.rawstrings")) {
+                    if (!sig.isEmpty() && !mshtaMatched.contains(sig) && ascii.contains(sig.toLowerCase())) {
+                        mshtaMatched.add(sig);
+                        mshtaHits++;
+                        ilog("  → MSHTA candidate: raw sig '" + sig + "' in class data");
+                    }
                 }
             }
-        }
-
-        // MSHTA dropper — very specific: mshta in raw bytes
-        for (byte[] classData : classes.values()) {
-            String ascii = new String(classData, StandardCharsets.US_ASCII);
-            for (String sig : cfgArr("mshta.dropper.rawstrings")) {
-                if (!sig.isEmpty() && ascii.toLowerCase().contains(sig.toLowerCase())) {
-                    ilog("  → MSHTA dropper (raw sig '" + sig + "' in class data)");
-                    return Variant.MSHTA_DROPPER;
-                }
+            if (mshtaHits >= 2) {
+                ilog("  → MSHTA dropper: " + mshtaHits + " raw signature hits — classifying");
+                return Variant.MSHTA_DROPPER;
             }
         }
 
@@ -1357,10 +1335,32 @@ public class JarAnalyzer {
     // BEHAVIORAL MARKER DETECTION (extended)
     // ─────────────────────────────────────────────────────────────────────
 
-    static List<String> detectBehavioralMarkers(String src, Map<String, byte[]> classes, String jarPath) {
+    /** Record a marker detail (file, line, context) for a given marker label. */
+    static void addMarkerDetail(String label, String file, int line, String context) {
+        markerDetails.computeIfAbsent(label, k -> new ArrayList<>()).add(Map.of(
+            "file", file != null ? file : "unknown",
+            "line", String.valueOf(line),
+            "context", context != null ? context.substring(0, Math.min(120, context.length())).trim() : ""
+        ));
+    }
+
+    /** Find the line number and context of a pattern in a source string. Returns {line, context} or null. */
+    static int[] findLineNumber(String content, String pattern) {
+        int idx = content.indexOf(pattern);
+        if (idx < 0) return null;
+        int line = 1;
+        for (int i = 0; i < idx; i++) {
+            if (content.charAt(i) == '\n') line++;
+        }
+        return new int[]{line, idx};
+    }
+
+    static List<String> detectBehavioralMarkers(String src, Map<String, byte[]> classes, String jarPath,
+                                                  Map<String, String> sourceFiles) {
         List<String> findings = new ArrayList<>();
 
         // Source-level patterns — loaded from CFG (format: "pattern=label", pipe-separated)
+        // Search per-file for location details
         for (String entry : cfgArr("behavioral.patterns")) {
             int eq = entry.indexOf('=');
             if (eq <= 0) continue;
@@ -1370,33 +1370,54 @@ public class JarAnalyzer {
                 if (!findings.contains(label)) {
                     findings.add(label);
                     ilog("  [MARKER] " + label + " (pattern: " + pat.trim() + ")");
+                    // Find which file(s) contain this pattern
+                    for (Map.Entry<String, String> sf : sourceFiles.entrySet()) {
+                        int[] loc = findLineNumber(sf.getValue(), pat);
+                        if (loc != null) {
+                            String[] lines = sf.getValue().split("\n");
+                            String ctx = (loc[0] - 1 < lines.length) ? lines[loc[0] - 1] : "";
+                            addMarkerDetail(label, sf.getKey(), loc[0], ctx);
+                        }
+                    }
                 }
             }
         }
 
-        // IP address detection in source
+        // IP address detection in source (with per-file location)
         Pattern ipSrcPat = Pattern.compile("\"(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})(?::\\d+)?\"");
-        Matcher ipSrcM = ipSrcPat.matcher(src);
-        while (ipSrcM.find()) {
-            String ip = ipSrcM.group(1);
-            if (!isPrivateOrInvalidIP(ip)) {
-                String m = "Hardcoded IP address: " + ip;
-                if (!findings.contains(m)) { findings.add(m); ilog("  [MARKER] " + m); }
+        for (Map.Entry<String, String> sf : sourceFiles.entrySet()) {
+            Matcher ipSrcM = ipSrcPat.matcher(sf.getValue());
+            while (ipSrcM.find()) {
+                String ip = ipSrcM.group(1);
+                if (!isPrivateOrInvalidIP(ip)) {
+                    String m = "Hardcoded IP address: " + ip;
+                    if (!findings.contains(m)) {
+                        findings.add(m); ilog("  [MARKER] " + m);
+                    }
+                    int line = 1;
+                    for (int i = 0; i < ipSrcM.start(); i++) { if (sf.getValue().charAt(i) == '\n') line++; }
+                    addMarkerDetail(m, sf.getKey(), line, ipSrcM.group());
+                }
             }
         }
 
-        // Base64 encoded strings in source
+        // Base64 encoded strings in source (with per-file location)
         Pattern b64SrcPat = Pattern.compile("\"([A-Za-z0-9+/]{40,}={0,2})\"");
-        Matcher b64SrcM = b64SrcPat.matcher(src);
-        while (b64SrcM.find()) {
-            try {
-                byte[] dec = Base64.getDecoder().decode(b64SrcM.group(1));
-                String decoded = new String(dec, StandardCharsets.UTF_8);
-                if (decoded.contains("http") || decoded.contains("discord") || decoded.contains("token")) {
-                    String m = "Base64 encoded suspicious string: " + decoded.substring(0, Math.min(80, decoded.length()));
-                    if (!findings.contains(m)) { findings.add(m); ilog("  [MARKER] " + m); }
-                }
-            } catch (Exception ignored) {}
+        for (Map.Entry<String, String> sf : sourceFiles.entrySet()) {
+            Matcher b64SrcM = b64SrcPat.matcher(sf.getValue());
+            while (b64SrcM.find()) {
+                try {
+                    byte[] dec = Base64.getDecoder().decode(b64SrcM.group(1));
+                    String decoded = new String(dec, StandardCharsets.UTF_8);
+                    if (decoded.contains("http") || decoded.contains("discord") || decoded.contains("token")) {
+                        String m = "Base64 encoded suspicious string: " + decoded.substring(0, Math.min(80, decoded.length()));
+                        if (!findings.contains(m)) { findings.add(m); ilog("  [MARKER] " + m); }
+                        int line = 1;
+                        for (int i = 0; i < b64SrcM.start(); i++) { if (sf.getValue().charAt(i) == '\n') line++; }
+                        addMarkerDetail(m, sf.getKey(), line, "Base64: " + b64SrcM.group(1).substring(0, Math.min(40, b64SrcM.group(1).length())) + "...");
+                    }
+                } catch (Exception ignored) {}
+            }
         }
 
         // Char array string construction detection
@@ -1456,17 +1477,24 @@ public class JarAnalyzer {
         }
 
         // Raw-byte patterns — loaded from CFG (format: "pattern=label", pipe-separated)
+        // Also track which class file(s) contain each pattern
         Set<String> rawStrings = extractRawStrings(classes);
         for (String entry : cfgArr("raw.patterns")) {
             int eq = entry.indexOf('=');
             if (eq <= 0) continue;
             String pat   = entry.substring(0, eq);
             String label = entry.substring(eq + 1);
-            if (rawStrings.stream().anyMatch(s -> s.contains(pat))) {
-                if (!findings.contains(label)) {
-                    findings.add(label);
-                    ilog("  [MARKER/RAW] " + label);
+            boolean found = false;
+            for (Map.Entry<String, byte[]> classEntry : classes.entrySet()) {
+                String ascii = new String(classEntry.getValue(), StandardCharsets.US_ASCII);
+                if (ascii.contains(pat)) {
+                    found = true;
+                    addMarkerDetail(label, classEntry.getKey(), 0, "Raw bytes in class file");
                 }
+            }
+            if (found && !findings.contains(label)) {
+                findings.add(label);
+                ilog("  [MARKER/RAW] " + label);
             }
         }
 
@@ -1536,7 +1564,7 @@ public class JarAnalyzer {
         for (byte[] classData : classes.values()) {
             String ascii = new String(classData, StandardCharsets.US_ASCII);
             if (ascii.contains("Allatori") || ascii.contains("allatori")) {
-                String m = "Allatori obfuscator detected (used by Fractureiser/SkyRage)";
+                String m = "Allatori commercial obfuscator detected";
                 if (!findings.contains(m)) { findings.add(m); ilog("  [MARKER] " + m); }
                 break;
             }
@@ -1640,8 +1668,8 @@ public class JarAnalyzer {
         while (m.find()) count++;
 
         if (count >= 10) {
-            String msg = "HIGH DENSITY byte[] string construction: " + count + " instances " +
-                "(fractureiser/obfuscation indicator — all strings hidden as byte arrays)";
+            String msg = "Heavy string obfuscation: " + count + " instances of byte[] string construction " +
+                "(all string literals encoded as byte arrays — common in obfuscated JARs)";
             if (!findings.contains(msg)) { findings.add(msg); warn(msg); }
         } else if (count >= 5) {
             String msg = "Moderate byte[] string construction density: " + count + " instances";
@@ -2175,7 +2203,9 @@ public class JarAnalyzer {
                 sb.append("\"").append(escJson(markers.get(i))).append("\"");
                 if (i < markers.size() - 1) sb.append(", ");
             }
-            sb.append("]\n}\n");
+            sb.append("],\n");
+            appendMarkerDetails(sb);
+            sb.append("\n}\n");
             Files.writeString(out(jarName + "_iocs.json"), sb.toString());
         } catch (Exception e) { warn("Could not write iocs.json: " + e.getMessage()); }
     }
@@ -2232,7 +2262,9 @@ public class JarAnalyzer {
                 sb.append("\"").append(escJson(markers.get(i))).append("\"");
                 if (i < markers.size() - 1) sb.append(", ");
             }
-            sb.append("]\n}\n");
+            sb.append("],\n");
+            appendMarkerDetails(sb);
+            sb.append("\n}\n");
             Files.writeString(out(jarName + "_iocs.json"), sb.toString());
         } catch (Exception e) { warn("Could not write iocs.json: " + e.getMessage()); }
     }
@@ -2258,9 +2290,32 @@ public class JarAnalyzer {
                 sb.append("\"").append(escJson(markers.get(i))).append("\"");
                 if (i < markers.size() - 1) sb.append(", ");
             }
-            sb.append("]\n}\n");
+            sb.append("],\n");
+            appendMarkerDetails(sb);
+            sb.append("\n}\n");
             Files.writeString(out(jarName + "_iocs.json"), sb.toString());
         } catch (Exception e) { warn("Could not write iocs.json: " + e.getMessage()); }
+    }
+
+    /** Append the markerDetails JSON object to a StringBuilder. */
+    static void appendMarkerDetails(StringBuilder sb) {
+        sb.append("  \"markerDetails\": {");
+        int mi = 0;
+        for (Map.Entry<String, List<Map<String, String>>> me : markerDetails.entrySet()) {
+            sb.append("\n    \"").append(escJson(me.getKey())).append("\": [");
+            List<Map<String, String>> locs = me.getValue();
+            for (int i = 0; i < locs.size(); i++) {
+                Map<String, String> loc = locs.get(i);
+                sb.append("{\"file\":\"").append(escJson(loc.getOrDefault("file", "")))
+                  .append("\",\"line\":").append(loc.getOrDefault("line", "0"))
+                  .append(",\"context\":\"").append(escJson(loc.getOrDefault("context", "")))
+                  .append("\"}");
+                if (i < locs.size() - 1) sb.append(",");
+            }
+            sb.append("]");
+            if (++mi < markerDetails.size()) sb.append(",");
+        }
+        sb.append("\n  }");
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -4468,8 +4523,8 @@ public class JarAnalyzer {
             w.println("   - C2/config code highlighted in main/important/ directory");
             if (configRaw != null)
                 w.println("3. Found and decrypted embedded configuration file");
-            w.println("4. Scanned for behavioral markers and IOCs");
-            w.println("5. Extracted and decrypted obfuscated strings (variant-specific)");
+            w.println("3. Scanned for behavioral markers and IOCs");
+            w.println("4. Extracted and decrypted obfuscated strings (variant-specific)");
             w.println();
 
             w.println("──── WHY THIS ANALYSIS ────");
@@ -4492,7 +4547,24 @@ public class JarAnalyzer {
             if (!markers.isEmpty()) {
                 w.println("──── BEHAVIORAL MARKERS ────");
                 w.println();
-                for (String m : markers) w.println("  - " + m);
+                for (String m : markers) {
+                    w.println("  - " + m);
+                    // Include file/line details if available
+                    List<Map<String, String>> details = markerDetails.get(m);
+                    if (details != null) {
+                        for (Map<String, String> d : details) {
+                            String file = d.getOrDefault("file", "");
+                            String line = d.getOrDefault("line", "0");
+                            String ctx = d.getOrDefault("context", "");
+                            if (!file.isEmpty()) {
+                                w.print("      @ " + file);
+                                if (!"0".equals(line)) w.print(":" + line);
+                                if (!ctx.isEmpty()) w.print("  →  " + ctx.trim());
+                                w.println();
+                            }
+                        }
+                    }
+                }
                 w.println();
             }
 
@@ -4691,11 +4763,17 @@ public class JarAnalyzer {
             // Check for Discord tokens, API keys, etc. (skip known-safe library strings)
             if (s.matches("[A-Za-z0-9._\\-]{50,}") || s.contains("token") || s.contains("api_key")
                 || s.contains("password") || s.contains("secret")) {
-                // Allowlist: known-safe strings from common libraries (Gson, Jackson, etc.)
-                if (s.equals("token") || s.equals("tokenType") || s.equals("tokenValue")
-                    || s.equals("nextToken") || s.equals("peekToken") || s.equals("getToken")
-                    || s.equals("password") || s.equals("secret")
-                    || s.startsWith("com.google.gson") || s.startsWith("com.fasterxml.jackson")) continue;
+                // Skip single-word programming terms and common library references
+                String lower = s.toLowerCase();
+                if (lower.contains("tokenize") || lower.contains("tokenizer") || lower.contains("tokenclass")
+                    || lower.contains("tokentype") || lower.contains("tokenvalue") || lower.contains("nexttoken")
+                    || lower.contains("peektoken") || lower.contains("gettoken") || lower.contains("parsetoken")
+                    || lower.contains("token_") || lower.contains("_token") || lower.contains("tokenfactory")
+                    || lower.equals("token") || lower.equals("password") || lower.equals("secret")
+                    || lower.startsWith("com.google.") || lower.startsWith("com.fasterxml.")
+                    || lower.startsWith("org.json.") || lower.startsWith("com.formdev.")
+                    || lower.contains("expected") || lower.contains("invalid json")
+                    || lower.contains("keyword")) continue;
                 interestingStrings.add("[SENSITIVE] " + s);
             }
         }

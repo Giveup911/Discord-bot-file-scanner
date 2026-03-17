@@ -50,7 +50,7 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(),
         logging.handlers.RotatingFileHandler(
-            "scanner.log", encoding="utf-8", maxBytes=10 * 1024 * 1024, backupCount=5
+            str(Path(__file__).resolve().parent / "scanner.log"), encoding="utf-8", maxBytes=10 * 1024 * 1024, backupCount=5
         ),
     ],
 )
@@ -62,6 +62,9 @@ BOT_DIR = Path(__file__).resolve().parent
 MASTER_DIR = BOT_DIR.parent
 TOOLS_DIR = MASTER_DIR / "tools"
 STATS_FILE = BOT_DIR / "stats.json"
+CATALOG_FILE = BOT_DIR / "catalog.json"
+EXCEPTIONS_FILE = BOT_DIR / "exceptions.var"
+EXCEPTIONS_MD = BOT_DIR / "exceptions.md"
 DEFAULT_CFG = {
     "discord": {
         "token": "",
@@ -360,22 +363,166 @@ def save_stats(stats: dict):
 
 
 scan_stats = load_stats()
-_stats_lock: Optional[asyncio.Lock] = None
-
-
-def _get_stats_lock() -> asyncio.Lock:
-    global _stats_lock
-    if _stats_lock is None:
-        _stats_lock = asyncio.Lock()
-    return _stats_lock
+_stats_lock = asyncio.Lock()
 
 
 async def update_stats(**increments):
     """Thread-safe stat update. Usage: await update_stats(total_scans=1, detections=1)"""
-    async with _get_stats_lock():
+    async with _stats_lock:
         for key, delta in increments.items():
             scan_stats[key] = scan_stats.get(key, 0) + delta
         save_stats(scan_stats)
+
+# ─── File Catalog ────────────────────────────────────────────────────────────
+
+
+def load_catalog() -> dict:
+    if CATALOG_FILE.exists():
+        try:
+            return json.loads(CATALOG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_catalog(catalog: dict):
+    try:
+        tmp = str(CATALOG_FILE) + ".tmp"
+        Path(tmp).write_text(json.dumps(catalog, indent=2), encoding="utf-8")
+        os.replace(tmp, CATALOG_FILE)
+    except Exception as e:
+        log.warning(f"Failed to save catalog: {e}")
+
+
+file_catalog = load_catalog()
+_catalog_lock = asyncio.Lock()
+
+
+async def catalog_update(sha256: str, entry: dict):
+    async with _catalog_lock:
+        file_catalog[sha256] = entry
+        save_catalog(file_catalog)
+
+
+async def catalog_lookup(sha256: str) -> Optional[dict]:
+    return file_catalog.get(sha256)
+
+# ─── Exception List ──────────────────────────────────────────────────────────
+
+def load_exceptions() -> set:
+    """Load approved exception hashes from exceptions.var"""
+    hashes = set()
+    if EXCEPTIONS_FILE.exists():
+        for line in EXCEPTIONS_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Take just the hash part (before any comment)
+            h = line.split()[0].strip().lower()
+            if len(h) == 64:  # SHA-256 length
+                hashes.add(h)
+    return hashes
+
+approved_exceptions = load_exceptions()
+
+async def check_exception(sha256: str) -> bool:
+    """Check if a file hash is in the approved exceptions list."""
+    return sha256.lower() in approved_exceptions
+
+async def write_exception_candidate(filename: str, sha256: str, file_size: int,
+                                      score: int, level: str, variant: str,
+                                      extracted_urls: list, url_hash_matches: list):
+    """Write a candidate to exceptions.md for user review."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    entry = f"\n## {filename} — {now}\n"
+    entry += f"- **SHA-256:** `{sha256}`\n"
+    entry += f"- **File size:** {file_size:,} bytes\n"
+    entry += f"- **Score:** {score}/100 ({level})\n"
+    if variant and variant.lower() != "unknown":
+        entry += f"- **Variant detected:** {variant}\n"
+    if extracted_urls:
+        entry += f"- **URLs found in file:**\n"
+        for u in extracted_urls[:10]:
+            entry += f"  - `{u}`\n"
+    if url_hash_matches:
+        entry += f"- **Hash verification results:**\n"
+        for match in url_hash_matches:
+            status = "MATCH" if match.get("matches") else "NO MATCH" if match.get("hash_found") else "No hash found on page"
+            entry += f"  - `{match['url'][:80]}` — {status}\n"
+            if match.get("page_hash"):
+                entry += f"    Page hash: `{match['page_hash']}`\n"
+
+    recommendation = "Unknown"
+    if any(m.get("matches") for m in url_hash_matches):
+        recommendation = "LIKELY SAFE — SHA-256 matches hash published on official source. Consider adding to exceptions.var"
+    elif extracted_urls and not url_hash_matches:
+        recommendation = "Could not verify — no hashes found on linked pages"
+    else:
+        recommendation = "Could not verify — hash does not match any published hash"
+    entry += f"- **Recommendation:** {recommendation}\n"
+    entry += f"\nTo approve, add this line to `exceptions.var`:\n```\n{sha256}  # {filename}\n```\n---\n"
+
+    # Append to exceptions.md
+    try:
+        header = "# Exception Candidates\n\nFiles listed here were auto-researched by the scanner. Review and add approved hashes to `exceptions.var`.\n\n---\n"
+        if EXCEPTIONS_MD.exists():
+            existing = EXCEPTIONS_MD.read_text(encoding="utf-8")
+        else:
+            existing = header
+
+        # Don't duplicate entries for the same hash
+        if sha256 in existing:
+            return
+
+        EXCEPTIONS_MD.write_text(existing + entry, encoding="utf-8")
+        log.info(f"Exception candidate written for {filename} ({sha256[:16]}...)")
+    except Exception as e:
+        log.warning(f"Failed to write exception candidate: {e}")
+
+
+async def auto_research_urls(urls: list, sha256: str, session: aiohttp.ClientSession) -> list:
+    """Try to find hash verification on download pages."""
+    results = []
+    # Only check URLs that look like download/release pages
+    research_domains = [
+        "github.com", "modrinth.com", "curseforge.com", "spigotmc.org",
+        "bukkit.org", "hangar.papermc.io", "polymart.org",
+        "builtbybit.com", "mc-market.org",
+    ]
+
+    candidate_urls = []
+    for u in urls:
+        if any(d in u for d in research_domains):
+            candidate_urls.append(u)
+
+    if not candidate_urls:
+        return results
+
+    for url in candidate_urls[:3]:  # Max 3 URLs to check
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10),
+                                   allow_redirects=True) as resp:
+                if resp.status != 200:
+                    continue
+                text = await resp.text()
+
+                # Look for SHA-256 hashes on the page
+                hash_pattern = re.compile(r'\b([a-fA-F0-9]{64})\b')
+                found_hashes = hash_pattern.findall(text)
+
+                result = {"url": url, "hash_found": False, "matches": False, "page_hash": None}
+                for h in found_hashes:
+                    result["hash_found"] = True
+                    result["page_hash"] = h.lower()
+                    if h.lower() == sha256.lower():
+                        result["matches"] = True
+                        break
+                results.append(result)
+        except Exception as e:
+            log.debug(f"Auto-research failed for {url}: {e}")
+
+    return results
 
 # ─── YARA (optional) ────────────────────────────────────────────────────────
 
@@ -503,8 +650,7 @@ async def vt_upload(filepath: str, sha256: str, session: aiohttp.ClientSession) 
         else:
             upload_url = f"{VT_BASE}/files"
 
-        fh = open(filepath, "rb")
-        try:
+        with open(filepath, "rb") as fh:
             data = aiohttp.FormData()
             data.add_field("file", fh, filename=os.path.basename(filepath))
             async with session.post(upload_url, headers=headers, data=data) as resp:
@@ -514,8 +660,6 @@ async def vt_upload(filepath: str, sha256: str, session: aiohttp.ClientSession) 
                             "meaningful_name": "", "tags": [], "first_seen": None, "status": "upload_failed"}
                 result = await resp.json()
                 analysis_id = result["data"]["id"]
-        finally:
-            fh.close()
 
         await update_stats(files_sent_to_vt=1)
 
@@ -627,8 +771,7 @@ async def mb_upload(filepath: str, sha256: str, session: aiohttp.ClientSession,
         if comment:
             json_meta["context"] = {"comment": comment[:500]}
 
-        fh = open(filepath, "rb")
-        try:
+        with open(filepath, "rb") as fh:
             data = aiohttp.FormData()
             data.add_field("json_data", json.dumps(json_meta), content_type="application/json")
             data.add_field(
@@ -662,8 +805,6 @@ async def mb_upload(filepath: str, sha256: str, session: aiohttp.ClientSession,
                 else:
                     log.warning(f"MalwareBazaar upload returned {resp.status}: {body[:200]}")
                     return {"status": "upload_failed", "permalink": permalink, "detail": f"HTTP {resp.status}"}
-        finally:
-            fh.close()
     except Exception as e:
         log.warning(f"MalwareBazaar upload failed: {e}")
         return {"status": "upload_failed", "permalink": permalink, "detail": str(e)}
@@ -755,8 +896,7 @@ async def ha_submit(filepath: str, sha256: str, session: aiohttp.ClientSession) 
     headers = {"api-key": api_key, "User-Agent": "Falcon", "accept": "application/json"}
     permalink = f"https://www.hybrid-analysis.com/sample/{sha256}"
     try:
-        fh = open(filepath, "rb")
-        try:
+        with open(filepath, "rb") as fh:
             data = aiohttp.FormData()
             data.add_field("file", fh, filename=os.path.basename(filepath))
             data.add_field("environment_id", "160")  # Windows 10 64-bit
@@ -779,8 +919,6 @@ async def ha_submit(filepath: str, sha256: str, session: aiohttp.ClientSession) 
                     body = await resp.text()
                     log.warning(f"Hybrid Analysis submit returned {resp.status}: {body[:200]}")
                     return {"permalink": permalink, "status": "submit_failed"}
-        finally:
-            fh.close()
     except Exception as e:
         log.warning(f"Hybrid Analysis submit failed: {e}")
         return {"permalink": permalink, "status": "error"}
@@ -1995,7 +2133,7 @@ def compute_risk_score(
                 )
             )
         ]
-        score += min(len(non_library_markers), 10)
+        score += min(len(non_library_markers), 8)
 
     # VirusTotal
     if vt and vt.get("total", 0) > 0:
@@ -2017,29 +2155,39 @@ def compute_risk_score(
     # YARA
     score += min(len(yara_matches) * 5, 15)
 
-    # obfuscators
+    # obfuscators — low weight since hacked clients and legitimate mods
+    # routinely use obfuscation for IP protection, not just malware
     if obfuscators:
-        score += min(len(obfuscators) * 3, 10)
+        score += min(len(obfuscators) * 2, 6)
 
-    # entropy
+    # entropy — moderate weight; obfuscated but legitimate code often has high entropy
     if entropy:
         if entropy.get("suspicious_entries"):
-            score += min(len(entropy["suspicious_entries"]) * 3, 10)
-        if entropy.get("max_class_entropy", 0) > 7.0:
-            score += 5
+            score += min(len(entropy["suspicious_entries"]) * 2, 6)
+        if entropy.get("max_class_entropy", 0) > 7.5:
+            score += 3
 
     # raw string extraction
+    has_webhooks = False
     if extracted_strings:
         if extracted_strings.get("discord_webhooks"):
             score += 10
+            has_webhooks = True
         if extracted_strings.get("discord_tokens"):
             score += 15
         if extracted_strings.get("eth_addresses"):
             score += 5
 
-    # manifest
+    # Combo: webhook + launcher_accounts is almost always a stealer
+    has_launcher_accounts = iocs and any(
+        "launcher_accounts" in m for m in iocs.get("behavioralMarkers", [])
+    )
+    if has_webhooks and has_launcher_accounts:
+        score += 15
+
+    # manifest — reduced weight for Mixin-related keys (Premain-Class, Can-Redefine-Classes)
     if manifest and manifest.get("suspicious_keys"):
-        score += min(len(manifest["suspicious_keys"]) * 3, 10)
+        score += min(len(manifest["suspicious_keys"]) * 2, 8)
 
     # Multi-format analysis scoring
     if format_analysis:
@@ -2226,6 +2374,76 @@ def _safe_add_field(embed: discord.Embed, budget: list, **kwargs):
     return True
 
 
+# ── Variant descriptions in plain language ──
+_VARIANT_DESCRIPTIONS = {
+    "adamrat": "AdamRAT (a Minecraft account stealer that sends your login info to the attacker via Discord webhook)",
+    "majanito_dropper": "Majanito Dropper (downloads and runs a second malicious file using the Ethereum blockchain to hide the download link)",
+    "session_harvester": "Session Harvester (steals your Minecraft login session so someone else can log in as you)",
+    "vape_curium": "Vape Curium (a RAT that can control your computer remotely, download more malware, and spread to friends)",
+    "donut_dupe": "DonutDupe (uses blockchain technology to hide its connection to the attacker's server)",
+    "mshta_dropper": "MSHTA Dropper (uses a Windows trick called MSHTA to run hidden malicious scripts)",
+    "fractureiser": "Fractureiser (a very dangerous virus that spreads through Minecraft mods and steals passwords, tokens, and crypto wallets)",
+    "skyrage": "SkyRage (steals your Discord token, browser passwords, and Minecraft account, and hides itself as a Windows service)",
+    "weirdutils": "WeirdUtils (a hidden backdoor that pretends to be a normal mod but steals your data)",
+    "comet": "Comet Backdoor (a Minecraft server backdoor that lets attackers run commands on the server)",
+    "ectasy": "Ectasy (a server backdoor that downloads itself into your server and gives attackers remote control)",
+    "server_crasher": "Server Crasher / Exploit Client (a tool designed to crash or exploit Minecraft servers)",
+    "mclauncher_loader": "MCLauncher Loader (hides inside a normal-looking mod and secretly downloads and runs malware)",
+}
+
+_INFECTION_RESOURCES = (
+    "\n\n**If you already ran this file, you should:**\n"
+    "\u2022 Change your Minecraft, Discord, and email passwords immediately\n"
+    "\u2022 Enable 2FA on all accounts if you haven't already\n"
+    "\u2022 Check Discord Settings > Authorized Apps and remove anything suspicious\n"
+    "\u2022 Run a full antivirus scan (Windows Defender, Malwarebytes, etc.)\n"
+    "\u2022 Check for unknown programs in Task Manager / startup apps\n"
+    "\u2022 See this guide for more help: https://prismlauncher.org/wiki/overview/getting-rid-of-malware/"
+)
+
+
+def _build_plain_summary(score, level, variant, iocs, vt, yara_matches,
+                         extracted_strings, mb_result):
+    """Build a plain-language summary for the top of the embed."""
+    lines = []
+
+    # Best guess at what it is
+    if variant and variant != "unknown" and variant in _VARIANT_DESCRIPTIONS:
+        lines.append(f"**What is this?** This file is **{_VARIANT_DESCRIPTIONS[variant]}**.")
+    elif score > 60:
+        lines.append("**What is this?** This file has strong indicators of being **malware** (a program designed to steal your data or harm your computer).")
+    elif score > 35:
+        lines.append("**What is this?** This file has some suspicious behaviors that could indicate malware, but it might also be a legitimate (but sketchy-looking) program. Check the details below.")
+    elif score > DETECTION_THRESHOLD:
+        lines.append("**What is this?** This file has a few minor flags. It's probably fine, but take a quick look at the details below to be sure.")
+    else:
+        lines.append("**What is this?** This file looks clean. No malware indicators were found.")
+
+    # What the scan found (simplified)
+    findings = []
+    if vt and vt.get("detected", 0) > 0:
+        findings.append(f"{vt['detected']} out of {vt['total']} antivirus engines flagged it")
+    if mb_result and mb_result.get("status") == "found":
+        findings.append("it's in a known malware database (MalwareBazaar)")
+    if yara_matches:
+        findings.append(f"it matched {len(yara_matches)} malware signature rule(s)")
+    if extracted_strings and extracted_strings.get("discord_webhooks"):
+        findings.append("it contains a Discord webhook URL (often used to send stolen data to attackers)")
+    if iocs:
+        if iocs.get("c2Base") or iocs.get("ethContract"):
+            findings.append("it connects to a known attacker-controlled server")
+    if findings:
+        lines.append("**Key findings:** " + "; ".join(findings) + ".")
+
+    # Confidence + ran-it warning
+    if score > 60:
+        lines.append(_INFECTION_RESOURCES)
+    elif score > 35:
+        lines.append("\n*If you're unsure, don't run it. Ask someone you trust or check the details below.*")
+
+    return "\n".join(lines)
+
+
 def build_embeds(
     filename: str,
     file_size: int,
@@ -2270,10 +2488,17 @@ def build_embeds(
 
     e = discord.Embed(
         title=f"{emoji} Scan Results: {filename[:70]}",
-        description=scan_desc,
         color=color,
         timestamp=datetime.now(timezone.utc),
     )
+
+    # ── Plain-language summary at the top ──
+    variant_raw = ""
+    if iocs:
+        variant_raw = (iocs.get("variant") or "").lower()
+    summary = _build_plain_summary(score, level, variant_raw, iocs, vt, yara_matches,
+                                   extracted_strings, mb_result)
+    e.description = summary
 
     # risk score with context
     bar_filled = score // 10
@@ -2419,9 +2644,11 @@ def build_embeds(
 
     # obfuscators
     if obfuscators:
+        obf_text = ", ".join(f"`{o}`" for o in obfuscators)
+        obf_text += "\n*Obfuscation scrambles the code to make it hard to read. Both malware AND legitimate programs use this to protect their code.*"
         e.add_field(
-            name="\U0001F576 Obfuscators",
-            value=", ".join(f"`{o}`" for o in obfuscators),
+            name="\U0001F576 Obfuscators Detected",
+            value=obf_text,
             inline=False,
         )
 
@@ -2434,12 +2661,14 @@ def build_embeds(
             ent_text += f"\n**{len(entropy['suspicious_entries'])}** high-entropy entries (>7.5):"
             for se in entropy["suspicious_entries"][:3]:
                 ent_text += f"\n  `{se['name'][:40]}` \u2014 {se['entropy']:.1f} ({se['size']} bytes)"
+        ent_text += "\n*Entropy measures randomness. High values can mean encrypted/compressed data (normal in obfuscated mods) or hidden payloads.*"
         e.add_field(name="\U0001F4CA Entropy", value=_trunc(ent_text), inline=False)
 
     # manifest
     if manifest and manifest.get("suspicious_keys"):
         mf_text = "\n".join(f"`{k}`" for k in manifest["suspicious_keys"][:5])
-        e.add_field(name="\U0001F4C4 Suspicious Manifest", value=mf_text, inline=False)
+        mf_text += "\n*The manifest is like a label on the JAR. These entries let the program run code automatically or modify other programs. Mixin-based mods use these legitimately.*"
+        e.add_field(name="\U0001F4C4 Manifest Entries", value=mf_text, inline=False)
 
     # extracted URLs — sanitize paths
     if extracted_strings and extracted_strings.get("urls"):
@@ -2467,7 +2696,9 @@ def build_embeds(
         e.add_field(name="\U0001F4B0 Ethereum Addresses", value=eth_text, inline=False)
 
     # behavioral markers — split into threats vs informational
+    marker_details = {}
     if iocs:
+        marker_details = iocs.get("markerDetails", {})
         markers = iocs.get("behavioralMarkers", [])
         important = [m for m in markers if not m.startswith("Bytecode API ref:")]
         high_risk = [m for m in important if "HIGH RISK" in m]
@@ -2482,16 +2713,41 @@ def build_embeds(
                 threats.append(m)
             else:
                 info_markers.append(m)
+
+        def _format_marker_with_details(marker_label, prefix=""):
+            """Format a marker with file/line details if available."""
+            line = f"{prefix}{sanitize_path(marker_label)}"
+            details = marker_details.get(marker_label, [])
+            if details:
+                # Show first location
+                d = details[0]
+                f_name = d.get("file", "")
+                f_line = d.get("line", "0")
+                if f_name:
+                    loc = f"`{f_name}"
+                    if f_line and f_line != "0":
+                        loc += f":{f_line}"
+                    loc += "`"
+                    line += f"\n  {loc}"
+                    ctx = d.get("context", "").strip()
+                    if ctx and len(ctx) > 3:
+                        line += f" — `{sanitize_path(ctx[:60])}`"
+                if len(details) > 1:
+                    line += f" (+{len(details) - 1} more location{'s' if len(details) > 2 else ''})"
+            return line
+
         if threats:
-            text = "\n".join(f"\U0001F6A8 {sanitize_path(m)}" for m in threats[:8])
-            if len(threats) > 8:
-                text += f"\n*... and {len(threats) - 8} more*"
+            text = "\n".join(_format_marker_with_details(m, "\U0001F6A8 ") for m in threats[:6])
+            if len(threats) > 6:
+                text += f"\n*... and {len(threats) - 6} more*"
             _safe_add_field(e, budget, name="\U0001F6A8 Threat Indicators", value=_trunc(text), inline=False)
         if info_markers:
-            text = "*These behaviors are common in legitimate software (installers, mods with native code) and do not necessarily indicate malware:*\n"
-            text += "\n".join(f"\u2022 {sanitize_path(m)}" for m in info_markers[:10])
-            if len(info_markers) > 10:
-                text += f"\n*... and {len(info_markers) - 10} more*"
+            text = ("*These are things the file CAN do. Many normal programs do these things too "
+                    "(like game launchers, mods, installers). They're only concerning when combined "
+                    "with other red flags above:*\n")
+            text += "\n".join(_format_marker_with_details(m, "\u2022 ") for m in info_markers[:8])
+            if len(info_markers) > 8:
+                text += f"\n*... and {len(info_markers) - 8} more*"
             _safe_add_field(e, budget, name="\U0001F50D Observed Behaviors", value=_trunc(text), inline=False)
 
     # ── Deobfuscated strings ──
@@ -2644,8 +2900,8 @@ def build_embeds(
         high_concern = []  # APIs that are almost always suspicious in mods
         moderate_concern = []  # APIs that are common but worth noting
         other_concern = []  # Everything else worth showing
-        ALWAYS_SUSPICIOUS = ["defineClass", "URLClassLoader", "setAccessible"]
-        CONTEXT_DEPENDENT = ["Runtime.exec", "ProcessBuilder", "System.load", "System.loadLibrary", "deleteOnExit"]
+        ALWAYS_SUSPICIOUS = ["defineClass", "URLClassLoader"]
+        CONTEXT_DEPENDENT = ["Runtime.exec", "ProcessBuilder", "System.load", "System.loadLibrary", "deleteOnExit", "setAccessible"]
         for m in non_lib_markers:
             if any(x in m for x in ALWAYS_SUSPICIOUS):
                 high_concern.append(m)
@@ -2655,11 +2911,14 @@ def build_embeds(
                 other_concern.append(m)
         if high_concern or moderate_concern or other_concern:
             e2 = discord.Embed(title="\U0001F50E Bytecode API Analysis", color=color)
-            lines = ["*Scanned Java bytecode for sensitive API calls. Known library code (LWJGL, FlatLaf, Fabric, etc.) is filtered out \u2014 only application code is shown below.*\n"]
+            lines = [("*We looked at what Java commands this file uses. "
+                       "Think of these like capabilities \u2014 things it CAN do. "
+                       "Normal mods use some of these too, so they're not automatically bad. "
+                       "Library code (LWJGL, Fabric, etc.) is already filtered out.*\n")]
             # Clean up obfuscated class names for readability
             _obf_map = {}  # shared across all categories so numbering is consistent
             if high_concern:
-                lines.append("**Unusual for mods** (rarely needed by legitimate code):")
+                lines.append("**High-interest APIs** (dual-use — legitimate in some contexts, also used by malware):")
                 for m in high_concern[:10]:
                     cleaned = _clean_class_name(sanitize_path(m.replace('[LIB] ', '')), _obf_map)
                     lines.append(f"\U0001F6A8 {cleaned}")
@@ -3804,6 +4063,17 @@ async def reload_command(ctx: discord.ApplicationContext):
     await ctx.respond(f"YARA rules reloaded. {YARA_RULES is not None}", ephemeral=True)
 
 
+# ─── /reload-exceptions command ──────────────────────────────────────────────
+
+@bot.slash_command(name="reload-exceptions", description="Reload exception list (admin only)", **_install_params)
+async def reload_exceptions_command(ctx: discord.ApplicationContext):
+    if not ctx.guild or not hasattr(ctx.author, "guild_permissions") or not ctx.author.guild_permissions.administrator:
+        return await ctx.respond("Admin only.", ephemeral=True)
+    global approved_exceptions
+    approved_exceptions = load_exceptions()
+    await ctx.respond(f"Exception list reloaded. {len(approved_exceptions)} approved hash(es).", ephemeral=True)
+
+
 # ─── /save command ───────────────────────────────────────────────────────────
 
 @bot.slash_command(name="save", description="Toggle saving scanned files to disk (admin only)", **_install_params)
@@ -3886,7 +4156,7 @@ async def run_scan(
             filename = re.sub(r"[^\w.\-]", "_", attachment.filename or "unknown")
             dl_path = os.path.join(work_dir, filename)
             max_bytes = CFG["scanner"]["max_file_size_mb"] * 1024 * 1024
-            async with aiohttp.ClientSession() as dl_session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as dl_session:
                 async with dl_session.get(attachment.url) as resp:
                     total_dl = 0
                     async with aiofiles.open(dl_path, "wb") as f:
@@ -3917,6 +4187,29 @@ async def run_scan(
         if not mod_name:
             mod_name = sha256[:12]
         log.info(f"[{scan_id}] Downloaded {filename} ({file_size} bytes, SHA256={sha256[:16]}...)")
+
+        # ── Exception check ──
+        if await check_exception(sha256):
+            await safe_send(
+                embed=discord.Embed(
+                    title=f"\u2705 Known Safe: {filename[:70]}",
+                    description=(
+                        f"This file (`{sha256[:16]}...`) is in the **approved exceptions list** and has been verified as safe.\n\n"
+                        f"**SHA-256:** `{sha256}`\n"
+                        f"**Size:** {file_size:,} bytes\n\n"
+                        f"*To remove this exception, edit `exceptions.var` in the bot folder.*"
+                    ),
+                    color=0x2ECC71,
+                )
+            )
+            return
+
+        # ── Catalog check ──
+        prev_scan = await catalog_lookup(sha256)
+        if prev_scan:
+            scan_count = prev_scan.get("scan_count", 1)
+            prev_time = prev_scan.get("last_scan", "unknown")
+            await progress(f"Previously scanned {scan_count} time(s) (last: {prev_time}). Refreshing analysis...")
 
         # ── Build stage tracker ──
         vt_enabled = CFG["virustotal"]["enabled"] and CFG["virustotal"]["api_key"]
@@ -4343,8 +4636,10 @@ async def run_scan(
         )
 
         # ── Upload to MalwareBazaar if not already in database ──
-        mb_upload_enabled = CFG.get("malwarebazaar", {}).get("upload_flagged", True)
-        if (mb_result and mb_result.get("status") == "not_found"
+        # Only upload files that actually scored above detection threshold
+        mb_upload_enabled = CFG.get("malwarebazaar", {}).get("upload_flagged", False)
+        if (score > DETECTION_THRESHOLD
+                and mb_result and mb_result.get("status") == "not_found"
                 and http_session and mb_enabled and mb_upload_enabled):
             mb_tags = []
             if all_iocs and all_iocs.get("variant", "").lower() != "unknown":
@@ -4366,6 +4661,34 @@ async def run_scan(
             await update_stats(total_scans=1, detections=1)
         else:
             await update_stats(total_scans=1, clean=1)
+
+        # ── Update catalog ──
+        await catalog_update(sha256, {
+            "filename": filename,
+            "file_size": file_size,
+            "last_scan": datetime.now(timezone.utc).isoformat(),
+            "score": score,
+            "level": level,
+            "variant": (all_iocs.get("variant", "") if all_iocs else ""),
+            "scan_count": (prev_scan.get("scan_count", 0) + 1) if prev_scan else 1,
+            "yara_hits": len(yara_matches),
+            "vt_detected": vt_result.get("detected", 0) if vt_result else 0,
+            "vt_total": vt_result.get("total", 0) if vt_result else 0,
+        })
+
+        # ── Auto-research for exception candidates ──
+        if score <= DETECTION_THRESHOLD and extracted_strings and http_session:
+            all_urls = extracted_strings.get("urls", [])
+            if all_urls:
+                try:
+                    url_matches = await auto_research_urls(all_urls, sha256, http_session)
+                    variant_name = all_iocs.get("variant", "") if all_iocs else ""
+                    await write_exception_candidate(
+                        filename, sha256, file_size, score, level,
+                        variant_name, all_urls[:10], url_matches,
+                    )
+                except Exception as e:
+                    log.debug(f"Auto-research failed: {e}")
 
         # ── Build main results embed (local analysis + YARA + strings etc.) ──
         embeds = build_embeds(
@@ -4588,7 +4911,7 @@ if __name__ == "__main__":
                 with open(yml_path, encoding="utf-8") as f:
                     raw = f.read()
                 # Replace placeholder or empty token
-                for placeholder in ('""', "''", '"YOUR_BOT_TOKEN_HERE"', "''"):
+                for placeholder in ('""', "''", '"YOUR_BOT_TOKEN_HERE"'):
                     old_line = f"token: {placeholder}"
                     if old_line in raw:
                         raw = raw.replace(old_line, f'token: "{new_token}"', 1)

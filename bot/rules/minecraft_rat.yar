@@ -124,21 +124,16 @@ rule MSHTA_Dropper
 rule Suspicious_Minecraft_Mod
 {
     meta:
-        description = "Minecraft mod with suspicious capabilities"
+        description = "Minecraft mod that reads launcher accounts and exfiltrates via webhook"
         author = "RatScanner"
         severity = "medium"
 
     strings:
-        $mc_dir = ".minecraft" ascii
         $launcher_accts = "launcher_accounts" ascii
-        $access_token = "accessToken" ascii
-        $session = "session" ascii
-        $exec1 = "Runtime.getRuntime()" ascii
-        $exec2 = "ProcessBuilder" ascii
         $webhook = "discord.com/api/webhooks" ascii
 
     condition:
-        ($mc_dir or $launcher_accts) and ($access_token or $session) and ($exec1 or $exec2 or $webhook)
+        $launcher_accts and $webhook
 }
 
 rule Ethereum_Contract_C2
@@ -176,4 +171,246 @@ rule Known_Malicious_Domains
 
     condition:
         any of them
+}
+
+rule Browser_Data_Stealer
+{
+    meta:
+        description = "Browser credential/cookie stealer targeting Chrome/Firefox/Edge"
+        author = "RatScanner"
+        severity = "high"
+
+    strings:
+        $chrome_db1 = "Login Data" ascii
+        $chrome_db2 = "Web Data" ascii
+        $chrome_db3 = "Local State" ascii
+        $chrome_path = "Google/Chrome/User Data" ascii
+        $chrome_path2 = "Google\\Chrome\\User Data" ascii
+        $firefox_db1 = "logins.json" ascii
+        $firefox_db2 = "key4.db" ascii
+        $firefox_db3 = "places.sqlite" ascii
+        $firefox_path = "Mozilla/Firefox/Profiles" ascii
+        $firefox_path2 = "Mozilla\\Firefox\\Profiles" ascii
+        $edge_path = "Microsoft/Edge/User Data" ascii
+        $edge_path2 = "Microsoft\\Edge\\User Data" ascii
+        $brave_path = "BraveSoftware/Brave-Browser" ascii
+        $brave_path2 = "BraveSoftware\\Brave-Browser" ascii
+        $dpapi = "CryptUnprotectData" ascii
+        $exfil_webhook = /discord\.com\/api\/webhooks/ ascii
+        $exfil_telegram = "api.telegram.org" ascii
+
+    condition:
+        // Require browser path + credential DB + exfil method
+        (any of ($chrome_path*) or any of ($firefox_path*) or any of ($edge_path*) or any of ($brave_path*))
+        and (any of ($chrome_db*) or any of ($firefox_db*) or $dpapi)
+        and (any of ($exfil*))
+}
+
+rule Discord_Token_Stealer
+{
+    meta:
+        description = "Discord token stealer targeting app local storage"
+        author = "RatScanner"
+        severity = "high"
+
+    strings:
+        $discord_ls = "discord/Local Storage/leveldb" ascii
+        $discord_ls2 = "discord\\Local Storage\\leveldb" ascii
+        $discordcanary = "discordcanary" ascii nocase
+        $discordptb = "discordptb" ascii nocase
+        $api_check = "/api/v9/users/@me" ascii
+        $api_check2 = "/api/v10/users/@me" ascii
+        $betterdiscord = "BetterDiscord" ascii
+        $token_regex = "dQw4w9WgXcQ" ascii
+
+    condition:
+        // Require leveldb path access + token validation OR token regex
+        (any of ($discord_ls*)) and (any of ($api_check*) or $token_regex)
+        or ($token_regex and any of ($api_check*))
+        or (any of ($discord_ls*) and 2 of ($discordcanary, $discordptb, $betterdiscord))
+}
+
+rule Crypto_Miner_Injection
+{
+    meta:
+        description = "Cryptocurrency miner injected into Minecraft mod/client"
+        author = "RatScanner"
+        severity = "high"
+
+    strings:
+        $stratum1 = "stratum+tcp://" ascii
+        $stratum2 = "stratum+ssl://" ascii
+        $xmrig = "xmrig" ascii nocase
+        $pool1 = "pool.minexmr.com" ascii
+        $pool2 = "pool.hashvault.pro" ascii
+        $pool3 = "xmrpool.eu" ascii
+        $pool4 = "pool.supportxmr.com" ascii
+        $pool5 = "monerohash.com" ascii
+        $pool6 = "moneroocean.stream" ascii
+        $coinhive = "coinhive" ascii nocase
+
+    condition:
+        any of ($stratum*) or any of ($pool*) or $xmrig or $coinhive
+}
+
+rule Clipboard_Hijacker
+{
+    meta:
+        description = "Clipboard monitoring and crypto address replacement"
+        author = "RatScanner"
+        severity = "high"
+
+    strings:
+        $clipboard1 = "getSystemClipboard" ascii
+        $clipboard2 = "ClipboardOwner" ascii
+        $clipboard3 = "lostOwnership" ascii
+        $clipboard4 = "StringSelection" ascii
+        $clipboard5 = "setContents" ascii
+
+    condition:
+        ($clipboard1 or $clipboard2) and ($clipboard3 or $clipboard4 or $clipboard5)
+}
+
+rule Keylogger_Injection
+{
+    meta:
+        description = "Keylogger functionality in Minecraft mod"
+        author = "RatScanner"
+        severity = "high"
+
+    strings:
+        $jnativehook = "jnativehook" ascii
+        $nkl = "NativeKeyListener" ascii
+        $gkl = "GlobalKeyListener" ascii
+        $keylogger = "KeyLogger" ascii nocase
+        $getasync = "GetAsyncKeyState" ascii
+        $sethook = "SetWindowsHookEx" ascii
+
+    condition:
+        ($jnativehook or $nkl or $gkl or $keylogger) or ($getasync and $sethook)
+}
+
+rule Staged_Payload_Downloader
+{
+    meta:
+        description = "Multi-stage downloader fetching payloads from paste/file hosting"
+        author = "RatScanner"
+        severity = "medium"
+
+    strings:
+        $paste1 = "pastebin.com/raw" ascii
+        $paste2 = "hastebin.com/raw" ascii
+        $paste3 = "hasteb.in/raw" ascii
+        $paste4 = "rentry.co/raw" ascii
+        $github_raw = "raw.githubusercontent.com" ascii
+        $discord_cdn = "cdn.discordapp.com/attachments" ascii
+        $transfer = "transfer.sh" ascii
+        $gofile = "gofile.io" ascii
+        $anonfiles = "anonfiles.com" ascii
+        $urlloader = "URLClassLoader" ascii
+        $defineclass = "defineClass" ascii
+
+    condition:
+        any of ($paste*, $github_raw, $discord_cdn, $transfer, $gofile, $anonfiles) and ($urlloader or $defineclass)
+}
+
+rule AntiAnalysis_Evasion
+{
+    meta:
+        description = "Anti-VM/anti-analysis checks before payload execution"
+        author = "RatScanner"
+        severity = "medium"
+
+    strings:
+        $vbox1 = "VBoxService" ascii
+        $vbox2 = "VirtualBox" ascii
+        $vmware1 = "vmtoolsd" ascii
+        $vmware2 = "vmwaretray" ascii
+        $wireshark = "Wireshark" ascii
+        $procmon = "procmon" ascii
+        $fiddler = "Fiddler" ascii
+        $sandbox = "SbieDll" ascii
+        $defender_excl = "Add-MpPreference" ascii
+
+    condition:
+        3 of ($vbox*, $vmware*, $wireshark, $procmon, $fiddler, $sandbox) or $defender_excl
+}
+
+rule Minecraft_Launcher_Token_Stealer
+{
+    meta:
+        description = "Targets multiple Minecraft launcher token files for theft"
+        author = "RatScanner"
+        severity = "high"
+
+    strings:
+        $la = "launcher_accounts" ascii
+        $lp = "launcher_profiles" ascii
+        $essential = "essential/microsoft_accounts" ascii
+        $essential2 = "essential\\microsoft_accounts" ascii
+        $feather = "feather/accounts" ascii
+        $feather2 = "feather\\accounts" ascii
+        $lunar = "lunar/accounts" ascii
+        $lunar2 = "lunar\\accounts" ascii
+        $webhook = "discord.com/api/webhooks" ascii
+        $telegram = "api.telegram.org" ascii
+
+    condition:
+        2 of ($la, $lp, $essential*, $feather*, $lunar*) and ($webhook or $telegram)
+}
+
+rule Telegram_Bot_Exfil
+{
+    meta:
+        description = "Telegram bot token used for data exfiltration"
+        author = "RatScanner"
+        severity = "high"
+
+    strings:
+        $tg_api = "api.telegram.org" ascii
+        $tg_bot = /bot[0-9]{8,10}:[A-Za-z0-9_\-]{35}/ ascii
+        $tg_send = "sendDocument" ascii
+        $tg_send2 = "sendMessage" ascii
+
+    condition:
+        $tg_api and ($tg_bot or $tg_send or $tg_send2)
+}
+
+rule BleedingPipe_Deserialization
+{
+    meta:
+        description = "Deserialization RCE pattern (BleedingPipe-style)"
+        author = "RatScanner"
+        severity = "critical"
+
+    strings:
+        $readobj = "readObject" ascii
+        $objinput = "ObjectInputStream" ascii
+        $socket_recv = "getInputStream" ascii
+        $ysoserial = "ysoserial" ascii nocase
+        $commons_collect = "commons-collections" ascii
+        $transformer = "InvokerTransformer" ascii
+        $lazy_map = "LazyMap" ascii
+
+    condition:
+        ($ysoserial or $transformer or $lazy_map) or
+        ($readobj and $objinput and $socket_recv and ($commons_collect or $transformer))
+}
+
+rule JVMTI_Agent_Injection
+{
+    meta:
+        description = "JVMTI agent injection (NeptuneLoader-style)"
+        author = "RatScanner"
+        severity = "high"
+
+    strings:
+        $attach = "VirtualMachine.attach" ascii
+        $attach2 = "com.sun.tools.attach" ascii
+        $agent_load = "loadAgent" ascii
+        $agent_path = "agentmain" ascii
+        $instrumentation = "Instrumentation" ascii
+
+    condition:
+        ($attach or $attach2) and ($agent_load or $agent_path) and $instrumentation
 }
