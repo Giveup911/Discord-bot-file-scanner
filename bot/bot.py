@@ -827,11 +827,11 @@ async def ha_search(sha256: str, session: aiohttp.ClientSession) -> Optional[dic
         "accept": "application/json",
     }
     try:
-        # HA v2 search/hash — use GET (POST is deprecated)
-        async with session.get(
+        # HA v2 search/hash — POST with form data
+        async with session.post(
             f"{HA_BASE}/search/hash",
             headers=headers,
-            params={"hash": sha256},
+            data={"hash": sha256},
             timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
             body = await resp.text()
@@ -974,6 +974,126 @@ async def vt_get_sandbox_links(sha256: str, session: aiohttp.ClientSession) -> O
     except Exception as e:
         log.warning(f"VT sandbox links failed: {e}")
         return None
+
+
+# ─── Background Pollers (VT / HA) ────────────────────────────────────────────
+
+
+def _track_poll_task(coro):
+    """Create a background task and prevent GC by storing a reference."""
+    task = asyncio.create_task(coro)
+    _background_poll_tasks.add(task)
+    task.add_done_callback(_background_poll_tasks.discard)
+    return task
+
+
+async def _poll_vt_completion(
+    sha256: str,
+    msg: "discord.Message",
+    scan_id: str,
+):
+    """Background poller: wait for a queued VT analysis to finish, then edit the message."""
+    api_key = CFG["virustotal"]["api_key"]
+    if not api_key:
+        return
+    headers = {"x-apikey": api_key}
+    permalink = f"https://www.virustotal.com/gui/file/{sha256}"
+    # Use our own session so we're immune to reconnect session swaps
+    async with aiohttp.ClientSession() as poll_session:
+        # Poll every 30s for up to 10 minutes
+        for _ in range(20):
+            await asyncio.sleep(30)
+            try:
+                async with poll_session.get(
+                    f"{VT_BASE}/files/{sha256}", headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    attrs = data.get("data", {}).get("attributes", {})
+                    stats = attrs.get("last_analysis_stats", {})
+                    total = sum(stats.values())
+                    if total < 10:
+                        continue  # Still too early
+                    results = attrs.get("last_analysis_results", {})
+                    detections = {
+                        name: r["result"]
+                        for name, r in results.items()
+                        if isinstance(r, dict) and r.get("category") in ("malicious", "suspicious")
+                    }
+                    vt_result = {
+                        "detected": stats.get("malicious", 0) + stats.get("suspicious", 0),
+                        "total": total,
+                        "detections": detections,
+                        "permalink": permalink,
+                        "meaningful_name": attrs.get("meaningful_name", ""),
+                        "tags": attrs.get("tags", []),
+                        "first_seen": attrs.get("first_submission_date"),
+                        "status": "found",
+                    }
+                    await msg.edit(embed=build_vt_embed(vt_result, sha256, scan_id))
+                    log.info(f"[{scan_id}] VT poll: analysis complete ({vt_result['detected']}/{vt_result['total']})")
+                    return
+            except discord.HTTPException:
+                return  # Message was deleted or we lost access
+            except Exception as exc:
+                log.debug(f"VT poll error: {exc}")
+    # Timed out — leave the message as-is (already shows permalink)
+
+
+async def _poll_ha_completion(
+    sha256: str,
+    msg: "discord.Message",
+    scan_id: str,
+):
+    """Background poller: wait for a submitted HA sandbox run to finish, then edit the message."""
+    api_key = CFG.get("hybrid_analysis", {}).get("api_key", "")
+    if not api_key:
+        return
+    headers = {"api-key": api_key, "User-Agent": "Falcon", "accept": "application/json"}
+    # Use our own session so we're immune to reconnect session swaps
+    async with aiohttp.ClientSession() as poll_session:
+        # Poll every 60s for up to 15 minutes
+        for _ in range(15):
+            await asyncio.sleep(60)
+            try:
+                async with poll_session.post(
+                    f"{HA_BASE}/search/hash",
+                    headers=headers,
+                    data={"hash": sha256},
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json(content_type=None)
+                    reports = []
+                    if isinstance(data, dict) and "reports" in data:
+                        reports = data["reports"]
+                    elif isinstance(data, list):
+                        reports = data
+                    elif isinstance(data, dict) and data.get("sha256"):
+                        reports = [data]
+                    completed = [r for r in reports if r.get("verdict") and r.get("state") == "SUCCESS"]
+                    if not completed:
+                        continue
+                    best = max(completed, key=lambda r: r.get("threat_score") or 0)
+                    ha_result = {
+                        "verdict": best.get("verdict", ""),
+                        "threat_score": best.get("threat_score"),
+                        "threat_level": best.get("threat_level"),
+                        "analysis_start_time": best.get("analysis_start_time", ""),
+                        "environment": best.get("environment_description", ""),
+                        "permalink": f"https://www.hybrid-analysis.com/sample/{sha256}",
+                        "status": "found",
+                    }
+                    await msg.edit(embed=build_ha_embed(ha_result, sha256, scan_id))
+                    log.info(f"[{scan_id}] HA poll: sandbox complete (verdict={ha_result['verdict']})")
+                    return
+            except discord.HTTPException:
+                return
+            except Exception as exc:
+                log.debug(f"HA poll error: {exc}")
 
 
 # ─── Entropy Analysis ────────────────────────────────────────────────────────
@@ -1888,7 +2008,8 @@ def analyze_file_format(filepath: str) -> Optional[dict]:
 MAX_DECOMPRESSED_SIZE = 512 * 1024 * 1024  # 512MB max decompressed
 MAX_ZIP_ENTRIES = 10000
 MAX_NESTED_ARCHIVES = 50
-MAX_COMPRESSION_RATIO = 100
+MAX_COMPRESSION_RATIO = 1500  # legitimate JARs with compressed assets can hit 600:1+
+MIN_BOMB_DECOMPRESSED = 100 * 1024 * 1024  # only flag ratio if decompressed > 100MB
 
 
 def check_zip_bomb(filepath: str) -> Optional[str]:
@@ -1899,8 +2020,14 @@ def check_zip_bomb(filepath: str) -> Optional[str]:
             total_uncompressed = sum(info.file_size for info in zf.infolist())
             entry_count = len(zf.infolist())
 
-            if file_size > 0 and total_uncompressed / file_size > MAX_COMPRESSION_RATIO:
-                return f"Compression ratio {total_uncompressed / file_size:.0f}:1 ({total_uncompressed / 1024 / 1024:.0f} MB uncompressed)"
+            ratio = total_uncompressed / file_size if file_size > 0 else 0
+
+            # High ratio alone isn't enough — compressed assets (textures, data)
+            # in legitimate JARs/mods can easily hit 600:1. Only flag when BOTH
+            # the ratio is extreme AND the decompressed size is large enough to
+            # actually cause resource exhaustion.
+            if ratio > MAX_COMPRESSION_RATIO and total_uncompressed > MIN_BOMB_DECOMPRESSED:
+                return f"Compression ratio {ratio:.0f}:1 ({total_uncompressed / 1024 / 1024:.0f} MB uncompressed)"
 
             if total_uncompressed > MAX_DECOMPRESSED_SIZE:
                 return f"Decompressed size {total_uncompressed / 1024 / 1024:.0f} MB exceeds limit"
@@ -4233,6 +4360,7 @@ def _build_command_install_params() -> dict:
 _install_params = _build_command_install_params()
 http_session: Optional[aiohttp.ClientSession] = None
 _ready_fired = False
+_background_poll_tasks: set = set()  # prevent GC of fire-and-forget tasks
 
 
 @bot.event
@@ -4608,43 +4736,66 @@ async def run_scan(
             ha_result = None
             vt_sandbox = None
 
-            # VT — own message
-            if http_session and vt_enabled:
-                stages["VirusTotal"] = "running"
-                await update_progress(stages, filename, file_size, hashes)
-                vt_msg = await safe_send(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "~30s", scan_id))
-                vt_result = await vt_lookup(sha256, http_session)
-                if vt_result is None:
-                    if vt_msg:
-                        await vt_msg.edit(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "uploading ~2-3min", scan_id))
-                    vt_result = await vt_upload(dl_path, sha256, http_session)
-                stages["VirusTotal"] = "complete"
-                if vt_result and vt_msg:
-                    await vt_msg.edit(embed=build_vt_embed(vt_result, sha256, scan_id))
-
-            # Send pending messages for parallel services
+            # Send ALL pending embeds up front
+            vt_msg = None
             vt_sb_msg = None
             mb_msg = None
             ha_msg = None
             if http_session and vt_enabled:
+                vt_msg = await safe_send(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "~30s", scan_id))
                 vt_sb_msg = await safe_send(embed=_build_service_pending_embed("VT Sandbox Analysis", "\U0001F9EC", "~2s", scan_id))
             if http_session and mb_enabled:
                 mb_msg = await safe_send(embed=_build_service_pending_embed("MalwareBazaar", "\U0001F9A0", "~2s", scan_id))
             if http_session and ha_enabled:
                 ha_msg = await safe_send(embed=_build_service_pending_embed("Hybrid Analysis", "\U0001F50D", "~5s", scan_id))
 
-            # Launch concurrently
+            # VT helper for zip bomb path
+            async def _zb_vt_lookup_or_upload():
+                result = await vt_lookup(sha256, http_session)
+                if result is None:
+                    if vt_msg:
+                        try:
+                            await vt_msg.edit(embed=_build_service_pending_embed(
+                                "VirusTotal", "\U0001F9EA", "uploading ~2-3min", scan_id))
+                        except discord.HTTPException:
+                            pass
+                    result = await vt_upload(dl_path, sha256, http_session)
+                return result
+
+            # Launch ALL concurrently
             api_tasks = {}
+            if http_session and vt_enabled:
+                stages["VirusTotal"] = "running"
+                api_tasks["vt"] = asyncio.create_task(_zb_vt_lookup_or_upload())
             if http_session and mb_enabled:
                 stages["MalwareBazaar"] = "running"
                 api_tasks["mb"] = asyncio.create_task(mb_lookup(sha256, http_session))
             if http_session and ha_enabled:
                 stages["Hybrid Analysis"] = "running"
                 api_tasks["ha"] = asyncio.create_task(ha_search_or_submit(sha256, dl_path, http_session))
-            if http_session and vt_enabled and vt_result:
-                stages["VT Sandbox"] = "running"
-                api_tasks["vt_sb"] = asyncio.create_task(vt_get_sandbox_links(sha256, http_session))
 
+            # Collect VT result first (needed for VT Sandbox)
+            if "vt" in api_tasks:
+                try:
+                    vt_result = await api_tasks["vt"]
+                except Exception as exc:
+                    log.warning(f"VirusTotal task failed: {exc}")
+                    vt_result = {"detected": 0, "total": 0, "detections": {},
+                                 "permalink": f"https://www.virustotal.com/gui/file/{sha256}",
+                                 "meaningful_name": "", "tags": [], "first_seen": None, "status": "error"}
+                stages["VirusTotal"] = "complete"
+                if vt_result and vt_msg:
+                    try:
+                        await vt_msg.edit(embed=build_vt_embed(vt_result, sha256, scan_id))
+                    except discord.HTTPException:
+                        pass
+                    if vt_result.get("status") == "queued" and vt_msg:
+                        _track_poll_task(_poll_vt_completion(sha256, vt_msg, scan_id))
+                if vt_result and vt_result.get("status") in ("found", "completed"):
+                    stages["VT Sandbox"] = "running"
+                    api_tasks["vt_sb"] = asyncio.create_task(vt_get_sandbox_links(sha256, http_session))
+
+            # Collect MB result
             if "mb" in api_tasks:
                 try:
                     mb_result = await api_tasks["mb"]
@@ -4664,6 +4815,8 @@ async def run_scan(
                     await mb_msg.edit(embed=build_mb_embed(None, sha256, scan_id))
                 except discord.HTTPException:
                     pass
+
+            # Collect HA result
             if "ha" in api_tasks:
                 try:
                     ha_result = await api_tasks["ha"]
@@ -4676,8 +4829,16 @@ async def run_scan(
                         await ha_msg.edit(embed=build_ha_embed(ha_result, sha256, scan_id))
                     except discord.HTTPException:
                         pass
+                    if ha_result and ha_result.get("status") == "submitted" and ha_msg:
+                        _track_poll_task(_poll_ha_completion(sha256, ha_msg, scan_id))
+
+            # Collect VT Sandbox result
             if "vt_sb" in api_tasks:
-                vt_sandbox = await api_tasks["vt_sb"]
+                try:
+                    vt_sandbox = await api_tasks["vt_sb"]
+                except Exception as exc:
+                    log.debug(f"VT Sandbox task failed: {exc}")
+                    vt_sandbox = None
                 stages["VT Sandbox"] = "complete"
                 if vt_sb_msg:
                     try:
@@ -4870,7 +5031,7 @@ async def run_scan(
         stages["Local Analysis"] = "complete"
         await update_progress(stages, filename, file_size, hashes)
 
-        # ── External API lookups — each gets its own message ──
+        # ── External API lookups — ALL run concurrently with pending embeds ──
         vt_result = None
         mb_result = None
         ha_result = None
@@ -4882,25 +5043,11 @@ async def run_scan(
         mb_msg = None
         ha_msg = None
 
-        # ── VirusTotal ──
+        # ── Send ALL pending embeds up front ──
         if http_session and vt_enabled:
-            stages["VirusTotal"] = "running"
-            await update_progress(stages, filename, file_size, hashes)
-            # Send pending VT message
-            vt_msg = await safe_send(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "~30s", scan_id))
-            vt_result = await vt_lookup(primary_sha256, http_session)
-            if vt_result is None:
-                if vt_msg:
-                    await vt_msg.edit(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "uploading ~2-3min", scan_id))
-                vt_result = await vt_upload(primary_path, primary_sha256, http_session)
-            stages["VirusTotal"] = "complete"
-            # Update VT message with results
-            if vt_result and vt_msg:
-                await vt_msg.edit(embed=build_vt_embed(vt_result, primary_sha256, scan_id))
-            await update_progress(stages, filename, file_size, hashes)
-
-        # ── Send pending messages for parallel services ──
-        if http_session and vt_enabled:
+            vt_msg = await safe_send(
+                embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "~30s", scan_id)
+            )
             vt_sb_msg = await safe_send(
                 embed=_build_service_pending_embed("VT Sandbox Analysis", "\U0001F9EC", "~2s", scan_id)
             )
@@ -4913,21 +5060,61 @@ async def run_scan(
                 embed=_build_service_pending_embed("Hybrid Analysis", "\U0001F50D", "~5s", scan_id)
             )
 
-        # ── Launch MB, HA, VT Sandbox concurrently ──
+        # ── VT helper: lookup then upload if needed (runs as concurrent task) ──
+        async def _vt_lookup_or_upload():
+            result = await vt_lookup(primary_sha256, http_session)
+            if result is None:
+                if vt_msg:
+                    try:
+                        await vt_msg.edit(embed=_build_service_pending_embed(
+                            "VirusTotal", "\U0001F9EA", "uploading ~2-3min", scan_id))
+                    except discord.HTTPException:
+                        pass
+                result = await vt_upload(primary_path, primary_sha256, http_session)
+            return result
+
+        # ── Launch ALL services concurrently ──
         api_tasks = {}
+        if http_session and vt_enabled:
+            stages["VirusTotal"] = "running"
+            api_tasks["vt"] = asyncio.create_task(_vt_lookup_or_upload())
         if http_session and mb_enabled:
             stages["MalwareBazaar"] = "running"
             api_tasks["mb"] = asyncio.create_task(mb_lookup(primary_sha256, http_session))
         if http_session and ha_enabled:
             stages["Hybrid Analysis"] = "running"
             api_tasks["ha"] = asyncio.create_task(ha_search_or_submit(primary_sha256, primary_path, http_session))
-        if http_session and vt_enabled and vt_result:
-            stages["VT Sandbox"] = "running"
-            api_tasks["vt_sb"] = asyncio.create_task(vt_get_sandbox_links(primary_sha256, http_session))
         if api_tasks:
             await update_progress(stages, filename, file_size, hashes)
 
         # ── Collect results and update each message as it completes ──
+
+        # VT result
+        if "vt" in api_tasks:
+            try:
+                vt_result = await api_tasks["vt"]
+            except Exception as exc:
+                log.warning(f"VirusTotal task failed: {exc}")
+                vt_result = {"detected": 0, "total": 0, "detections": {},
+                             "permalink": f"https://www.virustotal.com/gui/file/{primary_sha256}",
+                             "meaningful_name": "", "tags": [], "first_seen": None, "status": "error"}
+            stages["VirusTotal"] = "complete"
+            if vt_result and vt_msg:
+                try:
+                    await vt_msg.edit(embed=build_vt_embed(vt_result, primary_sha256, scan_id))
+                except discord.HTTPException:
+                    pass
+                # If VT analysis is still queued, start a background poller to update the message
+                if vt_result.get("status") == "queued" and vt_msg:
+                    _track_poll_task(_poll_vt_completion(primary_sha256, vt_msg, scan_id))
+
+            # Now that VT is done, launch VT Sandbox lookup
+            if vt_result and vt_result.get("status") in ("found", "completed"):
+                stages["VT Sandbox"] = "running"
+                api_tasks["vt_sb"] = asyncio.create_task(vt_get_sandbox_links(primary_sha256, http_session))
+            await update_progress(stages, filename, file_size, hashes)
+
+        # MB result
         if "mb" in api_tasks:
             try:
                 mb_result = await api_tasks["mb"]
@@ -4948,6 +5135,7 @@ async def run_scan(
             except discord.HTTPException:
                 pass
 
+        # HA result
         if "ha" in api_tasks:
             try:
                 ha_result = await api_tasks["ha"]
@@ -4960,9 +5148,17 @@ async def run_scan(
                     await ha_msg.edit(embed=build_ha_embed(ha_result, primary_sha256, scan_id))
                 except discord.HTTPException:
                     pass
+                # If HA file was submitted for sandbox, start background poller to update message
+                if ha_result and ha_result.get("status") == "submitted" and ha_msg:
+                    _track_poll_task(_poll_ha_completion(primary_sha256, ha_msg, scan_id))
 
+        # VT Sandbox result
         if "vt_sb" in api_tasks:
-            vt_sandbox = await api_tasks["vt_sb"]
+            try:
+                vt_sandbox = await api_tasks["vt_sb"]
+            except Exception as exc:
+                log.debug(f"VT Sandbox task failed: {exc}")
+                vt_sandbox = None
             stages["VT Sandbox"] = "complete"
             if vt_sb_msg:
                 try:
@@ -4970,7 +5166,6 @@ async def run_scan(
                 except discord.HTTPException:
                     pass
         elif vt_sb_msg:
-            # No VT result to query sandbox for
             try:
                 await vt_sb_msg.edit(embed=build_vt_sandbox_embed(None, primary_sha256, scan_id))
             except discord.HTTPException:
@@ -5021,7 +5216,7 @@ async def run_scan(
                 mb_result = upload_result
                 if mb_msg:
                     try:
-                        await mb_msg.edit(embed=build_mb_embed(mb_result, sha256, scan_id))
+                        await mb_msg.edit(embed=build_mb_embed(mb_result, primary_sha256, scan_id))
                     except discord.HTTPException:
                         pass
 
@@ -5090,6 +5285,12 @@ async def run_scan(
                 value="Unknown file type. VT, YARA, and string extraction results only.",
                 inline=False,
             )
+
+        # ── Ensure at least one log dir exists for the report ──
+        if not all_log_dirs:
+            fallback_log_dir = os.path.join(work_dir, "logs")
+            os.makedirs(fallback_log_dir, exist_ok=True)
+            all_log_dirs.append(fallback_log_dir)
 
         # ── Write full report + decrypted strings into each log dir ──
         for ld in all_log_dirs:
