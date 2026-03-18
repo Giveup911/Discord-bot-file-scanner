@@ -827,11 +827,11 @@ async def ha_search(sha256: str, session: aiohttp.ClientSession) -> Optional[dic
         "accept": "application/json",
     }
     try:
-        # HA v2 search/hash — POST with form data
-        async with session.post(
+        # HA v2 search/hash — GET (POST was deprecated in API v2.35.0)
+        async with session.get(
             f"{HA_BASE}/search/hash",
             headers=headers,
-            data={"hash": sha256},
+            params={"hash": sha256},
             timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
             body = await resp.text()
@@ -3607,11 +3607,13 @@ def write_full_report(log_dir: str, **kwargs):
             lines.append(f"  Link: {ha_result.get('permalink', '')}")
             lines.append("")
 
-        # VT Sandbox
-        if vt_sandbox and vt_sandbox.get("sandbox_links"):
+        # VT Sandbox (vt_sandbox is a list of dicts from vt_get_sandbox_links)
+        if vt_sandbox and isinstance(vt_sandbox, list):
             lines.append("── VT SANDBOX REPORTS ──")
-            for sb in vt_sandbox["sandbox_links"]:
-                lines.append(f"  {sb.get('name', 'Unknown')}: {sb.get('link', '')}")
+            for sb in vt_sandbox:
+                name = sb.get("sandbox_name", "Unknown") if isinstance(sb, dict) else str(sb)
+                link = sb.get("link", "") if isinstance(sb, dict) else ""
+                lines.append(f"  {name}: {link}")
             lines.append("")
 
         # YARA
