@@ -8,7 +8,7 @@ Generated: 2026-03-17
 
 - [x] **[HIGH] `_poll_ha_completion` uses POST instead of GET** — `bot.py:1064` uses `poll_session.post()` for `/search/hash`, but the TODO at line 36 says "Fix Hybrid Analysis 410 deprecation — POST /search/hash -> GET /search/hash" was already done. The main `ha_search()` function likely uses GET, but the background poller still uses POST. If HA enforces GET-only, the poller will silently fail every poll cycle and never update the HA embed.
 
-- [ ] **[MEDIUM] `catalog_lookup` is sync, not async-safe** — `bot.py:410-411` reads `file_catalog` dict without holding `_catalog_lock`. While CPython GIL makes simple dict reads safe, this breaks the pattern set by `update_stats`/`catalog_update` and could cause stale reads if another coroutine is mid-update via `catalog_update`.
+- [x] **[MEDIUM] `catalog_lookup` is sync, not async-safe** — `bot.py:410-411` reads `file_catalog` dict without holding `_catalog_lock`. Fixed: catalog_lookup now acquires `_catalog_lock`.
 
 - [x] **[MEDIUM] `vt_lookup` KeyError on malformed API response** — `bot.py:609` accesses `data["data"]["attributes"]["last_analysis_stats"]` without `.get()`, and line 614 does `r["category"]` without `.get()`. If VT returns a partial/malformed response (rate-limit HTML, changed schema), this crashes with KeyError. The poller version at line 1016-1026 uses safer `.get()` chains.
 
@@ -18,9 +18,9 @@ Generated: 2026-03-17
 
 - [ ] **[LOW] `cleanup_old_scans` timestamp parsing is fragile** — `bot.py:4075` slices `entry.name[:15]` and parses as `%Y%m%d_%H%M%S`. If any non-scan directory is placed in `scanned/` with a name starting with digits, it could either throw (caught) or accidentally match and get deleted.
 
-- [ ] **[LOW] JarAnalyzer static global state not reset between batch runs** — `JarAnalyzer.java:45-51` uses static fields (`infoLog`, `configLog`, `outDir`, `markerDetails`). While `analyzeJar()` clears `markerDetails` at line 723, other statics like `infoLog`/`configLog` from a prior run could leak if the previous run threw an exception before reassignment. In batch mode, this could cause log entries to go to the wrong file.
+- [x] **[LOW] JarAnalyzer static global state not reset between batch runs** — `JarAnalyzer.java:45-51` uses static fields (`infoLog`, `configLog`, `outDir`, `markerDetails`). While `analyzeJar()` clears `markerDetails` at line 723, other statics like `infoLog`/`configLog` from a prior run could leak if the previous run threw an exception before reassignment. In batch mode, this could cause log entries to go to the wrong file.
 
-- [ ] **[LOW] JarAnalyzer `extractClasses` opens ZipFile twice** — `JarAnalyzer.java:2343,2368` opens the JAR as a ZipFile in Pass 1, closes it, then reopens in Pass 2. This is a minor inefficiency; both passes could share a single ZipFile handle.
+- [x] **[LOW] JarAnalyzer `extractClasses` opens ZipFile twice** — `JarAnalyzer.java:2343,2368` opens the JAR as a ZipFile in Pass 1, closes it, then reopens in Pass 2. This is a minor inefficiency; both passes could share a single ZipFile handle.
 
 - [x] **[MEDIUM] Temp directory not always cleaned up on error** — `bot.py:4707` creates `work_dir = tempfile.mkdtemp(prefix="scan_")`. The cleanup at the end of `run_scan` is inside a `finally` block, but if the function is cancelled (e.g., bot shutdown during scan), the `finally` may not fully execute, leaving temp dirs behind. Consider a periodic temp cleanup or `atexit` handler.
 
@@ -30,7 +30,7 @@ Generated: 2026-03-17
 
 ## RACE CONDITIONS
 
-- [x] **[HIGH] `scan_stats` read without lock in `stats_command`** — `bot.py:4643-4646` reads `scan_stats["total_scans"]` etc. directly in the `/stats` command without acquiring `_stats_lock`. While `update_stats` holds the lock, the read side doesn't. This can show inconsistent intermediate state (e.g., `total_scans` incremented but `detections` not yet).
+- [x] **[HIGH] `scan_stats` read without lock in `stats_command`** — Fixed: stats_command now acquires `_stats_lock`. — `bot.py:4643-4646` reads `scan_stats["total_scans"]` etc. directly in the `/stats` command without acquiring `_stats_lock`. While `update_stats` holds the lock, the read side doesn't. This can show inconsistent intermediate state (e.g., `total_scans` incremented but `detections` not yet).
 
 - [ ] **[MEDIUM] `approved_exceptions` global replaced without lock** — `bot.py:4674` does `approved_exceptions = load_exceptions()` in `reload_exceptions_command`. If a scan is concurrently calling `check_exception`, it could see a partially-constructed set during the assignment. In practice CPython makes this safe due to atomic reference assignment, but it's not guaranteed by the language spec.
 
@@ -64,25 +64,25 @@ Generated: 2026-03-17
 
 - [x] **[HIGH] No detection for in-memory class loading via `Unsafe`** — `sun.misc.Unsafe.defineClass()` or `Lookup.defineClass()` can load classes from byte arrays without touching the filesystem. Current patterns only check for `URLClassLoader` and `defineClass` strings in source.
 
-- [ ] **[HIGH] No DNS tunneling C2 detection** — Malware can use DNS TXT records for C2 communication (e.g., `InetAddress.getByName` + custom DNS resolver). Current C2 detection focuses on HTTP URLs and Ethereum contracts. Add patterns for `javax.naming.directory.DirContext`, `InitialDirContext`, DNS record lookups.
+- [x] **[HIGH] No DNS tunneling C2 detection** — Malware can use DNS TXT records for C2 communication (e.g., `InetAddress.getByName` + custom DNS resolver). Current C2 detection focuses on HTTP URLs and Ethereum contracts. Add patterns for `javax.naming.directory.DirContext`, `InitialDirContext`, DNS record lookups.
 
 - [ ] **[HIGH] XOR decryption relies on decompiler-specific output patterns** — JarAnalyzer's XOR key extraction at lines 2500-2625 looks for specific decompiled code patterns. If a different obfuscator produces a slightly different code structure (or a different decompiler is used), the extraction fails silently. The constant pool scanner partially mitigates this, but the decryption logic should also operate on bytecode directly.
 
 - [ ] **[HIGH] No detection for Java Native Interface (JNI) payload execution** — Beyond JNIC obfuscation (which is detected), generic JNI calls via `System.loadLibrary()` / `System.load()` to execute native payloads are not flagged. A malware sample could bundle a `.so`/`.dll` and call native methods for all malicious behavior, completely bypassing Java-level analysis.
 
-- [ ] **[MEDIUM] No detection for ClassLoader hierarchy manipulation** — Malware can define custom ClassLoaders that intercept `loadClass()` to inject malicious code into legitimate classes at load time. This is especially relevant for Fabric/Forge mods that can access the mod classloader.
+- [x] **[MEDIUM] No detection for ClassLoader hierarchy manipulation** — Malware can define custom ClassLoaders that intercept `loadClass()` to inject malicious code into legitimate classes at load time. This is especially relevant for Fabric/Forge mods that can access the mod classloader.
 
-- [ ] **[MEDIUM] No detection for Instrumentation/agent-based hooking at JAR level** — While JVMTI agent injection is detected via YARA (`JVMTI_Agent_Injection`), the JarAnalyzer doesn't check for `Premain-Class`/`Agent-Class` in MANIFEST.MF. The bot's `inspect_manifest()` does check suspicious keys, but the JarAnalyzer's own analysis path doesn't cross-reference this.
+- [x] **[MEDIUM] No detection for Instrumentation/agent-based hooking at JAR level** — While JVMTI agent injection is detected via YARA (`JVMTI_Agent_Injection`), the JarAnalyzer doesn't check for `Premain-Class`/`Agent-Class` in MANIFEST.MF. The bot's `inspect_manifest()` does check suspicious keys, but the JarAnalyzer's own analysis path doesn't cross-reference this.
 
-- [ ] **[MEDIUM] No detection for Timer/ScheduledExecutorService-based delayed execution** — Malware commonly delays payload execution using `java.util.Timer` or `ScheduledExecutorService` to evade sandbox analysis. Add behavioral patterns for `Timer.schedule`, `ScheduledThreadPoolExecutor`, and `Thread.sleep` with large values (>30000).
+- [x] **[MEDIUM] No detection for Timer/ScheduledExecutorService-based delayed execution** — Malware commonly delays payload execution using `java.util.Timer` or `ScheduledExecutorService` to evade sandbox analysis. Add behavioral patterns for `Timer.schedule`, `ScheduledThreadPoolExecutor`, and `Thread.sleep` with large values (>30000).
 
 - [ ] **[MEDIUM] No Gradle/Maven plugin attack detection** — Malicious Minecraft mods distributed as Gradle projects can include build-time attacks via custom plugins or init scripts. Current analysis only handles JAR files.
 
-- [ ] **[MEDIUM] YARA rules don't detect polymorphic webhook URLs** — `Discord_Webhook_Exfil` rule looks for literal webhook URLs, but malware can split the URL across multiple strings or construct it dynamically. Consider also matching the webhook ID pattern (`/\d{17,20}/`) combined with the token pattern.
+- [x] **[MEDIUM] YARA rules don't detect polymorphic webhook URLs** — `Discord_Webhook_Exfil` rule looks for literal webhook URLs, but malware can split the URL across multiple strings or construct it dynamically. Consider also matching the webhook ID pattern (`/\d{17,20}/`) combined with the token pattern.
 
 - [ ] **[LOW] No detection for steganographic payloads in JAR resources** — Malware can embed payloads in PNG/JPG image resources within the JAR. Current analysis checks entropy of resources but doesn't attempt to detect steganography patterns (e.g., LSB encoding in image data).
 
-- [ ] **[LOW] No detection for `ServiceLoader` exploitation** — Java's `ServiceLoader` mechanism (META-INF/services/) can be used to auto-load malicious implementations. JarAnalyzer doesn't scan `META-INF/services/` entries.
+- [x] **[LOW] No detection for `ServiceLoader` exploitation** — Java's `ServiceLoader` mechanism (META-INF/services/) can be used to auto-load malicious implementations. JarAnalyzer doesn't scan `META-INF/services/` entries.
 
 ---
 
@@ -98,7 +98,7 @@ Generated: 2026-03-17
 
 - [ ] **[MEDIUM] Multi-JAR dependency analysis** — Some malware splits payloads across multiple JARs (e.g., a mod JAR + a "library" JAR). Allow scanning a set of JARs together and cross-referencing their interactions.
 
-- [ ] **[MEDIUM] Community reputation scoring** — Track how many times a file has been submitted, by how many unique users/servers, and whether it's been flagged before. High submission count with no detections increases confidence it's clean.
+- [x] **[MEDIUM] Community reputation scoring** — Track how many times a file has been submitted, by how many unique users/servers, and whether it's been flagged before. High submission count with no detections increases confidence it's clean.
 
 - [ ] **[MEDIUM] Automated YARA rule generation from IOCs** — When JarAnalyzer extracts new IOCs (domains, contracts, unique strings), auto-generate candidate YARA rules and present them for review.
 
@@ -118,7 +118,7 @@ Generated: 2026-03-17
 
 - [ ] **[LOW] `run_yara` redirects stdout on every call** — `bot.py:586-588` creates a `StringIO` and `redirect_stdout` context manager for every YARA scan. This is a minor overhead but unnecessary if no YARA rules use `console` module.
 
-- [ ] **[LOW] VT upload polls with fixed sleep intervals** — `bot.py:670` uses hardcoded waits `[10, 15, 20, 30, 45, 60]` totaling 180 seconds. For files that complete quickly, this wastes time. Consider exponential backoff starting from 5 seconds.
+- [x] **[LOW] VT upload polls with fixed sleep intervals** — `bot.py:670` uses hardcoded waits `[10, 15, 20, 30, 45, 60]` totaling 180 seconds. For files that complete quickly, this wastes time. Consider exponential backoff starting from 5 seconds.
 
 - [ ] **[LOW] Decompiler cascade tries all decompilers even when first succeeds partially** — `JarAnalyzer.java:3286-3310` tries Vineflower, and if any files failed, tries JADX/CFR for those files. But the `supplementFailedFiles` function may re-decompile files that already succeeded. Track which specific files failed and only retry those.
 
@@ -140,18 +140,18 @@ Generated: 2026-03-17
 
 - [ ] **[LOW] No abstract interface for threat intel APIs** — VT, MB, and HA each have bespoke lookup/upload functions with duplicated error handling patterns. Define a `ThreatIntelProvider` interface and implement each API as a provider.
 
-- [ ] **[LOW] Hardcoded decompiler version in path** — `JarAnalyzer.java:3225` hardcodes `jadx-1.5.1-all.jar`. When JADX is updated, this path breaks. Use glob pattern matching (which the fallback at line 3228 does, but only if the hardcoded path fails first).
+- [x] **[LOW] Hardcoded decompiler version in path** — `JarAnalyzer.java:3225` hardcodes `jadx-1.5.1-all.jar`. When JADX is updated, this path breaks. Use glob pattern matching (which the fallback at line 3228 does, but only if the hardcoded path fails first).
 
 ---
 
 ## UX IMPROVEMENTS
 
-- [ ] **[MEDIUM] No way to cancel an in-progress scan** — Once a scan starts, the user must wait for it to complete or timeout. Add a cancel button (Discord button component) that kills the subprocess and cleans up.
+- [x] **[MEDIUM] No way to cancel an in-progress scan** — Once a scan starts, the user must wait for it to complete or timeout. Add a cancel button (Discord button component) that kills the subprocess and cleans up.
 
 - [ ] **[MEDIUM] Error messages expose internal paths** — While `sanitize_path()` exists (line 271+), not all error paths use it. JarAnalyzer stderr output at line 2206 is sanitized, but exception tracebacks from Python-level errors might leak paths through Discord embeds.
 
 - [ ] **[LOW] Queue position not updated in real-time** — `ScanQueue` notifies waiters of position changes (line 4383-4385), but the mechanism (set+clear) is unreliable. Users in queue see stale position numbers.
 
-- [ ] **[LOW] `/stats` shows raw numbers without context** — Detection rate (detections/total), average scan time, and uptime would be more useful than raw counters.
+- [x] **[LOW] `/stats` shows raw numbers without context** — Detection rate (detections/total), average scan time, and uptime would be more useful than raw counters.
 
 - [ ] **[LOW] No per-server or per-user scan history** — Users can't see their previous scans. Consider storing a ring buffer of recent scan results per user/server.

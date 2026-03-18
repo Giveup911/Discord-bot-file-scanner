@@ -601,6 +601,7 @@ VT_BASE = "https://www.virustotal.com/api/v3"
 
 
 async def vt_lookup(sha256: str, session: aiohttp.ClientSession) -> Optional[dict]:
+    log.info(f"vt_lookup called for {sha256[:16]}...")
     api_key = CFG["virustotal"]["api_key"]
     if not api_key or not CFG["virustotal"]["enabled"]:
         return None
@@ -715,7 +716,9 @@ MB_API = "https://mb-api.abuse.ch/api/v1/"
 
 async def mb_lookup(sha256: str, session: aiohttp.ClientSession) -> Optional[dict]:
     """Query MalwareBazaar by SHA-256 hash."""
+    log.info(f"mb_lookup called for {sha256[:16]}...")
     if not CFG.get("malwarebazaar", {}).get("enabled", True):
+        log.info("mb_lookup: disabled in config")
         return None
     permalink = f"https://bazaar.abuse.ch/sample/{sha256}/"
     try:
@@ -821,8 +824,10 @@ HA_BASE = "https://hybrid-analysis.com/api/v2"
 
 async def ha_search(sha256: str, session: aiohttp.ClientSession) -> Optional[dict]:
     """Search Hybrid Analysis by hash."""
+    log.info(f"ha_search called for {sha256[:16]}...")
     api_key = CFG.get("hybrid_analysis", {}).get("api_key", "")
     if not api_key or not CFG.get("hybrid_analysis", {}).get("enabled", True):
+        log.info(f"ha_search: disabled (api_key={'set' if api_key else 'EMPTY'}, enabled={CFG.get('hybrid_analysis', {}).get('enabled', True)})")
         return None
     permalink = f"https://www.hybrid-analysis.com/sample/{sha256}"
     headers = {
@@ -5295,6 +5300,8 @@ async def run_scan(
 
         # ── Launch ALL services concurrently ──
         api_tasks = {}
+        log.info(f"[{scan_id}] API launch: http_session={'OK' if http_session else 'NONE'} "
+                 f"vt={vt_enabled} mb={mb_enabled} ha={ha_enabled}")
         if http_session and vt_enabled:
             stages["VirusTotal"] = "running"
             stage_start_times["VirusTotal"] = time.time()
@@ -5307,6 +5314,7 @@ async def run_scan(
             stages["Hybrid Analysis"] = "running"
             stage_start_times["Hybrid Analysis"] = time.time()
             api_tasks["ha"] = asyncio.create_task(ha_search_or_submit(primary_sha256, primary_path, http_session))
+        log.info(f"[{scan_id}] API tasks created: {list(api_tasks.keys())}")
         if api_tasks:
             await update_progress(stages, filename, file_size, hashes)
 
@@ -5316,8 +5324,9 @@ async def run_scan(
         if "vt" in api_tasks:
             try:
                 vt_result = await api_tasks["vt"]
+                log.info(f"[{scan_id}] VT result: status={vt_result.get('status') if vt_result else 'None'}")
             except Exception as exc:
-                log.warning(f"VirusTotal task failed: {exc}")
+                log.warning(f"[{scan_id}] VirusTotal task failed: {exc}")
                 vt_result = {"detected": 0, "total": 0, "detections": {},
                              "permalink": f"https://www.virustotal.com/gui/file/{primary_sha256}",
                              "meaningful_name": "", "tags": [], "first_seen": None, "status": "error"}
@@ -5343,8 +5352,9 @@ async def run_scan(
         if "mb" in api_tasks:
             try:
                 mb_result = await api_tasks["mb"]
+                log.info(f"[{scan_id}] MB result: status={mb_result.get('status') if mb_result else 'None'}")
             except Exception as exc:
-                log.warning(f"MalwareBazaar task failed: {exc}")
+                log.warning(f"[{scan_id}] MalwareBazaar task failed: {exc}")
                 mb_result = {"status": "error", "permalink": f"https://bazaar.abuse.ch/sample/{primary_sha256}/"}
             stages["MalwareBazaar"] = "complete"
             stage_start_times["MalwareBazaar_done"] = time.time()
@@ -5365,8 +5375,9 @@ async def run_scan(
         if "ha" in api_tasks:
             try:
                 ha_result = await api_tasks["ha"]
+                log.info(f"[{scan_id}] HA result: status={ha_result.get('status') if ha_result else 'None'}")
             except Exception as exc:
-                log.warning(f"Hybrid Analysis task failed: {exc}")
+                log.warning(f"[{scan_id}] Hybrid Analysis task failed: {exc}")
                 ha_result = None
             stages["Hybrid Analysis"] = "complete"
             stage_start_times["Hybrid Analysis_done"] = time.time()
