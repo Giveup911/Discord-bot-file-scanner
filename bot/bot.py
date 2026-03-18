@@ -2264,6 +2264,19 @@ def compute_risk_score(
         ]
         score += min(len(non_library_markers), 8)
 
+        # Persistence indicators (LOCALAPPDATA paths, scheduled tasks, Python droppers)
+        persistence_markers = [m for m in markers if any(x in m for x in [
+            "persistence", "NtProfileIndex", "_bootstrap.py", "python312._pth",
+            "schtasks", "scheduled task", "RuntimeBroker",
+        ])]
+        if persistence_markers:
+            score += min(len(persistence_markers) * 5, 10)
+
+        # Decompilation failure indicates advanced obfuscation
+        decompile_fail = [m for m in markers if "Decompilation failure:" in m]
+        if decompile_fail:
+            score += 5
+
     # VirusTotal
     if vt and vt.get("total", 0) > 0:
         vt_ratio = vt["detected"] / vt["total"]
@@ -5563,7 +5576,35 @@ if __name__ == "__main__":
         except (ValueError, TypeError):
             print(f"WARNING: Invalid guild_id '{guild_id}' in config — ignoring.")
 
+    # Graceful shutdown handler
+    async def shutdown():
+        """Clean up resources before exit."""
+        log.info("Shutting down...")
+        # Cancel background poll tasks
+        for task in list(_background_poll_tasks):
+            task.cancel()
+        # Close aiohttp session
+        if http_session is not None and not http_session.closed:
+            await http_session.close()
+        # Stop Tor
+        stop_tor()
+        # Close the bot
+        if not bot.is_closed():
+            await bot.close()
+
+    @bot.event
+    async def on_close():
+        """Called when the bot is closing."""
+        stop_tor()
+        if http_session is not None and not http_session.closed:
+            await http_session.close()
+
     # Auto-launch Tor before starting the bot
     start_tor()
 
-    bot.run(token)
+    try:
+        bot.run(token)
+    except KeyboardInterrupt:
+        log.info("Ctrl+C received — shutting down")
+    finally:
+        stop_tor()
