@@ -39,6 +39,10 @@
 - [x] Fix URL regex — now captures query parameters (?api_key=...)
 - [x] Add minimum score floor (61) for HIGH_RISK_VARIANTS
 - [x] Fix Ctrl+C not closing bot — added on_close handler, cleanup of background tasks/sessions/Tor
+- [x] Per-run unique log files — bot/logs/scanner_YYYYMMDD_HHMMSS.log
+- [x] Active ETAs — progress embed shows live elapsed time per stage, completion time when done
+- [x] Verbose local analysis — JarAnalyzer stdout streamed line-by-line, sub-stage details shown in embed
+- [x] Auto-decrypt display — JarAnalyzer writes decryptedStrings to IOCs JSON, bot displays them in embed + text report
 - [ ] Verify Tor startup failure (exit code 1) — may need config or path fix
 
 ## Dynamic Analysis

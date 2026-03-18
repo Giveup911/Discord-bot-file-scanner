@@ -44,13 +44,16 @@ except ImportError:
 
 # ─── Logging ────────────────────────────────────────────────────────────────
 
+_log_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+_log_dir = Path(__file__).resolve().parent / "logs"
+_log_dir.mkdir(exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.handlers.RotatingFileHandler(
-            str(Path(__file__).resolve().parent / "scanner.log"), encoding="utf-8", maxBytes=10 * 1024 * 1024, backupCount=5
+        logging.FileHandler(
+            str(_log_dir / f"scanner_{_log_ts}.log"), encoding="utf-8",
         ),
     ],
 )
@@ -2155,17 +2158,52 @@ async def run_jar_analyzer(jar_path: str, progress_cb=None) -> dict:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+
+    # Stream stdout line-by-line for live progress updates
+    stdout_lines: list[str] = []
+    stderr_buf = b""
+    last_cb = 0.0
+
+    async def _read_stdout():
+        nonlocal last_cb
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            decoded = line.decode("utf-8", errors="replace").rstrip()
+            stdout_lines.append(decoded)
+            log.info(f"[JarAnalyzer] {decoded}")
+            # Forward key status lines to progress callback (throttled to 2s)
+            if progress_cb and time.time() - last_cb >= 2.0:
+                # Extract a short status from the line
+                short = decoded[:80]
+                if any(kw in decoded.lower() for kw in
+                       ("step", "decompil", "analyz", "extract", "scan", "detect",
+                        "variant", "decrypt", "marker", "ioc", "score", "xor",
+                        "class", "writing", "done", "found", "warn")):
+                    await progress_cb(short)
+                    last_cb = time.time()
+
+    async def _read_stderr():
+        nonlocal stderr_buf
+        stderr_buf = await proc.stderr.read()
+
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        await asyncio.wait_for(
+            asyncio.gather(_read_stdout(), _read_stderr()),
+            timeout=timeout,
+        )
+        await proc.wait()
     except asyncio.TimeoutError:
         proc.kill()
         await proc.communicate()
         return {"error": "Scan timed out", "exit_code": -1, "log_dir": str(log_dir)}
 
+    stdout_text = "\n".join(stdout_lines)
     result = {
         "exit_code": proc.returncode,
-        "stdout": sanitize_path(stdout.decode("utf-8", errors="replace")),
-        "stderr": sanitize_path(stderr.decode("utf-8", errors="replace")),
+        "stdout": sanitize_path(stdout_text),
+        "stderr": sanitize_path(stderr_buf.decode("utf-8", errors="replace")),
         "log_dir": str(log_dir),
     }
 
@@ -2448,6 +2486,8 @@ def build_progress_embed(
     hashes: dict,
     scan_id: str,
     stages: dict,
+    stage_start_times: dict | None = None,
+    stage_details: dict | None = None,
 ) -> discord.Embed:
     """Build a lightweight progress embed showing scan stage status."""
     size_str = (
@@ -2462,6 +2502,7 @@ def build_progress_embed(
     )
     e.add_field(name="File", value=f"{size_str} | `{hashes['sha256'][:16]}...`", inline=False)
 
+    now = time.time()
     lines = []
     for stage_name, status in stages.items():
         icon = STAGE_ICONS.get(status, STAGE_ICONS.get(status.split()[0], "\u2753"))
@@ -2469,16 +2510,26 @@ def build_progress_embed(
         if status == "pending":
             eta = f" (ETA {STAGE_ETAS.get(stage_name, '~5s')})"
         elif status.startswith("running"):
-            # Allow custom running text like "running (~2min)"
-            if "(" in status:
+            # Show live elapsed time
+            if stage_start_times and stage_name in stage_start_times:
+                elapsed = int(now - stage_start_times[stage_name])
+                eta = f" ({elapsed}s elapsed)"
+            elif "(" in status:
                 eta = f" {status[status.index('('):]}"
-                status = "running"
             else:
                 eta = f" (ETA {STAGE_ETAS.get(stage_name, '~5s')})"
+            status = "running"
             icon = STAGE_ICONS["running"]
         elif status == "complete":
+            # Show how long the stage took
+            if stage_start_times and stage_name in stage_start_times:
+                elapsed = stage_start_times.get(f"{stage_name}_done", now) - stage_start_times[stage_name]
+                eta = f" ({elapsed:.0f}s)"
             icon = STAGE_ICONS["complete"]
-        lines.append(f"{icon} **{stage_name}**{eta}")
+        detail_line = ""
+        if stage_details and stage_name in stage_details:
+            detail_line = f"\n  \u2514 _{stage_details[stage_name]}_"
+        lines.append(f"{icon} **{stage_name}**{eta}{detail_line}")
     e.add_field(name="Progress", value="\n".join(lines), inline=False)
     e.set_footer(text=f"Scan ID: {scan_id}")
     return e
@@ -2805,7 +2856,17 @@ def build_embeds(
     # obfuscators
     if obfuscators:
         obf_text = ", ".join(f"`{o}`" for o in obfuscators)
-        obf_text += "\n*Obfuscation scrambles the code to make it hard to read. Both malware AND legitimate programs use this to protect their code.*"
+        # If we have decrypted strings from JarAnalyzer, replace generic message
+        decrypted = iocs.get("decryptedStrings", []) if iocs else []
+        if decrypted:
+            obf_text += f"\n**{len(decrypted)} string(s) auto-decrypted:**"
+            for ds in decrypted[:10]:
+                truncated = ds[:70] + ("..." if len(ds) > 70 else "")
+                obf_text += f"\n`{truncated}`"
+            if len(decrypted) > 10:
+                obf_text += f"\n*...and {len(decrypted) - 10} more*"
+        else:
+            obf_text += "\n*Obfuscation scrambles the code to make it hard to read. Both malware AND legitimate programs use this to protect their code.*"
         e.add_field(
             name="\U0001F576 Obfuscators Detected",
             value=obf_text,
@@ -3645,6 +3706,12 @@ def write_full_report(log_dir: str, **kwargs):
             lines.append("── OBFUSCATORS ──")
             for o in obfuscators:
                 lines.append(f"  {o}")
+            # Show auto-decrypted strings from JarAnalyzer
+            decrypted = iocs.get("decryptedStrings", []) if iocs else []
+            if decrypted:
+                lines.append(f"  Auto-decrypted {len(decrypted)} string(s):")
+                for ds in decrypted:
+                    lines.append(f"    {ds}")
             lines.append("")
 
         # Entropy
@@ -4660,14 +4727,19 @@ async def run_scan(
     # Throttled message edit to respect Discord rate limits (min 2s between edits)
     _last_edit = [0.0]
 
-    async def update_progress(stages: dict, filename: str, file_size: int, hashes: dict):
+    stage_start_times: dict[str, float] = {}
+    stage_details: dict[str, str] = {}
+
+    async def update_progress(stages: dict, filename: str, file_size: int, hashes: dict, force: bool = False):
         nonlocal scan_msg
         now = time.time()
-        if now - _last_edit[0] < 2.0:
+        if not force and now - _last_edit[0] < 2.0:
             return
         _last_edit[0] = now
         try:
-            embed = build_progress_embed(filename, file_size, hashes, scan_id, stages)
+            embed = build_progress_embed(filename, file_size, hashes, scan_id, stages,
+                                         stage_start_times=stage_start_times,
+                                         stage_details=stage_details)
             if scan_msg is None:
                 scan_msg = await safe_send(
                     content=f"Scan requested by {ctx.author.mention}",
@@ -4798,12 +4870,15 @@ async def run_scan(
             api_tasks = {}
             if http_session and vt_enabled:
                 stages["VirusTotal"] = "running"
+                stage_start_times["VirusTotal"] = time.time()
                 api_tasks["vt"] = asyncio.create_task(_zb_vt_lookup_or_upload())
             if http_session and mb_enabled:
                 stages["MalwareBazaar"] = "running"
+                stage_start_times["MalwareBazaar"] = time.time()
                 api_tasks["mb"] = asyncio.create_task(mb_lookup(sha256, http_session))
             if http_session and ha_enabled:
                 stages["Hybrid Analysis"] = "running"
+                stage_start_times["Hybrid Analysis"] = time.time()
                 api_tasks["ha"] = asyncio.create_task(ha_search_or_submit(sha256, dl_path, http_session))
 
             # Collect VT result first (needed for VT Sandbox)
@@ -4917,7 +4992,9 @@ async def run_scan(
 
         # ── Determine what to scan ──
         stages["Local Analysis"] = "running"
-        await update_progress(stages, filename, file_size, hashes)
+        stage_start_times["Local Analysis"] = time.time()
+        stage_details["Local Analysis"] = "Preparing..."
+        await update_progress(stages, filename, file_size, hashes, force=True)
         jars_to_scan = []
         is_zip = False
 
@@ -4985,8 +5062,13 @@ async def run_scan(
         all_analysis = None
         all_log_dirs = []
 
+        async def _jar_progress(msg: str):
+            """Update the Local Analysis stage detail and refresh embed."""
+            stage_details["Local Analysis"] = msg[:80]
+            await update_progress(stages, filename, file_size, hashes)
+
         for jar in jars_to_scan:
-            result = await run_jar_analyzer(jar, progress_cb=progress)
+            result = await run_jar_analyzer(jar, progress_cb=_jar_progress)
             if result.get("log_dir"):
                 all_log_dirs.append(result["log_dir"])
             if result.get("iocs"):
@@ -4995,6 +5077,8 @@ async def run_scan(
                     all_analysis = result.get("analysis_text")
 
         # ── Obfuscator detection ──
+        stage_details["Local Analysis"] = "Detecting obfuscators..."
+        await update_progress(stages, filename, file_size, hashes)
         obfuscators = await asyncio.to_thread(detect_obfuscators, dl_path)
 
         # ── DashO string deobfuscation ──
@@ -5013,12 +5097,17 @@ async def run_scan(
                 log.warning(f"Deobfuscation failed: {exc}")
 
         # ── Entropy analysis ──
+        stage_details["Local Analysis"] = "Analyzing entropy..."
+        await update_progress(stages, filename, file_size, hashes)
         entropy = await asyncio.to_thread(analyze_entropy, dl_path)
 
         # ── Manifest inspection ──
+        stage_details["Local Analysis"] = "Inspecting manifest..."
         manifest = await asyncio.to_thread(inspect_manifest, dl_path)
 
         # ── Raw string extraction (original file + extracted files) ──
+        stage_details["Local Analysis"] = "Extracting strings..."
+        await update_progress(stages, filename, file_size, hashes)
         extracted_strings = await asyncio.to_thread(extract_strings, dl_path)
         for ef in extracted_files:
             ef_strings = await asyncio.to_thread(extract_strings, ef)
@@ -5028,6 +5117,8 @@ async def run_scan(
                         extracted_strings.setdefault(key, []).extend(ef_strings[key])
 
         # ── Multi-format analysis (PE, PDF, Office, LNK, Script, MSI, ISO) ──
+        stage_details["Local Analysis"] = "Analyzing file format..."
+        await update_progress(stages, filename, file_size, hashes)
         # Analyze original file + all extracted files, merge results
         format_analysis = await asyncio.to_thread(analyze_file_format, dl_path)
         for ef in extracted_files:
@@ -5047,6 +5138,8 @@ async def run_scan(
                         format_analysis.setdefault(subkey, []).extend(ef_fmt[subkey])
 
         # ── YARA (original + all extracted files) ──
+        stage_details["Local Analysis"] = "Running YARA rules..."
+        await update_progress(stages, filename, file_size, hashes)
         yara_matches = await asyncio.to_thread(run_yara, dl_path)
         all_scan_files = jars_to_scan + extracted_files
         for sf in all_scan_files:
@@ -5061,7 +5154,9 @@ async def run_scan(
         yara_matches = unique_yara
 
         stages["Local Analysis"] = "complete"
-        await update_progress(stages, filename, file_size, hashes)
+        stage_start_times["Local Analysis_done"] = time.time()
+        stage_details.pop("Local Analysis", None)
+        await update_progress(stages, filename, file_size, hashes, force=True)
 
         # ── External API lookups — ALL run concurrently with pending embeds ──
         vt_result = None
@@ -5109,12 +5204,15 @@ async def run_scan(
         api_tasks = {}
         if http_session and vt_enabled:
             stages["VirusTotal"] = "running"
+            stage_start_times["VirusTotal"] = time.time()
             api_tasks["vt"] = asyncio.create_task(_vt_lookup_or_upload())
         if http_session and mb_enabled:
             stages["MalwareBazaar"] = "running"
+            stage_start_times["MalwareBazaar"] = time.time()
             api_tasks["mb"] = asyncio.create_task(mb_lookup(primary_sha256, http_session))
         if http_session and ha_enabled:
             stages["Hybrid Analysis"] = "running"
+            stage_start_times["Hybrid Analysis"] = time.time()
             api_tasks["ha"] = asyncio.create_task(ha_search_or_submit(primary_sha256, primary_path, http_session))
         if api_tasks:
             await update_progress(stages, filename, file_size, hashes)
@@ -5131,6 +5229,7 @@ async def run_scan(
                              "permalink": f"https://www.virustotal.com/gui/file/{primary_sha256}",
                              "meaningful_name": "", "tags": [], "first_seen": None, "status": "error"}
             stages["VirusTotal"] = "complete"
+            stage_start_times["VirusTotal_done"] = time.time()
             if vt_result and vt_msg:
                 try:
                     await vt_msg.edit(embed=build_vt_embed(vt_result, primary_sha256, scan_id))
@@ -5143,6 +5242,7 @@ async def run_scan(
             # Now that VT is done, launch VT Sandbox lookup
             if vt_result and vt_result.get("status") in ("found", "completed"):
                 stages["VT Sandbox"] = "running"
+                stage_start_times["VT Sandbox"] = time.time()
                 api_tasks["vt_sb"] = asyncio.create_task(vt_get_sandbox_links(primary_sha256, http_session))
             await update_progress(stages, filename, file_size, hashes)
 
@@ -5154,6 +5254,7 @@ async def run_scan(
                 log.warning(f"MalwareBazaar task failed: {exc}")
                 mb_result = {"status": "error", "permalink": f"https://bazaar.abuse.ch/sample/{primary_sha256}/"}
             stages["MalwareBazaar"] = "complete"
+            stage_start_times["MalwareBazaar_done"] = time.time()
             if mb_result and mb_result.get("status") == "found":
                 await update_stats(mb_hits=1)
             if mb_msg:
@@ -5175,6 +5276,7 @@ async def run_scan(
                 log.warning(f"Hybrid Analysis task failed: {exc}")
                 ha_result = None
             stages["Hybrid Analysis"] = "complete"
+            stage_start_times["Hybrid Analysis_done"] = time.time()
             if ha_msg:
                 try:
                     await ha_msg.edit(embed=build_ha_embed(ha_result, primary_sha256, scan_id))
@@ -5192,6 +5294,7 @@ async def run_scan(
                 log.debug(f"VT Sandbox task failed: {exc}")
                 vt_sandbox = None
             stages["VT Sandbox"] = "complete"
+            stage_start_times["VT Sandbox_done"] = time.time()
             if vt_sb_msg:
                 try:
                     await vt_sb_msg.edit(embed=build_vt_sandbox_embed(vt_sandbox, primary_sha256, scan_id))

@@ -3514,7 +3514,7 @@ public class JarAnalyzer {
         }
 
         // Write IOCs
-        writeIOCs(jarPath, jarSha256, "VAPE_CURIUM", markers, urls, null, null, ts);
+        writeIOCs(jarPath, jarSha256, "VAPE_CURIUM", markers, urls, null, null, decryptedStrings, ts);
 
         // Print console summary
         System.out.println();
@@ -3724,7 +3724,7 @@ public class JarAnalyzer {
             System.out.println(YELLOW + "  Buyer UUID: " + buyerUUID + RESET);
         }
 
-        writeIOCs(jarPath, jarSha256, "SILENT_NET", markers, urls, contracts, buyerUUID, ts);
+        writeIOCs(jarPath, jarSha256, "SILENT_NET", markers, urls, contracts, buyerUUID, decryptedStrings, ts);
     }
 
     /** Analyze MSHTA_DROPPER variant — mshta command execution */
@@ -4191,6 +4191,13 @@ public class JarAnalyzer {
     static void writeIOCs(String jarPath, String jarSha256, String variant,
                            List<String> markers, List<String> urls,
                            List<String> contracts, String buyerUUID, String ts) {
+        writeIOCs(jarPath, jarSha256, variant, markers, urls, contracts, buyerUUID, null, ts);
+    }
+
+    static void writeIOCs(String jarPath, String jarSha256, String variant,
+                           List<String> markers, List<String> urls,
+                           List<String> contracts, String buyerUUID,
+                           List<String> decryptedStrings, String ts) {
         try {
             StringBuilder json = new StringBuilder();
             json.append("{\n");
@@ -4205,6 +4212,14 @@ public class JarAnalyzer {
                 for (int i = 0; i < contracts.size(); i++) {
                     json.append("\"").append(escJson(contracts.get(i))).append("\"");
                     if (i < contracts.size()-1) json.append(",");
+                }
+                json.append("],\n");
+            }
+            if (decryptedStrings != null && !decryptedStrings.isEmpty()) {
+                json.append("  \"decryptedStrings\": [");
+                for (int i = 0; i < decryptedStrings.size(); i++) {
+                    json.append("\"").append(escJson(decryptedStrings.get(i))).append("\"");
+                    if (i < decryptedStrings.size()-1) json.append(",");
                 }
                 json.append("],\n");
             }
