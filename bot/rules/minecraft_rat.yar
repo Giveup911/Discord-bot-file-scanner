@@ -464,3 +464,94 @@ rule Polygon_Contract_C2
     condition:
         $known_contract or ($eth_call and $eth_method and any of ($polygon_rpc*))
 }
+
+rule Reflection_Chain_Execution {
+    meta:
+        description = "Detects Java reflection chains used to execute hidden payloads"
+        severity = "medium"
+    strings:
+        $forName = "Class.forName" ascii
+        $getMethod = "getMethod" ascii
+        $invoke = ".invoke(" ascii
+        $getDeclared = "getDeclaredMethod" ascii
+        $newInstance = "newInstance" ascii
+    condition:
+        $forName and ($getMethod or $getDeclared) and ($invoke or $newInstance)
+}
+
+rule Dynamic_ClassLoader_Injection {
+    meta:
+        description = "Detects dynamic class loading from byte arrays (runtime code injection)"
+        severity = "high"
+    strings:
+        $defineClass = "defineClass" ascii
+        $unsafe1 = "sun/misc/Unsafe" ascii
+        $unsafe2 = "sun.misc.Unsafe" ascii
+        $urlcl = "URLClassLoader" ascii
+        $byteArray = "[B" ascii
+        $lookup = "MethodHandles$Lookup" ascii
+    condition:
+        $defineClass and ($unsafe1 or $unsafe2 or $urlcl or ($byteArray and $lookup))
+}
+
+rule DNS_Tunneling_C2 {
+    meta:
+        description = "Detects DNS resolution APIs used for C2 communication"
+        severity = "medium"
+    strings:
+        $jndi1 = "InitialDirContext" ascii
+        $jndi2 = "javax.naming" ascii
+        $jndi3 = "DirContext" ascii
+        $dns1 = "TXT" ascii
+        $dns2 = "dns:" ascii
+        $lookup = "lookup" ascii
+    condition:
+        ($jndi1 or $jndi2 or $jndi3) and ($dns1 or $dns2) and $lookup
+}
+
+rule Polymorphic_Discord_Webhook {
+    meta:
+        description = "Detects Discord webhook URL construction via string building"
+        severity = "high"
+    strings:
+        $hook_path = "/api/webhooks/" ascii
+        $hook_url1 = "discord.com/api/webhooks" ascii nocase
+        $hook_url2 = "discordapp.com/api/webhooks" ascii nocase
+        $builder1 = "StringBuilder" ascii
+        $builder2 = "StringBuffer" ascii
+        $concat = "concat" ascii
+    condition:
+        ($hook_path or $hook_url1 or $hook_url2) and ($builder1 or $builder2 or $concat)
+}
+
+rule Java_Agent_Instrumentation {
+    meta:
+        description = "Detects Java agent instrumentation capabilities for bytecode manipulation"
+        severity = "high"
+    strings:
+        $premain = "Premain-Class" ascii
+        $agentclass = "Agent-Class" ascii
+        $instrument = "java/lang/instrument" ascii
+        $retransform = "retransformClasses" ascii
+        $redefine = "redefineClasses" ascii
+        $attach = "com.sun.tools.attach" ascii
+    condition:
+        ($premain or $agentclass) and ($instrument or $retransform or $redefine or $attach)
+}
+
+rule Scheduled_Delayed_Payload {
+    meta:
+        description = "Detects scheduled/delayed payload execution combined with dangerous actions"
+        severity = "low"
+    strings:
+        $timer = "java/util/Timer" ascii
+        $sched1 = "ScheduledExecutorService" ascii
+        $sched2 = "ScheduledThreadPoolExecutor" ascii
+        $proc1 = "ProcessBuilder" ascii
+        $exec1 = "Runtime.exec" ascii
+        $loader1 = "URLClassLoader" ascii
+        $loader2 = "defineClass" ascii
+        $unsafe = "sun/misc/Unsafe" ascii
+    condition:
+        ($timer or $sched1 or $sched2) and ($proc1 or $exec1 or $loader1 or $loader2 or $unsafe)
+}

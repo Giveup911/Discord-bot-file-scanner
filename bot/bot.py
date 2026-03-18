@@ -358,8 +358,9 @@ def load_stats() -> dict:
 
 def save_stats(stats: dict):
     try:
-        tmp = str(STATS_FILE) + ".tmp"
-        Path(tmp).write_text(json.dumps(stats, indent=2))
+        fd, tmp = tempfile.mkstemp(dir=str(STATS_FILE.parent), suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(stats, f, indent=2)
         os.replace(tmp, STATS_FILE)
     except Exception as e:
         log.warning(f"Failed to save stats: {e}")
@@ -390,8 +391,9 @@ def load_catalog() -> dict:
 
 def save_catalog(catalog: dict):
     try:
-        tmp = str(CATALOG_FILE) + ".tmp"
-        Path(tmp).write_text(json.dumps(catalog, indent=2), encoding="utf-8")
+        fd, tmp = tempfile.mkstemp(dir=str(CATALOG_FILE.parent), suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(catalog, f, indent=2)
         os.replace(tmp, CATALOG_FILE)
     except Exception as e:
         log.warning(f"Failed to save catalog: {e}")
@@ -408,7 +410,8 @@ async def catalog_update(sha256: str, entry: dict):
 
 
 async def catalog_lookup(sha256: str) -> Optional[dict]:
-    return file_catalog.get(sha256)
+    async with _catalog_lock:
+        return file_catalog.get(sha256)
 
 # ─── Exception List ──────────────────────────────────────────────────────────
 
@@ -606,23 +609,21 @@ async def vt_lookup(sha256: str, session: aiohttp.ClientSession) -> Optional[dic
         async with session.get(f"{VT_BASE}/files/{sha256}", headers=headers) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                stats = data["data"]["attributes"]["last_analysis_stats"]
-                results = data["data"]["attributes"].get("last_analysis_results", {})
-                detections = {
-                    name: r["result"]
-                    for name, r in results.items()
-                    if r["category"] in ("malicious", "suspicious")
-                }
-                names = data["data"]["attributes"].get("meaningful_name", "")
-                tags = data["data"]["attributes"].get("tags", [])
+                attrs = data.get("data", {}).get("attributes", {})
+                stats = attrs.get("last_analysis_stats", {})
+                results = attrs.get("last_analysis_results", {})
+                detections = {}
+                for name, r in results.items():
+                    if isinstance(r, dict) and r.get("category") in ("malicious", "suspicious"):
+                        detections[name] = r.get("result", "detected")
                 return {
                     "detected": stats.get("malicious", 0) + stats.get("suspicious", 0),
-                    "total": sum(stats.values()),
+                    "total": sum(stats.values()) if stats else 0,
                     "detections": detections,
                     "permalink": f"https://www.virustotal.com/gui/file/{sha256}",
-                    "meaningful_name": names,
-                    "tags": tags,
-                    "first_seen": data["data"]["attributes"].get("first_submission_date"),
+                    "meaningful_name": attrs.get("meaningful_name", ""),
+                    "tags": attrs.get("tags", []),
+                    "first_seen": attrs.get("first_submission_date"),
                     "status": "found",
                 }
             elif resp.status == 404:
@@ -667,7 +668,7 @@ async def vt_upload(filepath: str, sha256: str, session: aiohttp.ClientSession) 
         await update_stats(files_sent_to_vt=1)
 
         # Poll for completion with longer total wait
-        for wait in [10, 15, 20, 30, 45, 60]:
+        for wait in [5, 10, 15, 20, 30, 40, 50, 60]:
             await asyncio.sleep(wait)
             async with session.get(
                 f"{VT_BASE}/analyses/{analysis_id}", headers=headers
@@ -1061,10 +1062,10 @@ async def _poll_ha_completion(
         for _ in range(15):
             await asyncio.sleep(60)
             try:
-                async with poll_session.post(
+                async with poll_session.get(
                     f"{HA_BASE}/search/hash",
                     headers=headers,
-                    data={"hash": sha256},
+                    params={"hash": sha256},
                     timeout=aiohttp.ClientTimeout(total=20),
                 ) as resp:
                     if resp.status != 200:
@@ -1115,14 +1116,19 @@ def analyze_entropy(filepath: str) -> dict:
     """Analyze entropy of JAR contents. High entropy = packed/encrypted."""
     results = {"overall": 0.0, "suspicious_entries": [], "max_class_entropy": 0.0}
     try:
-        with open(filepath, "rb") as f:
-            raw = f.read()
-        results["overall"] = round(shannon_entropy(raw), 2)
-
+        # Compute overall entropy from ZIP entries to avoid reading raw file twice
+        all_counts = [0] * 256
+        total_bytes = 0
         with zipfile.ZipFile(filepath, "r") as zf:
             for entry in zf.namelist():
                 try:
                     data = zf.read(entry)
+                    if not data:
+                        continue
+                    # Accumulate byte counts for overall entropy
+                    for b in data:
+                        all_counts[b] += 1
+                    total_bytes += len(data)
                     if len(data) < 64:
                         continue
                     ent = shannon_entropy(data)
@@ -1136,6 +1142,14 @@ def analyze_entropy(filepath: str) -> dict:
                         })
                 except Exception:
                     pass
+        # Compute overall entropy from accumulated counts
+        if total_bytes > 0:
+            ent = 0.0
+            for c in all_counts:
+                if c > 0:
+                    p = c / total_bytes
+                    ent -= p * math.log2(p)
+            results["overall"] = round(ent, 2)
     except Exception:
         pass
     return results
@@ -2111,6 +2125,19 @@ def detect_obfuscators(jar_path: str) -> list[str]:
                     except Exception:
                         pass
 
+            # Check for ServiceLoader exploitation
+            services = [n for n in names if n.startswith("META-INF/services/")]
+            if services:
+                found.add(f"ServiceLoader ({len(services)} service(s))")
+
+            # Check for Java agent capabilities
+            if "META-INF/MANIFEST.MF" in names:
+                manifest_text = zf.read("META-INF/MANIFEST.MF").decode("utf-8", errors="replace")
+                if "Premain-Class:" in manifest_text:
+                    found.add("Java Agent (Premain-Class)")
+                if "Agent-Class:" in manifest_text:
+                    found.add("Java Agent (Agent-Class)")
+
             for entry in class_names[:100]:
                 try:
                     data = zf.read(entry)
@@ -2798,6 +2825,8 @@ def build_embeds(
             c2_parts.append(f"**Stage 2:** `{iocs['stage2Url']}`")
         if iocs.get("ethMethod"):
             c2_parts.append(f"**ETH Method:** `{iocs['ethMethod']}`")
+        if iocs.get("buyerUUID"):
+            c2_parts.append(f"**Buyer UUID:** `{iocs['buyerUUID']}`")
         if c2_parts:
             e.add_field(name="\U0001F310 C2 Infrastructure", value=_trunc("\n".join(c2_parts)), inline=False)
 
@@ -4460,15 +4489,42 @@ _install_params = _build_command_install_params()
 http_session: Optional[aiohttp.ClientSession] = None
 _ready_fired = False
 _background_poll_tasks: set = set()  # prevent GC of fire-and-forget tasks
+_bot_start_time: float = time.time()
+_cancelled_scans: set[str] = set()  # scan IDs that have been cancelled
+
+
+class CancelScanView(discord.ui.View):
+    """Persistent view with a cancel button for in-progress scans."""
+
+    def __init__(self, scan_id: str, requester_id: int):
+        super().__init__(timeout=600)  # 10 min timeout
+        self.scan_id = scan_id
+        self.requester_id = requester_id
+
+    @discord.ui.button(label="Cancel Scan", style=discord.ButtonStyle.danger, emoji="\u274C")
+    async def cancel_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if interaction.user.id != self.requester_id:
+            return await interaction.response.send_message("Only the scan requester can cancel.", ephemeral=True)
+        _cancelled_scans.add(self.scan_id)
+        button.disabled = True
+        button.label = "Cancelling..."
+        await interaction.response.edit_message(view=self)
+        log.info(f"[{self.scan_id}] Scan cancelled by {interaction.user}")
+
+
+async def ensure_http_session() -> aiohttp.ClientSession:
+    """Lazily create or return the global aiohttp session."""
+    global http_session
+    if http_session is None or http_session.closed:
+        http_session = aiohttp.ClientSession()
+    return http_session
 
 
 @bot.event
 async def on_ready():
     global http_session, _ready_fired
-    # Close old session on reconnect to prevent leaks
-    if http_session is not None and not http_session.closed:
-        await http_session.close()
-    http_session = aiohttp.ClientSession()
+    # Ensure session exists (may already be created by a scan command)
+    await ensure_http_session()
     # Only run setup tasks on first ready
     if not _ready_fired:
         _ready_fired = True
@@ -4633,19 +4689,31 @@ async def giverat_command(
 
 @bot.slash_command(name="stats", description="Show scanner statistics", **_install_params)
 async def stats_command(ctx: discord.ApplicationContext):
+    async with _stats_lock:
+        stats = dict(scan_stats)
+    total = stats.get("total_scans", 0)
+    detections = stats.get("detections", 0)
+    clean = stats.get("clean", 0)
+    rate = f"{detections / total * 100:.1f}%" if total > 0 else "N/A"
     e = discord.Embed(title="\U0001F4CA Scanner Statistics", color=0x3498DB)
-    e.add_field(name="Total Scans", value=str(scan_stats["total_scans"]), inline=True)
-    e.add_field(name="Detections", value=str(scan_stats["detections"]), inline=True)
-    e.add_field(name="Clean Files", value=str(scan_stats["clean"]), inline=True)
-    e.add_field(name="Webhooks Killed", value=str(scan_stats["webhooks_killed"]), inline=True)
-    e.add_field(name="Files Sent to VT", value=str(scan_stats["files_sent_to_vt"]), inline=True)
+    e.add_field(name="Total Scans", value=str(total), inline=True)
+    e.add_field(name="Detections", value=f"{detections} ({rate})", inline=True)
+    e.add_field(name="Clean Files", value=str(clean), inline=True)
+    e.add_field(name="Webhooks Killed", value=str(stats.get("webhooks_killed", 0)), inline=True)
+    e.add_field(name="Files Sent to VT", value=str(stats.get("files_sent_to_vt", 0)), inline=True)
     e.add_field(
         name="Queue",
         value=f"{scan_queue.active} active / {scan_queue.pending} pending",
         inline=True,
     )
+    # Uptime
+    uptime_s = int(time.time() - _bot_start_time) if _bot_start_time else 0
+    hours, rem = divmod(uptime_s, 3600)
+    mins, secs = divmod(rem, 60)
+    e.add_field(name="Uptime", value=f"{hours}h {mins}m {secs}s", inline=True)
     if YARA_RULES:
         e.add_field(name="YARA Rules", value="Loaded", inline=True)
+    e.add_field(name="Guilds", value=str(len(bot.guilds)), inline=True)
     await ctx.respond(embed=e, ephemeral=True)
 
 
@@ -4684,6 +4752,17 @@ async def save_command(
     if not ctx.guild or not hasattr(ctx.author, "guild_permissions") or not ctx.author.guild_permissions.administrator:
         return await ctx.respond("Admin only.", ephemeral=True)
     CFG["scanner"]["save_samples"] = enabled
+    # Persist to config.yml so it survives restarts
+    try:
+        import yaml
+        config_path = BOT_DIR / "config.yml"
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+        raw.setdefault("scanner", {})["save_samples"] = enabled
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(raw, f, default_flow_style=False, sort_keys=False)
+    except Exception as e:
+        log.warning(f"Failed to persist save_samples to config.yml: {e}")
     status = "enabled" if enabled else "disabled"
     await ctx.respond(f"Sample saving **{status}**. Scanned files will {'be archived in `scanned/`' if enabled else 'be deleted after scan'}.", ephemeral=True)
     log.info(f"Sample saving set to {enabled} by {ctx.author}")
@@ -4740,13 +4819,15 @@ async def run_scan(
             embed = build_progress_embed(filename, file_size, hashes, scan_id, stages,
                                          stage_start_times=stage_start_times,
                                          stage_details=stage_details)
+            cancel_view = CancelScanView(scan_id, ctx.author.id)
             if scan_msg is None:
                 scan_msg = await safe_send(
                     content=f"Scan requested by {ctx.author.mention}",
                     embed=embed,
+                    view=cancel_view,
                 )
             else:
-                await scan_msg.edit(embed=embed)
+                await scan_msg.edit(embed=embed, view=cancel_view)
         except discord.HTTPException:
             pass
 
@@ -4810,7 +4891,15 @@ async def run_scan(
         if prev_scan:
             scan_count = prev_scan.get("scan_count", 1)
             prev_time = prev_scan.get("last_scan", "unknown")
-            await progress(f"Previously scanned {scan_count} time(s) (last: {prev_time}). Refreshing analysis...")
+            n_submitters = len(prev_scan.get("submitters", []))
+            n_guilds = len(prev_scan.get("guilds", []))
+            rep_info = f"Previously scanned {scan_count} time(s) (last: {prev_time})"
+            if n_submitters > 1 or n_guilds > 1:
+                rep_info += f" by {n_submitters} user(s) across {n_guilds} server(s)"
+            await progress(f"{rep_info}. Refreshing analysis...")
+
+        # ── Ensure HTTP session exists (on_ready may not have fired yet) ──
+        await ensure_http_session()
 
         # ── Build stage tracker ──
         vt_enabled = CFG["virustotal"]["enabled"] and CFG["virustotal"]["api_key"]
@@ -4985,7 +5074,7 @@ async def run_scan(
                 zip_bomb_warning=zip_bomb_warning,
             )
             if scan_msg:
-                await scan_msg.edit(content=f"Scan requested by {ctx.author.mention}", embeds=embeds)
+                await scan_msg.edit(content=f"Scan requested by {ctx.author.mention}", embeds=embeds, view=None)
             else:
                 await safe_send(content=f"Scan requested by {ctx.author.mention}", embeds=embeds)
             return
@@ -5064,10 +5153,14 @@ async def run_scan(
 
         async def _jar_progress(msg: str):
             """Update the Local Analysis stage detail and refresh embed."""
+            if scan_id in _cancelled_scans:
+                raise asyncio.CancelledError("Scan cancelled by user")
             stage_details["Local Analysis"] = msg[:80]
             await update_progress(stages, filename, file_size, hashes)
 
         for jar in jars_to_scan:
+            if scan_id in _cancelled_scans:
+                raise asyncio.CancelledError("Scan cancelled by user")
             result = await run_jar_analyzer(jar, progress_cb=_jar_progress)
             if result.get("log_dir"):
                 all_log_dirs.append(result["log_dir"])
@@ -5362,6 +5455,12 @@ async def run_scan(
             await update_stats(total_scans=1, clean=1)
 
         # ── Update catalog ──
+        # Track unique submitters for reputation scoring
+        prev_submitters = set(prev_scan.get("submitters", [])) if prev_scan else set()
+        prev_submitters.add(str(ctx.author.id))
+        guild_id = str(ctx.guild.id) if ctx.guild else "DM"
+        prev_guilds = set(prev_scan.get("guilds", [])) if prev_scan else set()
+        prev_guilds.add(guild_id)
         await catalog_update(sha256, {
             "filename": filename,
             "file_size": file_size,
@@ -5370,6 +5469,8 @@ async def run_scan(
             "level": level,
             "variant": (all_iocs.get("variant", "") if all_iocs else ""),
             "scan_count": (prev_scan.get("scan_count", 0) + 1) if prev_scan else 1,
+            "submitters": list(prev_submitters)[-50:],  # cap at 50 unique submitters
+            "guilds": list(prev_guilds)[-50:],
             "yara_hits": len(yara_matches),
             "vt_detected": vt_result.get("detected", 0) if vt_result else 0,
             "vt_total": vt_result.get("total", 0) if vt_result else 0,
@@ -5469,7 +5570,7 @@ async def run_scan(
 
         try:
             if scan_msg:
-                await scan_msg.edit(content=f"Scan requested by {ctx.author.mention}", embeds=embeds)
+                await scan_msg.edit(content=f"Scan requested by {ctx.author.mention}", embeds=embeds, view=None)
                 if files_to_send:
                     # Discord limits to 10 files per message — batch if needed
                     for i in range(0, len(files_to_send), 10):
@@ -5510,6 +5611,20 @@ async def run_scan(
 
         log.info(f"[{scan_id}] Scan complete: {filename} — score={score} level={level}")
 
+    except asyncio.CancelledError:
+        log.info(f"[{scan_id}] Scan cancelled by user")
+        cancel_embed = discord.Embed(
+            title="\u274C Scan Cancelled",
+            description="The scan was cancelled by the requester.",
+            color=0x95A5A6,
+        )
+        if scan_msg:
+            try:
+                await scan_msg.edit(embed=cancel_embed, view=None)
+            except discord.HTTPException:
+                await safe_send(embed=cancel_embed)
+        else:
+            await safe_send(embed=cancel_embed)
     except Exception as e:
         log.exception(f"[{scan_id}] Scan error")
         error_embed = discord.Embed(
@@ -5519,12 +5634,13 @@ async def run_scan(
         )
         if scan_msg:
             try:
-                await scan_msg.edit(embed=error_embed)
+                await scan_msg.edit(embed=error_embed, view=None)
             except discord.HTTPException:
                 await safe_send(embed=error_embed)
         else:
             await safe_send(embed=error_embed)
     finally:
+        _cancelled_scans.discard(scan_id)
         try:
             shutil.rmtree(work_dir, ignore_errors=True)
         except Exception:
@@ -5583,11 +5699,16 @@ def start_tor():
     log.info(f"Starting Tor from {tor_exe}...")
     try:
         # Launch Tor as a background process (DEVNULL prevents pipe buffer deadlock)
+        tor_dir = Path(tor_exe).parent
+        torrc = tor_dir / "torrc"
+        cmd = [tor_exe]
+        if torrc.exists():
+            cmd += ["-f", str(torrc)]
         _tor_process = subprocess.Popen(
-            [tor_exe],
+            cmd,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            cwd=str(Path(tor_exe).parent),
+            stderr=subprocess.PIPE,
+            cwd=str(tor_dir),
         )
         # Wait for Tor to bootstrap (check every second, up to 30s)
         for i in range(30):
@@ -5597,7 +5718,13 @@ def start_tor():
                 return
             # Check if process died
             if _tor_process.poll() is not None:
-                log.error(f"Tor process exited with code {_tor_process.returncode}")
+                stderr_out = ""
+                try:
+                    stderr_out = _tor_process.stderr.read().decode("utf-8", errors="replace")[:500]
+                except Exception:
+                    pass
+                log.error(f"Tor process exited with code {_tor_process.returncode}"
+                          + (f": {stderr_out}" if stderr_out else ""))
                 _tor_process = None
                 return
         log.warning("Tor started but proxy not responding after 30s — URL downloads may fail")
@@ -5624,6 +5751,24 @@ def stop_tor():
 
 import atexit
 atexit.register(stop_tor)
+
+
+def _cleanup_stale_temp_dirs():
+    """Remove any leftover scan_ temp dirs older than 1 hour."""
+    try:
+        tmp = tempfile.gettempdir()
+        cutoff = time.time() - 3600
+        for entry in os.scandir(tmp):
+            if entry.name.startswith("scan_") and entry.is_dir():
+                try:
+                    if entry.stat().st_mtime < cutoff:
+                        shutil.rmtree(entry.path, ignore_errors=True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+atexit.register(_cleanup_stale_temp_dirs)
 
 
 # ─── Entry Point ─────────────────────────────────────────────────────────────

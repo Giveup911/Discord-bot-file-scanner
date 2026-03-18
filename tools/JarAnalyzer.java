@@ -50,6 +50,11 @@ public class JarAnalyzer {
     /** Per-marker location details: marker label → list of {file, line, context} */
     static Map<String, List<Map<String, String>>> markerDetails = new LinkedHashMap<>();
 
+    /** Constant pool URLs collected during metadata extraction — available to all variant analyzers */
+    static Set<String> cpUrlsCollected = new LinkedHashSet<>();
+    /** Constant pool domains collected during metadata extraction — available to all variant analyzers */
+    static Set<String> cpDomainsCollected = new LinkedHashSet<>();
+
     /** Resolve a file path inside the per-JAR output directory. */
     static Path out(String filename) { return outDir.resolve(filename); }
 
@@ -720,7 +725,13 @@ public class JarAnalyzer {
     // ─────────────────────────────────────────────────────────────────────
 
     static void analyzeJar(String jarPath) throws Exception {
-        markerDetails.clear(); // Clear before any work to prevent stale data on exceptions
+        // Reset ALL static state to prevent cross-contamination in batch mode
+        markerDetails.clear();
+        cpUrlsCollected.clear();
+        cpDomainsCollected.clear();
+        infoLog = null;
+        configLog = null;
+        cachedBlocklist = null;
         jarName = Paths.get(jarPath).getFileName().toString()
             .replaceAll("\\.(jar|zip)(\\.zip)?$", "")
             .replaceAll("[^a-zA-Z0-9_\\-]", "_");
@@ -814,14 +825,15 @@ public class JarAnalyzer {
         Path sourceDir = outDir.resolve("source");
         Files.createDirectories(sourceDir);
 
-        // Prepare a clean JAR for decompilation (handle trailing / entries)
-        String decompileTarget = jarPath;
-        if (hasTrailingSlashEntries) {
-            step("Repackaging JAR (fixing trailing / class entries)...");
-            cleanJar = repackageCleanJar(jarPath, tempDir);
-            decompileTarget = cleanJar.toString();
-            ok("Clean JAR created for decompilation");
-        }
+        // Build a stripped JAR with only non-library classes for faster decompilation
+        step("Building stripped JAR (excluding library classes)...");
+        cleanJar = buildStrippedJar(jarPath, tempDir, hasTrailingSlashEntries);
+        String decompileTarget = cleanJar.toString();
+        long strippedClasses = 0;
+        try (ZipFile szf = new ZipFile(cleanJar.toFile())) {
+            strippedClasses = szf.stream().filter(e -> e.getName().endsWith(".class")).count();
+        } catch (Exception ignored) {}
+        ok("Stripped JAR: " + strippedClasses + " class(es) to decompile (library classes excluded)");
 
         step("Decompiling full JAR to source/...");
         decompilerUsed = decompileFullJar(decompileTarget, sourceDir, vineflowerPath, jadxPath, cfrPath);
@@ -869,6 +881,98 @@ public class JarAnalyzer {
         else {
             ok("Detected " + markers.size() + " behavioral marker(s):");
             for (String m : markers) warn("  " + m);
+        }
+
+        // ── Encryption complexity scoring ──
+        // Count distinct encryption schemes found in markers
+        int encSchemeCount = 0;
+        for (String m : markers) {
+            String ml = m.toLowerCase();
+            if (ml.contains("xor") || ml.contains("byte[] string") || ml.contains("byte array string")) encSchemeCount++;
+            else if (ml.contains("aes") || ml.contains("crypto api")) encSchemeCount++;
+            else if (ml.contains("base64 encoded")) encSchemeCount++;
+            else if (ml.contains("char array string construction")) encSchemeCount++;
+        }
+        if (encSchemeCount > 1) {
+            String encMsg = "Multiple encryption schemes detected (" + encSchemeCount + " schemes)";
+            if (!markers.contains(encMsg)) {
+                markers.add(encMsg);
+                warn("  " + encMsg);
+            }
+        }
+
+        // ── MANIFEST agent markers → behavioral markers ──
+        // Re-read MANIFEST to add Premain-Class/Agent-Class as behavioral markers
+        try (ZipFile mfZf = new ZipFile(jarPath)) {
+            ZipEntry mfEntry = mfZf.getEntry("META-INF/MANIFEST.MF");
+            if (mfEntry != null) {
+                try (InputStream mfIs = mfZf.getInputStream(mfEntry)) {
+                    java.util.jar.Manifest mf = new java.util.jar.Manifest(mfIs);
+                    String premain = mf.getMainAttributes().getValue("Premain-Class");
+                    String agent = mf.getMainAttributes().getValue("Agent-Class");
+                    if (premain != null) {
+                        String m = "Java agent: Premain-Class found (" + premain + ")";
+                        if (!markers.contains(m)) markers.add(m);
+                    }
+                    if (agent != null) {
+                        String m = "Java agent: Agent-Class found (" + agent + ")";
+                        if (!markers.contains(m)) markers.add(m);
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+
+        // ── JNIC blob marker ──
+        try (ZipFile jnicZf = new ZipFile(jarPath)) {
+            var jnicEntries = jnicZf.entries();
+            while (jnicEntries.hasMoreElements()) {
+                ZipEntry e = jnicEntries.nextElement();
+                String name = e.getName().toLowerCase();
+                if (e.isDirectory() || e.getSize() <= 0) continue;
+                if (name.endsWith(".bin") || name.endsWith(".dat")) {
+                    try (InputStream is = jnicZf.getInputStream(e)) {
+                        byte[] header = new byte[(int)Math.min(e.getSize(), 64)];
+                        int rd = is.read(header);
+                        if (rd >= 4) {
+                            String headerStr = new String(header, 0, rd, StandardCharsets.US_ASCII);
+                            boolean hasJnic = headerStr.contains("JNIC");
+                            boolean hasCafeBabe = false;
+                            for (int off = 4; off < rd - 3; off++) {
+                                if ((header[off] & 0xFF) == 0xCA && (header[off+1] & 0xFF) == 0xFE
+                                    && (header[off+2] & 0xFF) == 0xBA && (header[off+3] & 0xFF) == 0xBE) {
+                                    hasCafeBabe = true;
+                                    break;
+                                }
+                            }
+                            if (hasJnic || hasCafeBabe) {
+                                String m = "JNIC native obfuscation blob detected (" + e.getSize() + " bytes)";
+                                if (!markers.contains(m)) markers.add(m);
+                            }
+                        }
+                    } catch (Exception ignored) {}
+                }
+            }
+        } catch (Exception ignored) {}
+
+        // ── ServiceLoader exploitation marker ──
+        try (ZipFile slZf = new ZipFile(jarPath)) {
+            var slEntries = slZf.entries();
+            while (slEntries.hasMoreElements()) {
+                ZipEntry e = slEntries.nextElement();
+                if (e.getName().startsWith("META-INF/services/") && !e.isDirectory()) {
+                    String m = "META-INF/services/ entries found (potential ServiceLoader exploitation)";
+                    if (!markers.contains(m)) markers.add(m);
+                    break;
+                }
+            }
+        } catch (Exception ignored) {}
+
+        // ── Constant pool URLs/domains into markers ──
+        if (!cpUrlsCollected.isEmpty()) {
+            for (String url : cpUrlsCollected) {
+                String m = "Constant pool URL: " + url;
+                if (!markers.contains(m)) markers.add(m);
+            }
         }
 
         // Check for decompilation failures — indicates advanced obfuscation
@@ -1643,6 +1747,93 @@ public class JarAnalyzer {
             }
         }
 
+        // ── Change 5: Reflection/invokedynamic bytecode detection ──
+        boolean hasForName = false, hasGetMethod = false, hasInvoke = false;
+        boolean hasMethodHandle = false, hasUnsafe = false;
+        boolean hasDefineClass = false, hasURLClassLoader = false;
+        boolean extendsClassLoader = false;
+        // ── Change 6: DNS tunneling detection ──
+        boolean hasDnsLookup = false;
+        // ── Change 7: Timer/delayed execution detection ──
+        boolean hasTimer = false, hasScheduledExecutor = false, hasThreadSleep = false;
+
+        for (Map.Entry<String, byte[]> classEntry : classes.entrySet()) {
+            boolean isLib = isLibraryClass(classEntry.getKey());
+            if (isLib) continue;
+            String ascii = new String(classEntry.getValue(), StandardCharsets.US_ASCII);
+
+            // Change 5: Reflection chains
+            if (ascii.contains("java/lang/Class") && ascii.contains("forName")) hasForName = true;
+            if (ascii.contains("getMethod") || ascii.contains("getDeclaredMethod")) hasGetMethod = true;
+            if (ascii.contains("java/lang/reflect/Method") && ascii.contains("invoke")) hasInvoke = true;
+            if (ascii.contains("java/lang/invoke/MethodHandle")) hasMethodHandle = true;
+            if (ascii.contains("sun/misc/Unsafe") || ascii.contains("jdk/internal/misc/Unsafe")) hasUnsafe = true;
+
+            // Change 6: DNS tunneling
+            if (ascii.contains("javax/naming/directory") || ascii.contains("InitialDirContext")
+                || ascii.contains("DirContext")) hasDnsLookup = true;
+
+            // Change 7: Timer/delayed execution
+            if (ascii.contains("java/util/Timer") && ascii.contains("schedule")) hasTimer = true;
+            if (ascii.contains("ScheduledThreadPoolExecutor") || ascii.contains("ScheduledExecutorService")) hasScheduledExecutor = true;
+            if (ascii.contains("java/lang/Thread") && ascii.contains("sleep")) hasThreadSleep = true;
+
+            // Change 9: ClassLoader manipulation
+            if (ascii.contains("defineClass")) hasDefineClass = true;
+            if (ascii.contains("URLClassLoader")) hasURLClassLoader = true;
+            // Check if class extends ClassLoader (constant pool contains "java/lang/ClassLoader" as superclass ref)
+            if (ascii.contains("java/lang/ClassLoader") && !ascii.contains("URLClassLoader")) extendsClassLoader = true;
+        }
+
+        // Change 5 markers
+        if (hasForName && hasGetMethod && hasInvoke) {
+            String m = "Reflection-based execution chain: Class.forName + getMethod + invoke";
+            if (!findings.contains(m)) { findings.add(m); ilog("  [CPREF] " + m); }
+        }
+        if (hasMethodHandle) {
+            String m = "invokedynamic dispatch: java/lang/invoke/MethodHandle reference";
+            if (!findings.contains(m)) { findings.add(m); ilog("  [CPREF] " + m); }
+        }
+        if (hasUnsafe) {
+            String m = "Unsafe class access: sun/misc/Unsafe or jdk/internal/misc/Unsafe (unsafe class loading)";
+            if (!findings.contains(m)) { findings.add(m); ilog("  [CPREF] " + m); }
+        }
+
+        // Change 6 markers
+        if (hasDnsLookup) {
+            String m = "DNS lookup API (potential DNS tunneling C2)";
+            if (!findings.contains(m)) { findings.add(m); ilog("  [CPREF] " + m); }
+        }
+
+        // Change 7 markers
+        if (hasTimer) {
+            String m = "Timer-based delayed execution: java/util/Timer + schedule";
+            if (!findings.contains(m)) { findings.add(m); ilog("  [CPREF] " + m); }
+        }
+        if (hasScheduledExecutor) {
+            String m = "Scheduled execution: ScheduledThreadPoolExecutor/ScheduledExecutorService";
+            if (!findings.contains(m)) { findings.add(m); ilog("  [CPREF] " + m); }
+        }
+        if (hasThreadSleep && findings.size() > 3) {
+            // Thread.sleep is only suspicious in combination with other markers
+            String m = "Thread.sleep in suspicious context (delayed execution with " + (findings.size()-1) + " other markers)";
+            if (!findings.contains(m)) { findings.add(m); ilog("  [CPREF] " + m); }
+        }
+
+        // Change 9 markers
+        if (hasDefineClass) {
+            String m2 = "ClassLoader.defineClass usage (runtime bytecode injection)";
+            if (!findings.contains(m2)) { findings.add(m2); ilog("  [CPREF] " + m2); }
+        }
+        if (hasURLClassLoader) {
+            String m2 = "URLClassLoader usage (remote class loading)";
+            if (!findings.contains(m2)) { findings.add(m2); ilog("  [CPREF] " + m2); }
+        }
+        if (extendsClassLoader) {
+            String m2 = "Custom ClassLoader subclass detected (potential code injection)";
+            if (!findings.contains(m2)) { findings.add(m2); ilog("  [CPREF] " + m2); }
+        }
+
         // Combo detection: only flag HIGH RISK when dangerous combos appear in NON-library code
         if (nonLibURLClassLoader && (nonLibDefineClass || nonLibReflection)) {
             String m = "HIGH RISK: URLClassLoader + dynamic class loading combo (stage2 download pattern)";
@@ -2339,8 +2530,9 @@ public class JarAnalyzer {
     static Map<String, byte[]> extractClasses(String jarPath, Path outDir) throws Exception {
         Map<String, byte[]> result = new LinkedHashMap<>();
 
-        // Pass 1: fake-directory ZIP trick (entries named *.class/ with data)
+        // Single ZipFile handle for both passes (avoids double open)
         try (ZipFile zf = new ZipFile(jarPath)) {
+            // Pass 1: fake-directory ZIP trick (entries named *.class/ with data)
             Enumeration<? extends ZipEntry> entries = zf.entries();
             while (entries.hasMoreElements()) {
                 ZipEntry entry = entries.nextElement();
@@ -2357,33 +2549,29 @@ public class JarAnalyzer {
                     } catch (Exception ignored) {}
                 }
             }
-        }
 
-        // Pass 2: standard .class files (always run to catch normal classes too)
-        {
+            // Pass 2: standard .class files (always run to catch normal classes too)
             if (result.isEmpty()) {
                 ilog("  Falling back to standard class extraction");
                 System.out.println("    Falling back to standard class extraction");
             }
-            try (ZipFile zf = new ZipFile(jarPath)) {
-                Enumeration<? extends ZipEntry> entries = zf.entries();
-                while (entries.hasMoreElements()) {
-                    ZipEntry entry = entries.nextElement();
-                    if (entry.isDirectory() || !entry.getName().endsWith(".class")) continue;
-                    if (entry.getSize() > 50_000_000) { ilog("  SKIP: " + entry.getName() + " too large"); continue; }
-                    try (InputStream is = zf.getInputStream(entry)) {
-                        byte[] data = readBounded(is, 50_000_000);
-                        if (isClassMagic(data)) {
-                            String safe = entry.getName().replaceAll("[/\\\\]", "_");
-                            if (result.containsKey(safe)) safe = safe + "_std"; // avoid collision with pass 1
-                            result.put(safe, data);
-                            ilog("  + [std] " + entry.getName() + " (" + data.length + " bytes)");
-                            System.out.println("    + [std] " + entry.getName() + " (" + data.length + " bytes)");
-                        }
-                    } catch (Exception ignored) {}
-                }
+            Enumeration<? extends ZipEntry> entries2 = zf.entries();
+            while (entries2.hasMoreElements()) {
+                ZipEntry entry = entries2.nextElement();
+                if (entry.isDirectory() || !entry.getName().endsWith(".class")) continue;
+                if (entry.getSize() > 50_000_000) { ilog("  SKIP: " + entry.getName() + " too large"); continue; }
+                try (InputStream is = zf.getInputStream(entry)) {
+                    byte[] data = readBounded(is, 50_000_000);
+                    if (isClassMagic(data)) {
+                        String safe = entry.getName().replaceAll("[/\\\\]", "_");
+                        if (result.containsKey(safe)) safe = safe + "_std"; // avoid collision with pass 1
+                        result.put(safe, data);
+                        ilog("  + [std] " + entry.getName() + " (" + data.length + " bytes)");
+                        System.out.println("    + [std] " + entry.getName() + " (" + data.length + " bytes)");
+                    }
+                } catch (Exception ignored) {}
             }
-        } // end pass 2
+        }
 
         return result;
     }
@@ -3238,6 +3426,13 @@ public class JarAnalyzer {
         // Check CWD and tools/ subdirectory
         for (String base : new String[]{"", "tools/"}) {
             if (hint.equals("jadx")) {
+                // Try glob first to find any jadx version
+                try (var s = Files.list(Paths.get(base + "jadx/lib"))) {
+                    var found = s.filter(p -> p.getFileName().toString().startsWith("jadx-")
+                            && p.getFileName().toString().endsWith("-all.jar")).findFirst();
+                    if (found.isPresent()) return found.get().toString();
+                } catch (Exception ignored) {}
+                // Fall back to hardcoded name
                 Path jadxAll = Paths.get(base + "jadx/lib/jadx-1.5.1-all.jar");
                 if (Files.exists(jadxAll)) return jadxAll.toString();
             } else {
@@ -3249,6 +3444,52 @@ public class JarAnalyzer {
     }
 
     /** Repackage a JAR, fixing entries with trailing "/" on .class files */
+    /** Build a stripped JAR containing only non-library classes + resources.
+     *  This dramatically speeds up decompilation by excluding bundled dependencies
+     *  (Gson, Apache, Kotlin, Minecraft internals, etc.). Also fixes trailing / entries. */
+    static Path buildStrippedJar(String jarPath, Path tempDir, boolean fixTrailingSlash) throws Exception {
+        Path stripped = tempDir.resolve("stripped.jar");
+        int kept = 0, skipped = 0;
+        try (ZipFile zf = new ZipFile(jarPath);
+             java.util.jar.JarOutputStream jos = new java.util.jar.JarOutputStream(
+                 new FileOutputStream(stripped.toFile()))) {
+            var entries = zf.entries();
+            Set<String> written = new HashSet<>();
+            while (entries.hasMoreElements()) {
+                ZipEntry entry = entries.nextElement();
+                String name = entry.getName();
+                // Fix trailing / on class entries
+                if (fixTrailingSlash && name.endsWith(".class/")) {
+                    name = name.substring(0, name.length() - 1);
+                }
+                // Sanitize path traversal
+                if (name.contains("..") || name.startsWith("/") || name.startsWith("\\")) continue;
+                if (written.contains(name)) continue;
+                // Skip library classes
+                if (name.endsWith(".class")) {
+                    String underscore = name.replace('/', '_').replace('\\', '_');
+                    if (isLibraryClass(underscore)) {
+                        skipped++;
+                        continue;
+                    }
+                }
+                written.add(name);
+                ZipEntry newEntry = new ZipEntry(name);
+                jos.putNextEntry(newEntry);
+                if (!entry.isDirectory() || entry.getSize() > 0) {
+                    try (InputStream is = zf.getInputStream(entry)) {
+                        is.transferTo(jos);
+                    }
+                }
+                jos.closeEntry();
+                if (name.endsWith(".class")) kept++;
+            }
+        }
+        if (skipped > 0)
+            clog("  Stripped " + skipped + " library class(es), kept " + kept + " for analysis");
+        return stripped;
+    }
+
     static Path repackageCleanJar(String jarPath, Path tempDir) throws Exception {
         Path cleanJar = tempDir.resolve("clean.jar");
         try (ZipFile zf = new ZipFile(jarPath);
@@ -3288,7 +3529,9 @@ public class JarAnalyzer {
         if (vineflower != null) {
             try {
                 step("  Trying Vineflower...");
-                Process p = new ProcessBuilder("java", "-jar", vineflower, "-ren=1", jarPath, sourceDir.toString())
+                Process p = new ProcessBuilder("java", "-Xmx512m", "-jar", vineflower,
+                        "-ren=1", "-thr=0", "-dgs=1", "-lit=1",
+                        jarPath, sourceDir.toString())
                     .redirectErrorStream(true).start();
                 p.getInputStream().transferTo(OutputStream.nullOutputStream());
                 boolean done = p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS);
@@ -4732,6 +4975,17 @@ public class JarAnalyzer {
                     ok("Main-Class: " + mainClass);
                     ilog("  Main-Class: " + mainClass);
                 }
+                // Check for Java agent attributes (Premain-Class, Agent-Class)
+                String premainClass = mf.getMainAttributes().getValue("Premain-Class");
+                if (premainClass != null) {
+                    warn("Java agent: Premain-Class found (" + premainClass + ")");
+                    ilog("  Premain-Class: " + premainClass);
+                }
+                String agentClass = mf.getMainAttributes().getValue("Agent-Class");
+                if (agentClass != null) {
+                    warn("Java agent: Agent-Class found (" + agentClass + ")");
+                    ilog("  Agent-Class: " + agentClass);
+                }
             }
         } catch (Exception e) { ilog("  MANIFEST.MF: (error: " + e.getMessage() + ")"); }
 
@@ -4793,6 +5047,58 @@ public class JarAnalyzer {
         if (!suspiciousResources.isEmpty()) {
             for (String r : suspiciousResources) warn("Suspicious resource: " + r);
         }
+
+        // 3b. JNIC blob detection — check binary resources for JNIC native obfuscation
+        try (ZipFile zf2 = new ZipFile(jarPath)) {
+            var entries2 = zf2.entries();
+            while (entries2.hasMoreElements()) {
+                ZipEntry e = entries2.nextElement();
+                String name = e.getName().toLowerCase();
+                if (e.isDirectory() || e.getSize() <= 0) continue;
+                if (name.endsWith(".bin") || name.endsWith(".dat")) {
+                    try (InputStream is = zf2.getInputStream(e)) {
+                        byte[] header = new byte[(int)Math.min(e.getSize(), 64)];
+                        int read = is.read(header);
+                        if (read >= 4) {
+                            // Check for "JNIC" string in first 64 bytes
+                            String headerStr = new String(header, 0, read, StandardCharsets.US_ASCII);
+                            boolean hasJnic = headerStr.contains("JNIC");
+                            // Check for CAFEBABE at non-standard offset (offset > 0)
+                            boolean hasCafeBabe = false;
+                            for (int off = 4; off < read - 3; off++) {
+                                if ((header[off] & 0xFF) == 0xCA && (header[off+1] & 0xFF) == 0xFE
+                                    && (header[off+2] & 0xFF) == 0xBA && (header[off+3] & 0xFF) == 0xBE) {
+                                    hasCafeBabe = true;
+                                    break;
+                                }
+                            }
+                            if (hasJnic || hasCafeBabe) {
+                                String msg = "JNIC native obfuscation blob detected (" + e.getSize() + " bytes): " + e.getName();
+                                warn(msg);
+                                ilog("  [JNIC] " + msg);
+                            }
+                        }
+                    } catch (Exception ignored) {}
+                }
+            }
+        } catch (Exception ignored) {}
+
+        // 3c. META-INF/services/ detection (ServiceLoader exploitation)
+        try (ZipFile zf3 = new ZipFile(jarPath)) {
+            var entries3 = zf3.entries();
+            boolean hasServices = false;
+            while (entries3.hasMoreElements()) {
+                ZipEntry e = entries3.nextElement();
+                if (e.getName().startsWith("META-INF/services/") && !e.isDirectory()) {
+                    hasServices = true;
+                    break;
+                }
+            }
+            if (hasServices) {
+                warn("META-INF/services/ entries found (potential ServiceLoader exploitation)");
+                ilog("  [SERVICES] META-INF/services/ entries detected");
+            }
+        } catch (Exception ignored) {}
 
         // 4. Java class file version detection (compile target)
         for (Map.Entry<String, byte[]> e : classes.entrySet()) {
@@ -4910,6 +5216,36 @@ public class JarAnalyzer {
                     warn("  " + s);
             }
         }
+
+        // 6b. Collect constant pool URLs and domains as pipeline IOCs
+        // These are stored as static fields on the metadata extraction pass so variant analyzers can use them
+        cpUrlsCollected.clear();
+        cpDomainsCollected.clear();
+        for (String s : interestingStrings) {
+            if (s.startsWith("[URL] ")) {
+                String url = s.substring(6).trim();
+                cpUrlsCollected.add(url);
+            }
+        }
+        // Extract domains from constant pool strings
+        for (String s : constantPoolStrings) {
+            if (domainPat.matcher(s).matches() && s.contains(".") && !s.contains("/")
+                && !s.endsWith(".class") && !s.endsWith(".java") && !s.endsWith(".json")
+                && !s.endsWith(".xml") && !s.endsWith(".yml") && !s.endsWith(".properties")
+                && s.length() <= 80) {
+                // Skip common Java/library package-like strings
+                if (!s.startsWith("java.") && !s.startsWith("javax.") && !s.startsWith("com.google.")
+                    && !s.startsWith("org.apache.") && !s.startsWith("com.sun.")
+                    && !s.startsWith("sun.") && !s.startsWith("com.fasterxml.")
+                    && !s.startsWith("org.slf4j.") && !s.startsWith("io.netty.")) {
+                    cpDomainsCollected.add(s);
+                }
+            }
+        }
+        if (!cpUrlsCollected.isEmpty())
+            ilog("  [CP-PIPELINE] Collected " + cpUrlsCollected.size() + " URL(s) from constant pool");
+        if (!cpDomainsCollected.isEmpty())
+            ilog("  [CP-PIPELINE] Collected " + cpDomainsCollected.size() + " domain pattern(s) from constant pool");
 
         // 7. Dangerous API import analysis
         Map<String, String> dangerousApis = new LinkedHashMap<>();
