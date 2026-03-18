@@ -6,7 +6,7 @@
 rule Weedhack_Dropper
 {
     meta:
-        description = "Weedhack/Majanito dropper - EtherHiding C2 resolution"
+        description = "Weedhack dropper - EtherHiding C2 resolution via Ethereum blockchain"
         author = "RatScanner"
         severity = "critical"
 
@@ -139,18 +139,19 @@ rule Suspicious_Minecraft_Mod
 rule Ethereum_Contract_C2
 {
     meta:
-        description = "EtherHiding - Ethereum smart contract used for C2"
+        description = "EtherHiding - Ethereum/Polygon smart contract used for C2"
         author = "RatScanner"
         severity = "critical"
 
     strings:
-        $known_contract = "0x1280a841Fbc1F883365d3C83122260E0b2995B74" ascii nocase
+        $known_contract_eth = "0x1280a841Fbc1F883365d3C83122260E0b2995B74" ascii nocase
+        $known_contract_poly = "0x9c0a507300fd902787bb193d80fca5ce6e1bff9a" ascii nocase
         $eth_call = "eth_call" ascii
         $jsonrpc = "jsonrpc" ascii
         $eth_method = "0xce6d41de" ascii
 
     condition:
-        $known_contract or ($eth_call and $jsonrpc and $eth_method)
+        any of ($known_contract*) or ($eth_call and $jsonrpc and $eth_method)
 }
 
 rule Known_Malicious_Domains
@@ -413,4 +414,53 @@ rule JVMTI_Agent_Injection
 
     condition:
         ($attach or $attach2) and ($agent_load or $agent_path) and $instrumentation
+}
+
+rule Silent_NET_Stealer
+{
+    meta:
+        description = "Silent NET - Minecraft session stealer with Polygon blockchain C2"
+        author = "RatScanner"
+        severity = "critical"
+
+    strings:
+        $pkg1 = "com/libmod" ascii
+        $pkg2 = "com.libmod" ascii
+        $opaque1 = "ktfdumxluduvzmma" ascii
+        $opaque2 = "azmssbnclpvvzpam" ascii
+        $opaque3 = "bzwkkgywwylfhgzl" ascii
+        $opaque4 = "xnhyeinlaaoruzua" ascii
+        $sltnnt = "sltnnt.ru" ascii
+        $contract = "0x9c0a5073" ascii nocase
+        $prefireMc = "prefireMc" ascii
+        $langdat = "lang.dat" ascii
+        $libmod_id = "\"id\": \"libmod\"" ascii
+
+    condition:
+        uint16(0) == 0x4B50 and (
+            (any of ($pkg*) and any of ($opaque*))
+            or $sltnnt
+            or $contract
+            or (any of ($pkg*) and $prefireMc)
+            or (any of ($pkg*) and $langdat and $libmod_id)
+        )
+}
+
+rule Polygon_Contract_C2
+{
+    meta:
+        description = "Polygon blockchain smart contract used for C2 resolution"
+        author = "RatScanner"
+        severity = "critical"
+
+    strings:
+        $known_contract = "0x9c0a507300fd902787bb193d80fca5ce6e1bff9a" ascii nocase
+        $polygon_rpc1 = "polygon-rpc.com" ascii
+        $polygon_rpc2 = "polygon-bor-rpc.publicnode.com" ascii
+        $polygon_rpc3 = "1rpc.io/matic" ascii
+        $eth_call = "eth_call" ascii
+        $eth_method = "0xce6d41de" ascii
+
+    condition:
+        $known_contract or ($eth_call and $eth_method and any of ($polygon_rpc*))
 }

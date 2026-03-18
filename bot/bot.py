@@ -2205,9 +2205,9 @@ def compute_hashes(filepath: str) -> dict:
 DETECTION_THRESHOLD = 25
 
 HIGH_RISK_VARIANTS = {
-    "adamrat", "majanito_dropper", "session_harvester", "vape_curium",
+    "adamrat", "weedhack", "session_harvester", "vape_curium",
     "mshta_dropper", "fractureiser", "skyrage", "comet", "ectasy",
-    "mclauncher_loader",
+    "mclauncher_loader", "silent_net",
 }
 
 
@@ -2235,10 +2235,12 @@ def compute_risk_score(
         elif variant and variant != "unknown":
             score += 25
 
-        if iocs.get("c2Base") or iocs.get("ethContract"):
+        if iocs.get("c2Base") or iocs.get("ethContract") or iocs.get("contracts"):
             score += 15
         if iocs.get("exfilUrl") or iocs.get("stage2Url"):
             score += 5
+        if iocs.get("urls") and len(iocs["urls"]) > 3:
+            score += 10
 
         webhook_keys = [k for k in iocs if "webhook" in k.lower() and iocs[k]]
         if webhook_keys:
@@ -2389,6 +2391,12 @@ def compute_risk_score(
                 score += 15
             score += min(len(format_analysis.get("warnings", [])) * 5, 15)
 
+    # Minimum score floor for known high-risk variants
+    if iocs:
+        variant = (iocs.get("variant") or "").lower()
+        if variant in HIGH_RISK_VARIANTS and score < 61:
+            score = 61
+
     score = min(score, 100)
 
     if score <= DETECTION_THRESHOLD:
@@ -2504,10 +2512,10 @@ def _safe_add_field(embed: discord.Embed, budget: list, **kwargs):
 # ── Variant descriptions in plain language ──
 _VARIANT_DESCRIPTIONS = {
     "adamrat": "AdamRAT (a Minecraft account stealer that sends your login info to the attacker via Discord webhook)",
-    "majanito_dropper": "Majanito Dropper (downloads and runs a second malicious file using the Ethereum blockchain to hide the download link)",
+    "weedhack": "Weedhack (downloads and runs a second malicious file using the Ethereum blockchain to hide the download link)",
     "session_harvester": "Session Harvester (steals your Minecraft login session so someone else can log in as you)",
     "vape_curium": "Vape Curium (a RAT that can control your computer remotely, download more malware, and spread to friends)",
-    "donut_dupe": "DonutDupe (uses blockchain technology to hide its connection to the attacker's server)",
+    "silent_net": "Silent NET (steals Minecraft sessions using Polygon blockchain smart contracts to dynamically resolve its C2 server)",
     "mshta_dropper": "MSHTA Dropper (uses a Windows trick called MSHTA to run hidden malicious scripts)",
     "fractureiser": "Fractureiser (a very dangerous virus that spreads through Minecraft mods and steals passwords, tokens, and crypto wallets)",
     "skyrage": "SkyRage (steals your Discord token, browser passwords, and Minecraft account, and hides itself as a Windows service)",
@@ -2557,7 +2565,7 @@ def _build_plain_summary(score, level, variant, iocs, vt, yara_matches,
     if extracted_strings and extracted_strings.get("discord_webhooks"):
         findings.append("it contains a Discord webhook URL (often used to send stolen data to attackers)")
     if iocs:
-        if iocs.get("c2Base") or iocs.get("ethContract"):
+        if iocs.get("c2Base") or iocs.get("ethContract") or iocs.get("contracts"):
             findings.append("it connects to a known attacker-controlled server")
     if findings:
         lines.append("**Key findings:** " + "; ".join(findings) + ".")
@@ -2717,6 +2725,9 @@ def build_embeds(
             c2_parts.append(f"**C2 Base:** `{iocs['c2Base']}`")
         if iocs.get("ethContract"):
             c2_parts.append(f"**ETH Contract:** `{iocs['ethContract']}`")
+        if iocs.get("contracts"):
+            for c in iocs["contracts"]:
+                c2_parts.append(f"**Contract:** `{c}`")
         if iocs.get("exfilUrl"):
             c2_parts.append(f"**Exfil:** `{iocs['exfilUrl']}`")
         if iocs.get("stage2Url"):
@@ -2726,8 +2737,8 @@ def build_embeds(
         if c2_parts:
             e.add_field(name="\U0001F310 C2 Infrastructure", value=_trunc("\n".join(c2_parts)), inline=False)
 
-    # Extracted IDs — Weedhack/Majanito campaign + operator routing IDs
-    if iocs and iocs.get("variant") == "majanito_dropper" and iocs.get("campaignId"):
+    # Extracted IDs — Weedhack campaign + operator routing IDs
+    if iocs and iocs.get("variant") == "weedhack" and iocs.get("campaignId"):
         campaign_uuid = iocs["campaignId"]
         # In Weedhack, the campaign UUID doubles as the operator userId on the C2 platform
         # It's sent as "minecraftInfo" in direct exfil and "userId" in Stage 2 context
@@ -3508,6 +3519,12 @@ def write_full_report(log_dir: str, **kwargs):
             for key, label in c2_fields:
                 if iocs.get(key):
                     c2_lines.append(f"  {label:16s}: {iocs[key]}")
+            # Silent NET / generic contract array support
+            if iocs.get("contracts"):
+                for c in iocs["contracts"]:
+                    c2_lines.append(f"  {'Contract':16s}: {c}")
+            if iocs.get("buyerUUID"):
+                c2_lines.append(f"  {'Buyer UUID':16s}: {iocs['buyerUUID']}")
             if c2_lines:
                 lines.append("── C2 INFRASTRUCTURE ──")
                 lines.extend(c2_lines)

@@ -56,10 +56,10 @@ public class JarAnalyzer {
     // ── Variant enum ───────────────────────────────────────────────
     enum Variant {
         ADAMRAT,            // com.example + vubsyodfkejzllnk + XOR/AES + Discord webhook
-        MAJANITO_DROPPER,   // com.example + FabricAdapter + Ethereum C2
+        WEEDHACK,           // com.example + FabricAdapter + Ethereum C2
         SESSION_HARVESTER,  // dev.majanito + LoginScreen/APIUtils — Minecraft token harvester
         VAPE_CURIUM,        // Multi-class XOR, stage2 download, worm spreading
-        DONUT_DUPE,         // com.libmod, Polygon blockchain C2, per-class XOR+UTF16
+        SILENT_NET,         // com.libmod, Polygon blockchain C2, per-class XOR+UTF16
         MSHTA_DROPPER,      // mshta command execution dropper
         FRACTUREISER,       // Multi-stage infector: URLClassLoader + IP, dev.neko, .ref, lib.jar
         SKYRAGE,            // SkyRage token stealer: skyrage.de, discord_rpc.dll
@@ -104,7 +104,7 @@ public class JarAnalyzer {
     // ── Runtime config (loaded from config.properties, with defaults) ──
     static final java.util.Properties CFG = new java.util.Properties();
     static {
-        // Dropper / Majanito defaults
+        // Dropper / Weedhack defaults
         CFG.setProperty("dropper.eth.contract",  "0x1280a841Fbc1F883365d3C83122260E0b2995B74");
         CFG.setProperty("dropper.eth.method",    "0xce6d41de");
         CFG.setProperty("dropper.exfil.path",    "/api/delivery/handler");
@@ -130,19 +130,19 @@ public class JarAnalyzer {
         // Variant classification hints (pipe-separated)
         CFG.setProperty("session.harvester.packages", "dev_majanito|dev/majanito");
         CFG.setProperty("session.harvester.classes",  "SessionIDLogin|LoginScreen|APIUtils");
-        CFG.setProperty("majanito.dropper.classes",   "FabricAdapter");
-        CFG.setProperty("majanito.dropper.helpers",   "Helper_class|Helper.class");
-        CFG.setProperty("majanito.dropper.zipentry",  "fabric.api.json");
-        CFG.setProperty("majanito.dropper.rawstrings","eth_call|initializeWeedhack|dev.majanito");
+        CFG.setProperty("weedhack.dropper.classes",   "FabricAdapter");
+        CFG.setProperty("weedhack.dropper.helpers",   "Helper_class|Helper.class");
+        CFG.setProperty("weedhack.dropper.zipentry",  "fabric.api.json");
+        CFG.setProperty("weedhack.dropper.rawstrings","eth_call|initializeWeedhack|dev.majanito");
         CFG.setProperty("adamrat.obf.classes",        "vubsyodfkejzllnk|upokyqklsolkxbys");
         CFG.setProperty("adamrat.client.class",       "ExampleModClient");
         CFG.setProperty("adamrat.inner.classes",      "$xyz123|$abc456|$c0nfig|$aPconf");
         CFG.setProperty("adamrat.obf.signatures",     "pynvtoxahbmzany|feghssgcoq|upokyqklsolkxbys");
 
-        // DONUT_DUPE detection
-        CFG.setProperty("donut.dupe.packages", "com_libmod|com/libmod");
-        CFG.setProperty("donut.dupe.classes", "Libmod");
-        CFG.setProperty("donut.dupe.rawstrings", "polygon-rpc.com|epqfgikdhiuzuybl|cwmhwqsenglvcost|glcqksioqxlglmmb");
+        // SILENT_NET detection
+        CFG.setProperty("silent.net.packages", "com_libmod|com/libmod");
+        CFG.setProperty("silent.net.classes", "Libmod");
+        CFG.setProperty("silent.net.rawstrings", "polygon-rpc.com|epqfgikdhiuzuybl|cwmhwqsenglvcost|glcqksioqxlglmmb|ktfdumxluduvzmma|azmssbnclpvvzpam|bzwkkgywwylfhgzl|xnhyeinlaaoruzua|sltnnt.ru|prefireMc|ukaduutk.bin");
 
         // VAPE_CURIUM detection
         // NetworkManager removed — too common in legitimate mods (every Fabric/Forge networking mod has one)
@@ -183,11 +183,14 @@ public class JarAnalyzer {
         CFG.setProperty("mclauncher.packages", "me/mclauncher|me\\mclauncher|dev/jnic|dev\\jnic");
         CFG.setProperty("mclauncher.classes", "IMCL|MEntrypoint|LoaderClient|StagingHelper|JNICLoader|$jnicLoader");
 
-        // Polygon RPC endpoints for DONUT_DUPE
-        CFG.setProperty("donut.polygon.rpcs",
+        // Polygon RPC endpoints for SILENT_NET
+        CFG.setProperty("silent.net.polygon.rpcs",
             "https://polygon-rpc.com|https://rpc.ankr.com/polygon|" +
             "https://polygon-bor-rpc.publicnode.com|https://1rpc.io/matic|" +
-            "https://polygon-mainnet.rpcfast.com|https://polygon.llamarpc.com");
+            "https://polygon-mainnet.rpcfast.com|https://polygon.llamarpc.com|" +
+            "https://rpc-mainnet.matic.quiknode.pro|https://polygon-public.nodies.app|" +
+            "https://api.zan.top/polygon-mainnet|https://polygon.rpc.subquery.network/public|" +
+            "https://endpoints.omniatech.io/v1/matic/mainnet/public");
 
         // Casino cheat class hints (pipe-separated)
         CFG.setProperty("casino.class.hints", "LegitRigController|PaperGameDispenser|aseity|optimization_rig");
@@ -208,18 +211,18 @@ public class JarAnalyzer {
             "whnewreceive.ru=Known malicious domain (whnewreceive.ru)|" +
             "whereceiver.ru=Known malicious domain (whereceiver.ru)|" +
             "weedhack=Known malicious infrastructure (weedhack)|" +
-            "initializeWeedhack=Majanito Stage 2 invocation|" +
+            "initializeWeedhack=Weedhack Stage 2 invocation|" +
             "initializeWeedhack2=Weedhack Stage 2 alternate entry|" +
             "eth_call=Ethereum RPC call (EtherHiding C2)|" +
-            "FabricAdapter=Majanito dropper component|" +
+            "FabricAdapter=Weedhack dropper component|" +
             "launcher_accounts=Reads launcher_accounts.json — contains Minecraft session tokens|" +
             "LegitRigController=Casino rig cheat module|" +
             "writeDigitValue=Item NBT manipulation (casino cheating)|" +
             "polygon-rpc.com=Polygon blockchain RPC (EtherHiding C2)|" +
             "boobility.online=Known C2 domain (Vape Curium)|" +
             "curium.cfg=Curium malware config|" +
-            "com.libmod=DonutDupe malware package|" +
-            "sltnnt.ru=Known C2 domain (DonutDupe)|" +
+            "com.libmod=Silent NET malware package|" +
+            "sltnnt.ru=Known C2 domain (Silent NET)|" +
             "api.donutsmp.net=Known C2 domain (DonutSMP/ADAMRAT)|" +
             "feathermc.com=Known infrastructure (FeatherMC decoy)|" +
             "owouwu.tk=Known C2 domain (WeirdUtils)|" +
@@ -277,8 +280,8 @@ public class JarAnalyzer {
             "adamrat.shop=Known C2 domain in class data (adamrat.shop)|" +
             "whnewreceive=Known C2 domain in class data (whnewreceive.ru)|" +
             "0x1280a841=Known Ethereum contract address|" +
-            "dev.majanito=Majanito author namespace in class data|" +
-            "0x9c0a5073=Known Polygon contract address (DonutDupe)|" +
+            "dev.majanito=Weedhack author namespace in class data|" +
+            "0x9c0a5073=Known Polygon contract address (Silent NET)|" +
             "donutsmp=DonutSMP infrastructure reference|" +
             "api.donutsmp.net=DonutSMP C2 API|" +
             "feathermc.com=FeatherMC decoy infrastructure|" +
@@ -317,7 +320,7 @@ public class JarAnalyzer {
     static final Map<String, String> CAMPAIGN_MAP = new LinkedHashMap<>();
     static {
         CAMPAIGN_MAP.put("bfe0b88a-d6a9-4a9f-8c66-753bee597522", "Adam Rat Builder");
-        CAMPAIGN_MAP.put("d19c1853-bd55-4638-b85c-68d0e39e5b24", "CasinoRig/DonutDupe/Radium batch");
+        CAMPAIGN_MAP.put("d19c1853-bd55-4638-b85c-68d0e39e5b24", "CasinoRig/SilentNET/Radium batch");
         CAMPAIGN_MAP.put("4f106cc1-3592-473f-80f7-812be70fc112", "weedhack.to distribution");
     }
 
@@ -868,9 +871,20 @@ public class JarAnalyzer {
             for (String m : markers) warn("  " + m);
         }
 
+        // Check for decompilation failures — indicates advanced obfuscation
+        long failedDecompiles = countFailedDecompiles(sourceDir);
+        long totalJavaFiles = countJavaFiles(sourceDir);
+        if (failedDecompiles > 0 && totalJavaFiles > 0) {
+            int failPct = (int)(failedDecompiles * 100 / totalJavaFiles);
+            String failMsg = "Decompilation failure: " + failedDecompiles + "/" + totalJavaFiles
+                + " files (" + failPct + "%) — indicates advanced obfuscation";
+            markers.add(failMsg);
+            warn("  " + failMsg);
+        }
+
         // ── Dispatch to variant-specific analyzer ────────────────────
         switch (variant) {
-            case MAJANITO_DROPPER:
+            case WEEDHACK:
                 analyzeDropper(jarPath, jarSha256, src, classes, markers, ts, hasCasinoClasses);
                 break;
             case SESSION_HARVESTER:
@@ -882,8 +896,8 @@ public class JarAnalyzer {
             case VAPE_CURIUM:
                 analyzeVapeCurium(jarPath, jarSha256, src, classes, markers, ts, sourceDir);
                 break;
-            case DONUT_DUPE:
-                analyzeDonutDupe(jarPath, jarSha256, src, classes, markers, ts, sourceDir);
+            case SILENT_NET:
+                analyzeSilentNet(jarPath, jarSha256, src, classes, markers, ts, sourceDir);
                 break;
             case MSHTA_DROPPER:
                 analyzeMshtaDropper(jarPath, jarSha256, src, classes, markers, ts);
@@ -974,23 +988,23 @@ public class JarAnalyzer {
         Set<String> names = classes.keySet();
         String namesJoined = String.join("|", names).toLowerCase();
 
-        // Majanito dropper — FabricAdapter + Helper + Ethernet C2
+        // Weedhack dropper — FabricAdapter + Helper + Ethernet C2
         // (checked BEFORE session harvester because both match on dev/majanito)
-        String[] dropperClasses = cfgArr("majanito.dropper.classes");
-        String[] dropperHelpers = cfgArr("majanito.dropper.helpers");
+        String[] dropperClasses = cfgArr("weedhack.dropper.classes");
+        String[] dropperHelpers = cfgArr("weedhack.dropper.helpers");
         boolean hasFabricAdapter = names.stream().anyMatch(n ->
             Arrays.stream(dropperClasses).anyMatch(h -> !h.isEmpty() && n.contains(h)));
         boolean hasHelper = names.stream().anyMatch(n ->
             Arrays.stream(dropperHelpers).anyMatch(h -> !h.isEmpty() && n.endsWith(h)));
         boolean hasFabricApi = false;
-        String zipEntry = cfg("majanito.dropper.zipentry");
+        String zipEntry = cfg("weedhack.dropper.zipentry");
         try (ZipFile zf = new ZipFile(jarPath)) {
             hasFabricApi = !zipEntry.isEmpty() && zf.getEntry(zipEntry) != null;
         } catch (Exception ignored) {}
 
         if (hasFabricAdapter || (hasHelper && hasFabricApi)) {
-            ilog("  → Majanito dropper: FabricAdapter=" + hasFabricAdapter + ", " + zipEntry + "=" + hasFabricApi);
-            return Variant.MAJANITO_DROPPER;
+            ilog("  → Weedhack dropper: FabricAdapter=" + hasFabricAdapter + ", " + zipEntry + "=" + hasFabricApi);
+            return Variant.WEEDHACK;
         }
 
         // Session harvester — MUST match package first, then class names confirm
@@ -1187,27 +1201,27 @@ public class JarAnalyzer {
             }
         }
 
-        // DONUT_DUPE — com.libmod package or Polygon/opaque predicate markers
-        for (String pkg : cfgArr("donut.dupe.packages")) {
+        // SILENT_NET — com.libmod package or Polygon/opaque predicate markers
+        for (String pkg : cfgArr("silent.net.packages")) {
             if (!pkg.isEmpty() && namesJoined.contains(pkg.toLowerCase())) {
-                ilog("  → DonutDupe: package fragment '" + pkg + "' detected");
-                return Variant.DONUT_DUPE;
+                ilog("  → Silent NET: package fragment '" + pkg + "' detected");
+                return Variant.SILENT_NET;
             }
         }
-        for (String cls : cfgArr("donut.dupe.classes")) {
+        for (String cls : cfgArr("silent.net.classes")) {
             for (String n : names) {
                 if (!cls.isEmpty() && n.contains(cls)) {
-                    ilog("  → DonutDupe: class '" + n + "' matched hint '" + cls + "'");
-                    return Variant.DONUT_DUPE;
+                    ilog("  → Silent NET: class '" + n + "' matched hint '" + cls + "'");
+                    return Variant.SILENT_NET;
                 }
             }
         }
         for (byte[] classData : classes.values()) {
             String ascii = new String(classData, StandardCharsets.US_ASCII);
-            for (String sig : cfgArr("donut.dupe.rawstrings")) {
+            for (String sig : cfgArr("silent.net.rawstrings")) {
                 if (!sig.isEmpty() && ascii.contains(sig)) {
-                    ilog("  → DonutDupe (raw sig '" + sig + "' in class data)");
-                    return Variant.DONUT_DUPE;
+                    ilog("  → Silent NET (raw sig '" + sig + "' in class data)");
+                    return Variant.SILENT_NET;
                 }
             }
         }
@@ -1260,19 +1274,19 @@ public class JarAnalyzer {
         }
 
         // Scan raw class bytes for dropper string signatures (from CFG)
-        String[] rawSigs = cfgArr("majanito.dropper.rawstrings");
+        String[] rawSigs = cfgArr("weedhack.dropper.rawstrings");
         for (byte[] classData : classes.values()) {
             String ascii = new String(classData, StandardCharsets.US_ASCII);
             // Also always check for the ETH method selector from CFG
             String ethMethod = cfg("dropper.eth.method");
             if ((!ethMethod.isEmpty() && ascii.contains(ethMethod))) {
-                ilog("  → Majanito dropper (eth method " + ethMethod + " in class data)");
-                return Variant.MAJANITO_DROPPER;
+                ilog("  → Weedhack dropper (eth method " + ethMethod + " in class data)");
+                return Variant.WEEDHACK;
             }
             for (String sig : rawSigs) {
                 if (!sig.isEmpty() && ascii.contains(sig)) {
-                    ilog("  → Majanito dropper (raw sig '" + sig + "' in class data)");
-                    return Variant.MAJANITO_DROPPER;
+                    ilog("  → Weedhack dropper (raw sig '" + sig + "' in class data)");
+                    return Variant.WEEDHACK;
                 }
             }
         }
@@ -1769,13 +1783,13 @@ public class JarAnalyzer {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // MAJANITO DROPPER ANALYSIS
+    // WEEDHACK DROPPER ANALYSIS
     // ─────────────────────────────────────────────────────────────────────
 
     static void analyzeDropper(String jarPath, String jarSha256, String src,
                                 Map<String, byte[]> classes, List<String> markers,
                                 String ts, boolean hasCasino) {
-        step("Analyzing Majanito dropper variant...");
+        step("Analyzing Weedhack dropper variant...");
 
         // Campaign UUID
         String fabricJson  = readFabricApiJson(jarPath);
@@ -1838,9 +1852,9 @@ public class JarAnalyzer {
         // Console output
         System.out.println();
         System.out.println(BOLD + GREEN + "════════════════════════════════════════" + RESET);
-        System.out.println(BOLD + GREEN + "  DROPPER CONFIG (Majanito/Blockchain C2)" + RESET);
+        System.out.println(BOLD + GREEN + "  DROPPER CONFIG (Weedhack/Blockchain C2)" + RESET);
         System.out.println(BOLD + GREEN + "════════════════════════════════════════" + RESET);
-        System.out.println(YELLOW + "  Variant       : Majanito Dropper (Ethereum blockchain C2)" + RESET);
+        System.out.println(YELLOW + "  Variant       : Weedhack (Ethereum blockchain C2)" + RESET);
         System.out.println(YELLOW + "  Sub-type      : " + (hasCasino ? "CASINO_BUNDLED" : "standard") + RESET);
         System.out.println(YELLOW + "  Campaign UUID : " + (campaignId != null ? campaignId : "unknown") + RESET);
         System.out.println(YELLOW + "  Campaign Name : " + campaignName + RESET);
@@ -1871,7 +1885,7 @@ public class JarAnalyzer {
 
     static void analyzeSessionHarvester(String jarPath, String jarSha256, String src,
                                          Map<String, byte[]> classes, List<String> markers, String ts) {
-        step("Analyzing Majanito Session Harvester...");
+        step("Analyzing Weedhack Session Harvester...");
 
         // Extract API endpoints from decompiled source
         List<String> apiEndpoints = new ArrayList<>();
@@ -1901,7 +1915,7 @@ public class JarAnalyzer {
         System.out.println(BOLD + GREEN + "════════════════════════════════════════" + RESET);
         System.out.println(BOLD + GREEN + "  SESSION HARVESTER (dev.majanito)" + RESET);
         System.out.println(BOLD + GREEN + "════════════════════════════════════════" + RESET);
-        System.out.println(YELLOW + "  Variant         : Majanito Session Token Harvester" + RESET);
+        System.out.println(YELLOW + "  Variant         : Weedhack Session Token Harvester" + RESET);
         System.out.println(YELLOW + "  Package         : dev.majanito" + RESET);
         System.out.println(YELLOW + "  LoginScreen     : " + hasLoginScreen + " (presents fake login UI to collect token)" + RESET);
         System.out.println(YELLOW + "  validateSession : " + canValidate   + " (verifies stolen token against Minecraft API)" + RESET);
@@ -1916,7 +1930,7 @@ public class JarAnalyzer {
 
         // Config log
         String line = "=".repeat(50);
-        clog(line); clog("  Session Harvester — Majanito"); clog("  " + ts); clog(line); clog("");
+        clog(line); clog("  Session Harvester — Weedhack"); clog("  " + ts); clog(line); clog("");
         clog("Sample          : " + jarPath);
         clog("SHA-256         : " + jarSha256);
         clog("Variant         : Session Token Harvester (dev.majanito)");
@@ -2116,10 +2130,10 @@ public class JarAnalyzer {
                                        String execEnv, boolean hasCasino,
                                        String ts, List<String> markers) {
         String line = "=".repeat(50);
-        clog(line); clog("  Decrypted Config — Majanito Dropper Variant"); clog("  " + ts); clog(line); clog("");
+        clog(line); clog("  Decrypted Config — Weedhack Dropper Variant"); clog("  " + ts); clog(line); clog("");
         clog("Sample        : " + jarPath);
         clog("SHA-256       : " + sha256);
-        clog("Variant       : Majanito Dropper (Ethereum blockchain C2)");
+        clog("Variant       : Weedhack (Ethereum blockchain C2)");
         clog("Sub-type      : " + (hasCasino ? "CASINO_BUNDLED (contains casino cheat rig)" : "standard"));
         clog("");
         clog("-- CAMPAIGN INFO --------------------------------------------");
@@ -2187,7 +2201,7 @@ public class JarAnalyzer {
             sb.append("  \"sha256\": \"").append(escJson(sha256)).append("\",\n");
             sb.append("  \"file\": \"").append(escJson(java.nio.file.Paths.get(jarPath).getFileName().toString())).append("\",\n");
             sb.append("  \"analyzed\": \"").append(escJson(java.time.Instant.now().toString())).append("\",\n");
-            sb.append("  \"variant\": \"majanito_dropper\",\n");
+            sb.append("  \"variant\": \"weedhack\",\n");
             sb.append("  \"subtype\": \"").append(hasCasino ? "casino_bundled" : "standard").append("\",\n");
             sb.append("  \"campaignId\": \"").append(escJson(campaignId != null ? campaignId : "")).append("\",\n");
             sb.append("  \"campaignName\": \"").append(escJson(campaignId != null ? CAMPAIGN_MAP.getOrDefault(campaignId, "Unknown") : "Unknown")).append("\",\n");
@@ -3514,14 +3528,14 @@ public class JarAnalyzer {
         System.out.println(GREEN  + "════════════════════════════════════════" + RESET);
     }
 
-    /** Analyze DONUT_DUPE variant — Polygon blockchain C2, per-class XOR */
-    static void analyzeDonutDupe(String jarPath, String jarSha256, String src,
+    /** Analyze SILENT_NET variant — Polygon blockchain C2, per-class XOR */
+    static void analyzeSilentNet(String jarPath, String jarSha256, String src,
                                   Map<String, byte[]> classes, List<String> markers,
                                   String ts, Path sourceDir) throws Exception {
         clog("═══════════════════════════════════════════════════════");
-        clog("DONUT DUPE ANALYSIS");
+        clog("SILENT NET ANALYSIS");
         clog("═══════════════════════════════════════════════════════");
-        clog("Variant: DONUT_DUPE (Polygon blockchain C2)");
+        clog("Variant: SILENT_NET (Polygon blockchain C2)");
         clog("JAR: " + jarPath);
         clog("SHA-256: " + jarSha256);
         clog("Time: " + ts);
@@ -3531,14 +3545,15 @@ public class JarAnalyzer {
         clog("C2 Method: Queries Polygon smart contract to dynamically resolve C2 domain");
         clog("");
 
-        // Extract per-class XOR key arrays (large byte arrays 80-130 bytes)
-        Pattern keyPat = Pattern.compile("new\\s+byte\\[\\]\\s*\\{([^}]{200,800})\\}");
+        // Extract per-class XOR key arrays (byte arrays 10-130 bytes)
+        // Lowered minimum from 80 to 10 to catch Core.java's 21-byte key (cvfwkoianc)
+        Pattern keyPat = Pattern.compile("new\\s+byte\\[\\]\\s*\\{([^}]{20,800})\\}");
         Matcher km = keyPat.matcher(src);
         List<byte[]> xorKeys = new ArrayList<>();
         while (km.find()) {
             try {
                 String[] parts = km.group(1).split(",");
-                if (parts.length >= 80 && parts.length <= 130) {
+                if (parts.length >= 10 && parts.length <= 130) {
                     byte[] key = new byte[parts.length];
                     for (int i = 0; i < parts.length; i++) key[i] = (byte)Integer.parseInt(parts[i].trim());
                     xorKeys.add(key);
@@ -3548,21 +3563,22 @@ public class JarAnalyzer {
         clog("Found " + xorKeys.size() + " per-class XOR key(s)");
 
         // Extract encrypted byte arrays (smaller, often start with negative values)
-        Pattern encPat = Pattern.compile("new\\s+byte\\[\\]\\s*\\{([^}]{8,600})\\}");
+        Pattern encPat = Pattern.compile("new\\s+byte\\[\\]\\s*\\{([^}]{8,2000})\\}");
         Matcher em = encPat.matcher(src);
         List<byte[]> encArrays = new ArrayList<>();
         while (em.find()) {
             try {
                 String[] parts = em.group(1).split(",");
-                if (parts.length >= 4 && parts.length <= 300) {
+                if (parts.length >= 4 && parts.length <= 500) {
                     byte[] arr = new byte[parts.length];
                     boolean hasNegative = false;
                     for (int i = 0; i < parts.length; i++) {
                         arr[i] = (byte)Integer.parseInt(parts[i].trim());
                         if (arr[i] < 0) hasNegative = true;
                     }
-                    // Encrypted arrays typically start with negative values (BOM artifact)
-                    if (hasNegative && parts.length <= 75) {
+                    // Encrypted arrays typically contain negative values (BOM artifact or signed bytes)
+                    // Raised cap from 75 to 500 to catch long encrypted URLs (RPC endpoints with API keys)
+                    if (hasNegative) {
                         // Skip XOR key arrays (already captured)
                         boolean isKey = false;
                         for (byte[] k : xorKeys) if (Arrays.equals(k, arr)) { isKey = true; break; }
@@ -3573,20 +3589,59 @@ public class JarAnalyzer {
         }
         clog("Found " + encArrays.size() + " encrypted byte array(s)");
 
-        // Try to decrypt using BOM recovery technique
+        // Try to decrypt using BOM recovery technique (Schemes 2/3/4: two-layer XOR)
         List<String> decryptedStrings = new ArrayList<>();
         for (byte[] enc : encArrays) {
+            boolean decrypted = false;
             for (byte[] xorKey : xorKeys) {
                 List<Integer> nCandidates = recoverNFromBOM(enc, xorKey);
                 for (int n : nCandidates) {
-                    String result = donutXorDecrypt(enc, xorKey, n);
+                    String result = silentNetXorDecrypt(enc, xorKey, n);
                     if (result != null && isAsciiPrintable(result) && result.length() >= 2) {
                         decryptedStrings.add(result);
                         clog("  Decrypted (n=" + n + "): " + result);
+                        decrypted = true;
+                    }
+                }
+            }
+            // Fallback: try single-layer XOR (Scheme 1 uses only str(n).getBytes())
+            if (!decrypted && enc.length >= 10) {
+                for (int n = -5000; n <= 5000; n++) {
+                    String result = silentNetSingleXorDecrypt(enc, n);
+                    if (result != null && isAsciiPrintable(result) && result.length() >= 2) {
+                        decryptedStrings.add(result);
+                        clog("  Decrypted single-XOR (n=" + n + "): " + result);
+                        break;
                     }
                 }
             }
         }
+
+        // Fallback: extract constant pool strings from raw class bytes when decompilation fails
+        // These catch strings that decompilers couldn't handle (opaque predicate methods)
+        clog("");
+        clog("──── Constant Pool String Extraction (fallback) ────");
+        int cpStringsFound = 0;
+        for (Map.Entry<String, byte[]> entry : classes.entrySet()) {
+            String className = entry.getKey();
+            byte[] classData = entry.getValue();
+            // Extract UTF8 constant pool entries that look like IOCs
+            String ascii = new String(classData, StandardCharsets.US_ASCII);
+            for (String pattern : new String[]{"polygon", "sltnnt", "prefireMc", "0x9c0a",
+                    "NtProfileIndex", "_bootstrap", "method_1674", "method_1676", "method_44717",
+                    "ktfdumxluduvzmma", "azmssbnclpvvzpam", "bzwkkgywwylfhgzl"}) {
+                if (ascii.contains(pattern)) {
+                    String marker = "Constant pool hit: '" + pattern + "' in " + className;
+                    if (!markers.contains(marker)) {
+                        markers.add(marker);
+                        clog("  [CPSTR] " + marker);
+                        cpStringsFound++;
+                    }
+                }
+            }
+        }
+        if (cpStringsFound > 0) clog("  Found " + cpStringsFound + " constant pool string hit(s)");
+        else clog("  (no additional IOC strings in constant pool)");
 
         // Extract smart contract address from source/decrypted strings
         Pattern contractPat = Pattern.compile("0x[0-9a-fA-F]{40}");
@@ -3598,12 +3653,43 @@ public class JarAnalyzer {
             while (cm2.find()) contracts.add(cm2.group());
         }
 
-        // Extract URLs
+        // Extract URLs from decrypted strings
         List<String> urls = new ArrayList<>();
-        Pattern urlPat = Pattern.compile("https?://[\\w.\\-/]+");
+        Pattern urlPat = Pattern.compile("https?://[\\w.\\-/?=&%+:@]+");
         for (String s : decryptedStrings) {
             Matcher um = urlPat.matcher(s);
             while (um.find()) urls.add(um.group());
+        }
+        // Also extract URLs from decompiled source (catches partially visible URLs)
+        Matcher srcUrlMatcher = urlPat.matcher(src);
+        while (srcUrlMatcher.find()) {
+            String u = srcUrlMatcher.group();
+            if (!urls.contains(u) && !u.contains("minecraft.net") && !u.contains("mojang.com")
+                    && !u.contains("fabricmc.net")) {
+                urls.add(u);
+            }
+        }
+        // Fallback: extract URLs from raw class constant pool bytes
+        for (byte[] classData : classes.values()) {
+            String ascii = new String(classData, StandardCharsets.US_ASCII);
+            Matcher rawUrlMatcher = urlPat.matcher(ascii);
+            while (rawUrlMatcher.find()) {
+                String u = rawUrlMatcher.group();
+                if (!urls.contains(u) && !u.contains("minecraft.net") && !u.contains("mojang.com")
+                        && !u.contains("fabricmc.net") && !u.contains("java.sun.com")) {
+                    urls.add(u);
+                }
+            }
+        }
+
+        // Fallback: extract contract addresses from raw class bytes
+        for (byte[] classData : classes.values()) {
+            String ascii = new String(classData, StandardCharsets.US_ASCII);
+            Matcher rawContractMatcher = contractPat.matcher(ascii);
+            while (rawContractMatcher.find()) {
+                String c = rawContractMatcher.group();
+                if (!contracts.contains(c)) contracts.add(c);
+            }
         }
 
         // Extract buyer UUID from lang.dat
@@ -3638,7 +3724,7 @@ public class JarAnalyzer {
             System.out.println(YELLOW + "  Buyer UUID: " + buyerUUID + RESET);
         }
 
-        writeIOCs(jarPath, jarSha256, "DONUT_DUPE", markers, urls, contracts, buyerUUID, ts);
+        writeIOCs(jarPath, jarSha256, "SILENT_NET", markers, urls, contracts, buyerUUID, ts);
     }
 
     /** Analyze MSHTA_DROPPER variant — mshta command execution */
@@ -3672,7 +3758,7 @@ public class JarAnalyzer {
         }
 
         // Extract any other URLs
-        Pattern urlPat = Pattern.compile("https?://[\\w.\\-/]+");
+        Pattern urlPat = Pattern.compile("https?://[\\w.\\-/?=&%+:@]+");
         Matcher um = urlPat.matcher(src);
         while (um.find()) {
             String u = um.group();
@@ -4220,7 +4306,7 @@ public class JarAnalyzer {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // DONUT_DUPE CRYPTO HELPERS
+    // SILENT_NET CRYPTO HELPERS
     // ─────────────────────────────────────────────────────────────────────
 
     /** Recover possible n values from BOM constraint (UTF-16 decryption) */
@@ -4268,8 +4354,8 @@ public class JarAnalyzer {
         return results;
     }
 
-    /** XOR decrypt for DonutDupe: data ^ keyStr ^ xorKey, result as UTF-16 */
-    static String donutXorDecrypt(byte[] data, byte[] xorKey, int n) {
+    /** XOR decrypt for Silent NET: data ^ keyStr ^ xorKey, result as UTF-16 (Schemes 2/3/4) */
+    static String silentNetXorDecrypt(byte[] data, byte[] xorKey, int n) {
         byte[] copy = data.clone();
         String keyStr = Integer.toString(n);
         byte[] keyBytes = keyStr.getBytes(StandardCharsets.US_ASCII);
@@ -4278,6 +4364,30 @@ public class JarAnalyzer {
             copy[i] = (byte)(copy[i] ^ xorKey[i % xorKey.length]);
         }
         return new String(copy, StandardCharsets.UTF_16);
+    }
+
+    /** Single-layer XOR decrypt for Silent NET Scheme 1: data ^ str(n).getBytes(), result as UTF-16BE */
+    static String silentNetSingleXorDecrypt(byte[] data, int n) {
+        if (data.length < 10) return null;
+        byte[] copy = data.clone();
+        String keyStr = Integer.toString(n);
+        byte[] keyBytes = keyStr.getBytes(StandardCharsets.US_ASCII);
+        for (int i = 0; i < copy.length; i++) {
+            copy[i] = (byte)(copy[i] ^ keyBytes[i % keyBytes.length]);
+        }
+        // Check for UTF-16 BOM (FE FF) after single-layer XOR
+        if (copy.length >= 2 && (copy[0] & 0xFF) == 0xFE && (copy[1] & 0xFF) == 0xFF) {
+            return new String(copy, StandardCharsets.UTF_16);
+        }
+        // Also try UTF-16BE interpretation (no BOM)
+        String result = new String(copy, java.nio.charset.Charset.forName("UTF-16BE"));
+        // Quick validity check: should contain mostly printable chars
+        int printable = 0;
+        for (char c : result.toCharArray()) {
+            if (c >= 0x20 && c < 0x7F) printable++;
+        }
+        if (result.length() > 0 && printable * 100 / result.length() > 80) return result;
+        return null;
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -4297,7 +4407,7 @@ public class JarAnalyzer {
                     importantPatterns.add("vubsyodfkejzllnk"); importantPatterns.add("upokyqklsolkxbys");
                     importantPatterns.add("ExampleModClient"); importantPatterns.add("c0nfig");
                     break;
-                case MAJANITO_DROPPER:
+                case WEEDHACK:
                     mainPatterns.add("FabricAdapter"); mainPatterns.add("Helper");
                     importantPatterns.add("FabricAdapter"); importantPatterns.add("Helper");
                     break;
@@ -4305,7 +4415,7 @@ public class JarAnalyzer {
                     mainPatterns.add("dev/majanito"); mainPatterns.add("dev\\majanito");
                     importantPatterns.add("LoginScreen"); importantPatterns.add("APIUtils");
                     break;
-                case DONUT_DUPE:
+                case SILENT_NET:
                     mainPatterns.add("com/libmod"); mainPatterns.add("com\\libmod");
                     importantPatterns.add("RpcHelper"); importantPatterns.add("Libmod");
                     importantPatterns.add("Main"); importantPatterns.add("Core");
@@ -4410,8 +4520,8 @@ public class JarAnalyzer {
                     w.println("Detection: Identified by obfuscated class names (vubsyodfkejzllnk pattern)");
                     w.println("and ExampleModClient entry point with inner config classes.");
                     break;
-                case MAJANITO_DROPPER:
-                    w.println("This JAR is a MAJANITO DROPPER. It uses Ethereum smart contracts (EtherHiding)");
+                case WEEDHACK:
+                    w.println("This JAR is a WEEDHACK DROPPER. It uses Ethereum smart contracts (EtherHiding)");
                     w.println("to dynamically resolve its C2 domain, downloads a native DLL stage2 payload,");
                     w.println("and invokes it via JNIC (Java Native Interface Compiler).");
                     w.println("Detection: FabricAdapter class + eth_call RPC patterns.");
@@ -4429,8 +4539,8 @@ public class JarAnalyzer {
                     w.println("Detection: TextureAtlasCache/ShaderCompileCache/ChunkMeshPool key classes");
                     w.println("with hex-encoded XOR string encryption.");
                     break;
-                case DONUT_DUPE:
-                    w.println("This JAR is a DONUT DUPE malware sample. It uses BLOCKCHAIN-BASED C2 RESOLUTION");
+                case SILENT_NET:
+                    w.println("This JAR is a SILENT NET malware sample. It uses BLOCKCHAIN-BASED C2 RESOLUTION");
                     w.println("via a Polygon smart contract to dynamically resolve its C2 domain. This makes");
                     w.println("the C2 infrastructure resilient to takedowns since the attacker can update the");
                     w.println("domain by writing to the blockchain.");
