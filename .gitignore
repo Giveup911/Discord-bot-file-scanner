@@ -25,6 +25,10 @@ bot/logs/
 # Uploaded samples
 PUT_JAR_HERE/
 
+# Scraped mods (large, downloaded at runtime)
+scraped_mods/
+bot/scrape_progress.json
+
 # Python
 __pycache__/
 *.pyc

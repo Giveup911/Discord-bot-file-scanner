@@ -5402,6 +5402,154 @@ async def die_command(ctx: discord.ApplicationContext):
     os._exit(0)
 
 
+# ─── /scrapemods command ─────────────────────────────────────────────────────
+
+try:
+    from mod_scraper import ModScrapeRunner
+    SCRAPER_AVAILABLE = True
+except ImportError:
+    SCRAPER_AVAILABLE = False
+
+_scrape_runner: Optional["ModScrapeRunner"] = None
+_scrape_task: Optional[asyncio.Task] = None
+
+
+@bot.slash_command(name="scrapemods", description="Scrape & scan mods from Modrinth/CurseForge/etc (alert IDs only)", **_install_params)
+async def scrapemods_command(
+    ctx: discord.ApplicationContext,
+    action: discord.Option(
+        str,
+        description="start or stop",
+        choices=["start", "stop", "status"],
+        required=True,
+    ),
+):
+    global _scrape_runner, _scrape_task
+
+    alert_ids = _get_alert_user_ids()
+    if ctx.author.id not in alert_ids:
+        return await ctx.respond("You are not authorized to use this command.", ephemeral=True)
+
+    if not SCRAPER_AVAILABLE:
+        return await ctx.respond("Scraper module not available (`mod_scraper.py` missing).", ephemeral=True)
+
+    if action == "stop":
+        if _scrape_runner:
+            _scrape_runner.stop()
+            await ctx.respond("Scraper stopping after current batch finishes...", ephemeral=True)
+        else:
+            await ctx.respond("Scraper is not running.", ephemeral=True)
+        return
+
+    if action == "status":
+        if _scrape_runner and _scrape_task and not _scrape_task.done():
+            s = _scrape_runner.stats
+            total_db = _scrape_runner.progress.total_downloaded
+            await ctx.respond(
+                f"**Scraper running**\n"
+                f"This session: {s['downloaded']} downloaded, {s['scanned']} scanned, "
+                f"{s['skipped']} skipped, {s['oversize']} oversize, {s['errors']} errors\n"
+                f"Total in database: {total_db}",
+                ephemeral=True,
+            )
+        else:
+            await ctx.respond("Scraper is not running.", ephemeral=True)
+        return
+
+    # action == "start"
+    if _scrape_task and not _scrape_task.done():
+        return await ctx.respond("Scraper is already running. Use `/scrapemods stop` first.", ephemeral=True)
+
+    await ctx.respond("Starting mod scraper... will download and scan in batches of 20.", ephemeral=True)
+
+    scraper_cfg = CFG.get("scraper", {})
+    cf_key = scraper_cfg.get("curseforge_api_key", "")
+    nx_key = scraper_cfg.get("nexusmods_api_key", "")
+    batch_size = scraper_cfg.get("batch_size", 20)
+
+    mods_dir = MASTER_DIR / "scraped_mods"
+    mods_dir.mkdir(exist_ok=True)
+    progress_file = BOT_DIR / "scrape_progress.json"
+
+    _scrape_runner = ModScrapeRunner(
+        mods_dir=mods_dir,
+        progress_file=progress_file,
+        cf_api_key=cf_key,
+        nx_api_key=nx_key,
+        batch_size=batch_size,
+    )
+
+    async def _scrape_loop():
+        global _scrape_runner
+        runner = _scrape_runner
+        batch_num = 0
+
+        conn = aiohttp.TCPConnector(limit=20, limit_per_host=5)
+        async with aiohttp.ClientSession(connector=conn) as session:
+            while not runner.stopped:
+                batch_num += 1
+                log.info(f"[scraper] Batch {batch_num}: collecting {runner.batch_size} mods...")
+
+                try:
+                    batch = await runner.collect_batch(session)
+                except Exception as e:
+                    log.exception(f"[scraper] Batch collect error: {e}")
+                    await asyncio.sleep(10)
+                    continue
+
+                if not batch:
+                    log.info("[scraper] No more mods to download. Stopping.")
+                    break
+
+                log.info(f"[scraper] Batch {batch_num}: downloaded {len(batch)} JARs, scanning...")
+
+                # Send status update to channel
+                try:
+                    await ctx.followup.send(
+                        f"**Batch {batch_num}:** Downloaded {len(batch)} mods, scanning...\n"
+                        f"Session totals: {runner.stats['downloaded']} downloaded, "
+                        f"{runner.stats['scanned']} scanned",
+                        ephemeral=True,
+                    )
+                except Exception:
+                    pass
+
+                # Scan each JAR in the batch
+                for jar_path, mod_name, source in batch:
+                    if runner.stopped:
+                        break
+                    try:
+                        scan_id = f"scrape_{uuid.uuid4().hex[:8]}"
+                        log.info(f"[scraper] Scanning: {mod_name} ({jar_path.name})")
+                        await run_scan(
+                            ctx,
+                            attachment=None,
+                            url=None,
+                            scan_id=scan_id,
+                            local_file=str(jar_path),
+                            private=True,  # don't upload scraped mods to VT/MB/HA
+                        )
+                        runner.stats["scanned"] += 1
+                    except Exception as e:
+                        log.warning(f"[scraper] Scan error {mod_name}: {e}")
+
+                log.info(f"[scraper] Batch {batch_num} complete. "
+                         f"Stats: {runner.stats}")
+
+        log.info(f"[scraper] Finished. Final stats: {runner.stats}")
+        try:
+            await ctx.followup.send(
+                f"**Scraper finished.**\n"
+                f"Downloaded: {runner.stats['downloaded']} | Scanned: {runner.stats['scanned']} | "
+                f"Skipped: {runner.stats['skipped']} | Errors: {runner.stats['errors']}",
+                ephemeral=True,
+            )
+        except Exception:
+            pass
+
+    _scrape_task = asyncio.create_task(_scrape_loop())
+
+
 # ─── Scan Runner ─────────────────────────────────────────────────────────────
 
 async def run_scan(

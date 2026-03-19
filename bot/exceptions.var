@@ -15,7 +15,6 @@ d183bacb845167f09264c2f90322b7ecffe8826debda6f60e597889264bef4af  # fabric-api-0
 c621f2b4575edf3eea1e18134dcf6e19bb8d882e471583b891f37609241d03e4  # sodium-extra-fabric-0.6.1+mc1.21.4.jar
 b42fc0424050f076c8e1f77b7549e48ec6e07605fbf868ed5d0ef47848665dd2  # reeses-sodium-options-fabric-1.8.3+mc1.21.4.jar
 6434855916199dadc7ad290e21349264f18a1fbc4072437067914a7899eb10ff  # c2me-fabric-mc1.21.4-0.3.2+alpha.0.30.jar
-94f195819b24e5da64effdc9da15cdd84836cc75e8ff0fd098bab6bc2f49e3fe  # krypton-0.2.8.jar
 d633096f0e702ff3f0b0d4841ece0c1c9a63caf3d585b8623f9f5d9d74502702  # NoChatReports-FABRIC-1.21.4-v2.11.0.jar
 df706a1e5456023566d02874278bff84d7b6c61b01f1e065751dcbcd74b050c2  # YetAnotherConfigLib-3.6.2+1.21.4-fabric.jar
 03a08e558ebb4d89abbed112eef96b9db7e200dbc4491ade2193b84011184ca0  # yet_another_config_lib_v3-3.7.1+1.21.4-fabric.jar
@@ -92,12 +91,22 @@ b02a1e2d2fc33f7911588d9438d829c783a2dcb018203a5542395801f5c017e2  # depth0_lwjgl
 9fa2f372db7e475c41b2a82cd285b7ac765a16398b467d908941b8e427eb29a1  # depth0_lwjgl-stb-3.3.3-natives-windows.jar
 94bbff1f6241522ad37b2a4860d02b1dc7fc25f46e20d2a103b1fc7e6bae596c  # depth0_lwjgl-stb-3.3.3.jar
 
+# ── Borderline mods (manually reviewed, approved 2026-03-19) ──
+24ec919e60d6f0f19dea76711b9512c08b04ddc4d632c66845ab8cfdb0d101f4  # 1trouser-streak-1.4.5-1.21.4.jar
+a9417cc1f77f0435a71a834605c4d5c5ca2f4a02808bdd75fb4f36102c9255b8  # baritone-api.jar
+31727b5a953ff8a20e065703d4a043e5d311639c0d26351924a664fca0de8262  # baritone-standalone-fabric-1.13.1.jar
+44f8759646ade8eb835857e3a0d1ecbc5d150914d0bacac280db2b2a5ee71d05  # capes-1.5.5+1.21.4-fabric.jar
+1fda0c4a89d4f075e51b3eb5570a4912870656d252d806ea3091d2bbc06781ea  # cloth-config-17.0.144-fabric.jar
+cdcb3fc2e4bb98b2ee894bdabe8181c35cfacf0bdb96cfdc78011b8af99c7479  # foamfix-0.6.3-law-1.8.x.jar
+2153771f2b3843a7e1c4d0ad14758a5e5cbda099ffa1f726d6b7bb33dc36c2a6  # lambdynamiclights-4.1.3+1.21.4.jar
+7f6e9152a5083971ce6692799739ad998eefe8b2bfb9e164bc3c6939e8229ff0  # litematica-fabric-1.21.4-0.21.4.jar
+39fec41d682ed5b36ca7a615c6ba29eac5c72db51e7deff1827a05527e56b0bf  # meteor-rejects-addon-0.3.jar
+151259d90cde1c8bef3cdf96b8549c21efeb9b926ddf227ba4d883ff1ca2fdaf  # METHOD.jar
+
 # ── Misc utility mods ──
 a72c9d37310bf9addd819602e07058ef4020f3871164e7322838f6857e960a6e  # AntiP2W-Tools-v2+b13+81710df.jar
-437b0ee057586cb0f6de71f9c7a49289abdd81b18265ec9a8d46e50649eda733  # dupemate-1.0.0.jar
 e5f7f40af419826f68234163993f3983917729ec505cc8d39a0fcb250a8545b9  # dupersunited-public-addon-1.21.11-3.3.7.jar
 2be9dc08fec4183fa56aac7e77d43a638b14739fb7ced4c981251211fba8de96  # telelo-UwU-0.3.17.jar
 4143b4ad74eb37c012af726d55ae37f7e555e999331e3ff308082ee6682c0ef2  # exploit-addon-public-1.21.4-1.0.0.jar
 e7de4240357ebd898ab08883d27ecfb01a430259249c1a576094b33dd9921c29  # vicore-addon-7.1.2-1.21.6.jar
 d63236061e8caa4d138ee3c0ebb9a92ee1d68e3a6fae0aacfe11ce41eafad93b  # Cyemer-Client-Fabric-1.21.1_1.jar
-1335ba10485577a6f3c8b02cd340b630af9c88f2c121952dce44754979c01018  # CakeHaus-protected.jar

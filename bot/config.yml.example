@@ -51,6 +51,12 @@ yara:
   enabled: true
   rules_dir: "rules"
 
+# Mod scraper — mass-download mods from public sources for scanning
+scraper:
+  curseforge_api_key: ""
+  nexusmods_api_key: ""
+  batch_size: 20
+
 # Alert notifications — DM these user IDs when thresholds are hit
 alerts:
   user_ids:
