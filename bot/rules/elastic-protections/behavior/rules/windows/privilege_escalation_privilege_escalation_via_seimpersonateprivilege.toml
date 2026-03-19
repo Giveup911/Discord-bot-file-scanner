@@ -1,0 +1,127 @@
+[rule]
+description = "Identifies a privilege escalation attempt from an account with the SeImpersonatePrivilege to full System privileges."
+id = "e9d6f6a5-c375-4313-b269-1a8d42c64480"
+license = "Elastic License v2"
+name = "Privilege Escalation via SeImpersonatePrivilege"
+os_list = ["windows"]
+reference = [
+    "https://decoder.cloud/2019/12/06/we-thought-they-were-potatoes-but-they-were-beans/",
+    "https://github.com/hackvens/CoercedPotato",
+]
+version = "1.0.23"
+
+query = '''
+sequence with maxspan=3m
+ [process where event.action == "start" and 
+  (user.id : ("S-1-5-17", "S-1-5-19", "S-1-5-20", "S-1-5-32-568") or user.domain : "IIS AppPool") and 
+  not process.executable : 
+                ("?:\\Windows\\Syswow64\\wbem\\wmiprvse.exe", 
+                 "?:\\Windows\\system32\\wbem\\wmiprvse.exe", 
+                 "?:\\WINDOWS\\system32\\svchost.exe",
+                 "?:\\Windows\\System32\\sppsvc.exe",
+                 "C:\\Windows\\System32\\taskhost.exe",
+                 "?:\\Windows\\system32\\printfilterpipelinesvc.exe", 
+                 "?:\\Windows\\syswow64\\printfilterpipelinesvc.exe",
+                 "\\Device\\HarddiskVolume*\\Windows\\System32\\printfilterpipelinesvc.exe", 
+                 "\\Device\\HarddiskVolume*\\Windows\\System32\\wbem\\wmiprvse.exe",
+                 "C:\\Windows\\System32\\Speech_OneCore\\Common\\SpeechModelDownload.exe") and
+  not (process.name : "rundll32.exe" and process.args : "?:\\WINDOWS\\sys*\\davclnt.dll,DavSetCookie") and
+  not (process.executable : "C:\\Windows\\System32\\conhost.exe" and
+       process.parent.executable : ("C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\*\\MpCmdRun.exe",
+                                    "C:\\Program Files\\Windows Defender\\mpcmdrun.exe")) and
+  not (process.parent.executable : "C:\\Program Files\\Windows Defender Advanced Threat Protection\\MsSense.exe" and
+       process.executable : "C:\\Program Files\\Windows Defender Advanced Threat Protection\\Classification\\SenseCE.exe")
+  ] by process.entity_id
+ [process where event.action == "start" and user.id : "S-1-5-18" and 
+  (
+   _arraysearch(process.parent.thread.Ext.call_stack, $entry, $entry.symbol_info : ("*CreateProcessAsUser*", "*CreateProcessWithToken*")) or 
+   
+   process.parent.thread.Ext.call_stack_summary : 
+                    ("ntdll.dll|Unbacked",
+                     "ntdll.dll|kernelbase.dll|Unbacked",
+                     "ntdll.dll|kernelbase.dll|Unknown",
+                     "ntdll.dll|kernelbase.dll|kernel32.dll|Unbacked",
+                     "ntdll.dll|wow64.dll|wow64cpu.dll|wow64.dll|ntdll.dll|kernelbase.dll|Unbacked",
+                     "ntdll.dll|wow64.dll|wow64cpu.dll|wow64.dll|ntdll.dll|kernelbase.dll|Unbacked|kernel32.dll|ntdll.dll") or 
+                     
+   (_arraysearch(process.parent.thread.Ext.call_stack, $entry, $entry.symbol_info : "*KernelBase.dll!CreateProcessInternal*") and 
+    not _arraysearch(process.parent.thread.Ext.call_stack, $entry, 
+                     $entry.symbol_info : ("*kernel32.dll!CreateProcess*", "*CreateProcessAsUser*", "*CreateProcessWithToken*", "*KernelBase.dll!CreateProcessA+*", "KernelBase.dll!CreateProcessW")))
+   ) and
+   not (process.executable : "?:\\Program Files (x86)\\Lenovo\\System Update\\uncsetting.exe" and
+        process.parent.executable : "?:\\Windows\\Microsoft.NET\\Framework64\\*\\csc.exe") and
+   not (process.executable : "C:\\Program Files (x86)\\Google\\GoogleUpdater\\*\\updater.exe" and
+        process.parent.executable == "C:\\Windows\\System32\\appidcertstorecheck.exe") and
+    not (process.executable == "C:\\Program Files (x86)\\Microsoft\\EdgeUpdate\\MicrosoftEdgeUpdate.exe" and
+         process.parent.executable in
+                         ("C:\\Program Files\\Windows Defender\\MpCmdRun.exe",
+                          "C:\\Program Files\\Windows Defender Advanced Threat Protection\\SenseNdr.exe",
+                          "C:\\Program Files\\Windows Defender Advanced Threat Protection\\Classification\\SenseCE.exe")) and
+    not (process.executable : "C:\\Program Files\\Portrait Displays\\HP Display Control Service\\DeviceCheck.exe" and
+         process.parent.executable : "C:\\Windows\\System32\\pacjsworker.exe") and
+
+    not (process.executable : ("C:\\Windows\\Microsoft.NET\\Framework\\*\\csc.exe", "C:\\Windows\\SysWOW64\\cmd.exe") and
+         process.parent.executable : "C:\\Program Files (x86)\\Tanium\\Tanium Client\\TaniumClient.exe") and
+    not process.executable :
+                     ("C:\\Program Files\\HP\\hpssacli\\bin\\hpssacli.exe",
+                      "C:\\Program Files (x86)\\ManageSoft\\Uploader\\ndupload.exe",
+                      "C:\\Program Files (x86)\\Google\\GoogleUpdater\\*\\updater.exe",
+                      "C:\\Program Files\\Npcap\\NPFInstall.exe",
+                      "C:\\Program Files (x86)\\ManageEngine\\UEMS_Agent\\bin\\metroapps.exe",
+                      "C:\\Program Files (x86)\\Google\\Update\\GoogleUpdate.exe",
+                      "C:\\Program Files (x86)\\SolarWinds\\Agent\\Plugins\\ADMProbe\\nping.exe") and
+    process.hash.sha256 != "8ba8760bcb924e1e7943c3008a80006b29737808cc41a93cabcfeaaec9785276" and
+    not process.parent.executable :
+                        ("C:\\Program Files (x86)\\MspPlatform\\PME\\Installers\\RequestHandlerAgentSetup.exe",
+                         "C:\\Program Files\\LANDESK\\Shavlik Protect Agent\\STAgentUpdater.exe",
+                         "C:\\Program Files\\AzureConnectedMachineAgent\\GCArcService\\GC\\gc_worker.exe",
+                         "C:\\Windows\\CCM\\Ccm32BitLauncher.exe") and
+    not (process.code_signature.subject_name in ("Sophos Ltd", "Entrust Datacard Corporation", "Com4Cure GmbH", "Martin Prikryl", "Stellar Cyber Inc", "Nmap Software LLC", "SimpleHelp Ltd") and
+         process.code_signature.trusted == true) and
+    not (process.executable : "C:\\Program Files (x86)\\Microsoft\\EdgeUpdate\\MicrosoftEdgeUpdate.exe" and
+         process.parent.executable : "C:\\Program Files (x86)\\Microsoft\\EdgeUpdate\\MicrosoftEdgeUpdate.exe") and
+    not (process.parent.executable : "C:\\Program Files\\Windows Defender Advanced Threat Protection\\SenseNdr.exe" and
+         process.executable : ("C:\\Windows\\System32\\DriverStore\\FileRepository\\*.exe", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")) and
+    not (process.parent.executable : "C:\\Windows\\Microsoft.NET\\Framework\\*\\ngentask.exe" and
+         process.executable : "C:\\Windows\\Microsoft.NET\\Framework\\*\\ngen.exe") and
+    not (process.parent.executable : "C:\\Windows\\System32\\winlogon.exe" and process.executable : "C:\\Windows\\System32\\LogonUI.exe") and
+    not (process.parent.executable : "C:\\Windows\\System32\\msiexec.exe" and process.executable : "C:\\Windows\\SysWOW64\\msiexec.exe") and
+    not (process.parent.executable : "C:\\Windows\\System32\\SearchIndexer.exe" and process.executable : "C:\\Windows\\System32\\SearchFilterHost.exe") and
+    not (process.executable : "C:\\Windows\\System32\\WerFault.exe" and process.parent.thread.Ext.call_stack_summary == "ntdll.dll|kernelbase.dll|faultrep.dll|wersvc.dll|ntdll.dll|kernel32.dll|ntdll.dll") and
+    not (process.executable : "C:\\Program Files (x86)\\Microsoft\\EdgeUpdate\\Install\\*.tmp\\setup.exe" and
+         process.parent.executable : "C:\\Program Files (x86)\\Microsoft\\EdgeUpdate\\Install\\*.tmp\\setup.exe")
+   ] by process.parent.entity_id
+'''
+
+min_endpoint_version = "8.7.0"
+optional_actions = []
+[[actions]]
+action = "kill_process"
+field = "process.entity_id"
+state = 1
+
+[[threat]]
+framework = "MITRE ATT&CK"
+[[threat.technique]]
+id = "T1134"
+name = "Access Token Manipulation"
+reference = "https://attack.mitre.org/techniques/T1134/"
+[[threat.technique.subtechnique]]
+id = "T1134.001"
+name = "Token Impersonation/Theft"
+reference = "https://attack.mitre.org/techniques/T1134/001/"
+
+[[threat.technique.subtechnique]]
+id = "T1134.002"
+name = "Create Process with Token"
+reference = "https://attack.mitre.org/techniques/T1134/002/"
+
+
+
+[threat.tactic]
+id = "TA0004"
+name = "Privilege Escalation"
+reference = "https://attack.mitre.org/tactics/TA0004/"
+
+[internal]
+min_endpoint_version = "8.7.0"

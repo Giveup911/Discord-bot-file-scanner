@@ -1,0 +1,71 @@
+[rule]
+description = """
+Identifies the load of a library from unusual modules or NTDLL offsets. This may indicate an attempt to bypass API
+monitoring using Return Oriented Programming (ROP) assembly gadgets to execute a syscall instruction.
+"""
+id = "415c647f-ebb1-474d-b621-192d6f64c01d"
+license = "Elastic License v2"
+name = "Potential Library Load via ROP Gadgets"
+os_list = ["windows"]
+version = "1.0.31"
+
+query = '''
+library where process.pid != 4 and
+ process.executable != null and dll.name != null and
+ not startswith~(dll.name, process.name) and not dll.name : "ntdll.dll" and
+ process.thread.Ext.call_stack_summary : ("ntdll.dll|*", "win32u.dll|*") and
+ dll.name : ("ws2_32.dll", "wininet.dll", "winhttp.dll", "amsi.dll",  "ntdll.dll", "dnsapi.dll") and
+ not _arraysearch(process.thread.Ext.call_stack, $entry, 
+                  $entry.symbol_info: ("*ntdll.dll*!Ldr*", "*ntdll.dll!LdrLoadDll*", "*KernelBase.dll*!LoadLibrary*", "*ntdll.dll*!*MapViewOfSection*",
+                                       "*wow64win.dll+0x*", "*ntdll.dll!NtMapViewOfSection*",
+                                       "*\\KernelBase.dll!KernelbasePostInit*", "*\\ntdll.dll!RtlCaptureStackBackTrace*", "*ntdll.dll!NtQueryVirtualMemory*",
+                                       "*ntdll.dll!ZwQueryVirtualMemory*", "*ntdll.dll!ZwMapViewOfSection*", "*ntdll.dll!ZwReadFile*",
+                                      "*ntdll.dll*!*OpenThreadTokenEx*", "*ntdll.dll*!*DeviceIoControlFile*", "*ntdll.dll*!NtOpenProcess*",
+                                      "*ntdll.dll*!*CreateUserProcess*", "*ntdll.dll*!NtTerminateProcess*", "*ntdll.dll*!NtAlpcOpenSenderProcess*",
+                                      "*ntdll.dll*!*ReplyWaitReceivePortEx*", "*ntdll.dll*!NtSetInformationFile*", "*ntdll.dll!ZwSetInformationFile*", "*ntdll.dll!TpAllocPool*",
+                                      "*ntdll.dll!RtlUnhandledExceptionFilter*", "*ntdll.dll*!*AlpcOpenSenderProcess*", "*ntdll.dll!KiUserApcDispatcher*", 
+                                      "*ntdll.dll!TpCallbackIndependent*", "*win32u.dll!NtGdiDdDDIQueryAdapterInfo*", "*ntdll.dll!*DuplicateObject*",
+                                      "*kernel32.dll!CreateThread*", "*KernelBase.dll!CreateRemoteThread*", "*ntdll.dll!*SetInformationWorkerFactory*", "*ntdll.dll!TpReleaseCleanupGroupMembers*",
+                                      "*ntdll.dll!NtReleaseWorkerFactoryWorker+*", "*ntdll.dll!ZwWaitForWorkViaWorkerFactory*",
+                                      "*KernelBase.dll!MapViewOfFileEx*", "*ntdll.dll!NtdllDialogWndProc*", "*ntdll.dll!EtwRegisterSecurityProvider*",
+                                      "*ntdll.dll!NtMapUserPhysicalPagesScatter*", "?:\\Windows\\System32\\cyinjct.dll!CyProcessPreinitThunk*",
+                                      "*\\ntdll.dll!ZwAlpcDeleteSecurityContext*", "*\\ntdll.dll!ZwAccessCheckAndAuditAlarm*",
+                                      "*\\win32u.dll!NtGdiDdDDIQueryAdapterInfo*", "*\\ntdll.dll!NtdllDefWindowProc_W*",
+                                      "C:\\Windows\\System32\\ntdll.dll!TpCallbackMayRunLong*", "C:\\Windows\\System32\\KernelBase.dll!GlobalUnlock+*",
+                                      "C:\\Windows\\System32\\ntdll.dll!NtGetTickCount*", "C:\\Windows\\System32\\ntdll.dll!NtSetDebugFilterState*",
+                                      "C:\\Windows\\System32\\ntdll.dll!NtWaitForDebugEvent*", "C:\\Windows\\System32\\ntdll.dll!RtlEncodeRemotePointer*",
+                                      "C:\\Windows\\System32\\ntdll.dll!SbExecuteProcedure*", "C:\\Windows\\System32\\ntdll.dll!MD4Init*", "*ntdll.dll!*CallbackReturn*",
+                                      "C:\\Windows\\System32\\ntdll.dll!ZwWaitForDebugEvent+*", "*ntdll.dll!RtlReAllocateHeap*", "*ntdll.dll!RtlAllocateHeap*",
+                                      "*ntdll.dll!NtReplyPort*", "*ntdll.dll!ZwCallbackReturn*", "*ntdll.dll!NtCreateWnfStateName*",
+                                      "C:\\Windows\\System32\\ntdll.dll!NtRequestWaitReplyPort*", "C:\\Windows\\System32\\ntdll.dll!NtAlpcImpersonateClientOfPort*",
+                                      "C:\\Windows\\System32\\ntdll.dll!RtlInsertElementGenericTableFullAvl*", "C:\\Windows\\System32\\ntdll.dll!RtlLookupElementGenericTableAvl*",
+                                      "C:\\Windows\\System32\\ntdll.dll!RtlCloneUserProcess*", "*ntdll.dll!RtlSetThreadSubProcessTag*")) and
+ not _arraysearch(process.thread.Ext.call_stack, $entry, $entry.symbol_info : "*ntdll.dll*" and $entry.allocation_private_bytes > 0) and
+ not _arraysearch(process.thread.Ext.call_stack, $entry, $entry.symbol_info : "*ntdll.dll+0x*") and
+ not process.thread.Ext.call_stack_summary like ("ntdll.dll|kernelbase.dll|fastprox.dll|combase.dll|rpcrt4.dll|*",
+                                                 "ntdll.dll|wow64.dll|wow64cpu.dll|wow64.dll|ntdll.dll|kernelbase.dll|fastprox.dll|combase.dll|rpcrt4.dll|combase.dll|wbemprox.dll|wbemdisp.dll|oleaut32.dll|wbemdisp.dll|oleaut32.dll|rpcrt4.dll|combase.dll|oleaut32.dll|combase.dll|user32.dll") and
+ not (process.executable : "C:\\Program Files\\Tenable\\Nessus Agent\\nessus*.exe" and process.code_signature.subject_name == "TENABLE, INC." and process.code_signature.trusted == true)
+'''
+
+min_endpoint_version = "8.8.0"
+optional_actions = []
+[[actions]]
+action = "kill_process"
+field = "process.entity_id"
+state = 0
+
+[[threat]]
+framework = "MITRE ATT&CK"
+[[threat.technique]]
+id = "T1055"
+name = "Process Injection"
+reference = "https://attack.mitre.org/techniques/T1055/"
+
+
+[threat.tactic]
+id = "TA0005"
+name = "Defense Evasion"
+reference = "https://attack.mitre.org/tactics/TA0005/"
+
+[internal]
+min_endpoint_version = "8.8.0"

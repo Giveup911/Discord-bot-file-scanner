@@ -1,0 +1,114 @@
+[rule]
+description = """
+Identifies the execution of Microsoft Office or Adobe Reader to open a potential decoy document from an untrusted parent
+process. An adversary may employ this technique to avoid victim suspicion by displaying a legit document after opening a
+malicious executable or script.
+"""
+id = "5ec7d995-c321-4866-b304-8cc5c4bb6157"
+license = "Elastic License v2"
+name = "Potential Decoy Document via User Execution"
+os_list = ["windows"]
+reference = ["https://www.welivesecurity.com/2022/03/23/mustang-panda-hodur-old-tricks-new-korplug-variant/"]
+version = "1.0.35"
+
+query = '''
+sequence with maxspan=5s
+ [process where event.action == "start" and user.id : ("S-1-5-21*", "S-1-12-*") and
+  (
+    process.parent.name : ("cmd.exe", "wscript.exe", "cscript.exe", "mshta.exe", "powershell.exe") or
+    (process.executable : ("?:\\Users\\*", "?:\\ProgramData\\*") and process.code_signature.trusted != true) or
+    (process.name : "cmd.exe" and process.working_directory : "?:\\" and not process.working_directory : "C:\\") or 
+    (process.name : "cmd.exe" and process.command_line : "*\\Temp\\7ZipSfx*")
+  ) and 
+  not process.executable :
+               ("?:\\Program Files (x86)\\SmartAdvocate\\SADocumentLauncher\\SADocumentLauncher.exe",
+                "C:\\Program Files\\Python*\\python.exe",
+                "C:\\Program Files\\WindowsApps\\PythonSoftwareFoundation.Python.*.exe",
+                "C:\\Program Files (x86)\\Microsoft Office\\root\\Office??\\OUTLOOK.EXE",
+                "C:\\Program Files\\Microsoft Office\\root\\Office??\\OUTLOOK.EXE") and
+  not process.parent.executable : ("\\Device\\Mup\\*",
+                                   "?:\\Program Files\\IBM\\ClientSolutions\\Start_Programs\\Windows_x86-64\\acspcoc.exe",
+                                   "C:\\Windows\\Microsoft.NET\\Framework64\\v*\\dfsvc.exe") and
+  not process.executable : "?:\\Program Files\\Python??\\python.exe" and
+  not (process.name : "rundll32.exe" and process.args : "url.dll,FileProtocolHandler") and
+  not process.hash.sha256 in ("204326fdd6483ebce82c889fce539b1782a645b225c0f2e9fc8d71139546f255",
+                              "da5612f679d98e07d49360989fd6abe7de157e7024d0b9ef0a3de527026baff2",
+                              "e4a98dac4a1df240f71b75dc73ef4a71a27bd83af460cef4136022f66b1f3a4e",
+                              "fe5d6e2fe76c098da524c59108a85afa653a3deee23e487f1ef38985407e0ef5",
+                              "fbd1cb3e91e17c9318b5e9d64b9458bdbc98c7761af9f175a77b1d9163dac7be",
+                              "a58f1415e0fc8560defca9e485b3c90b4d2f69a754adf40b7e565a9b1ba89d8b",
+                              "28ed5f6f1b46d0581941a56e6bf4f5de479eafa92e362ee340b4d9f92ea519b9",
+                              "e4a98dac4a1df240f71b75dc73ef4a71a27bd83af460cef4136022f66b1f3a4e",
+                              "fe5d6e2fe76c098da524c59108a85afa653a3deee23e487f1ef38985407e0ef5") and
+  not (process.parent.name : "cmd.exe" and process.parent.args : ("PDF Viewer", "1>NUL", "C:\\Users\\*\\AppData\\Local\\Temp\\*.pdf")) and
+  not process.args : "C:\\Users\\*\\AppData\\Local\\Temp\\JetB2\\userReports\\*.PDF"
+  ] by process.entity_id
+ [process where event.action == "start" and
+  (
+    /* Word as decoy document */
+  (process.name : "WINWORD.EXE" and
+   process.args : "/n" and process.args : "/o" and process.args : ("?:\\Users\\*", "?:\\ProgramData\\*")) or
+
+  (process.executable : "?:\\Program Files\\windows nt\\accessories\\wordpad.exe" and process.args_count == 2 and process.args : "*.doc*") or
+
+    /* PDF as decoy document */
+   (process.name : "AcroRd32.exe" and process.args_count == 2 and process.args : ("?:\\Users\\*.pdf", "?:\\ProgramData\\*.pdf")) or
+
+   (process.name : ("chrome.exe", "msedge.exe") and process.args : "--single-argument" and process.args : "*.pdf")
+  )
+   ] by process.parent.entity_id
+'''
+
+min_endpoint_version = "7.15.0"
+[[actions]]
+action = "kill_process"
+field = "process.entity_id"
+state = 0
+
+[[optional_actions]]
+action = "rollback"
+field = "process.entity_id"
+state = 0
+
+[[threat]]
+framework = "MITRE ATT&CK"
+[[threat.technique]]
+id = "T1566"
+name = "Phishing"
+reference = "https://attack.mitre.org/techniques/T1566/"
+[[threat.technique.subtechnique]]
+id = "T1566.001"
+name = "Spearphishing Attachment"
+reference = "https://attack.mitre.org/techniques/T1566/001/"
+
+
+
+[threat.tactic]
+id = "TA0001"
+name = "Initial Access"
+reference = "https://attack.mitre.org/tactics/TA0001/"
+[[threat]]
+framework = "MITRE ATT&CK"
+[[threat.technique]]
+id = "T1204"
+name = "User Execution"
+reference = "https://attack.mitre.org/techniques/T1204/"
+[[threat.technique.subtechnique]]
+id = "T1204.001"
+name = "Malicious Link"
+reference = "https://attack.mitre.org/techniques/T1204/001/"
+
+[[threat.technique.subtechnique]]
+id = "T1204.002"
+name = "Malicious File"
+reference = "https://attack.mitre.org/techniques/T1204/002/"
+
+
+
+[threat.tactic]
+id = "TA0002"
+name = "Execution"
+reference = "https://attack.mitre.org/tactics/TA0002/"
+
+[internal]
+min_endpoint_version = "7.15.0"

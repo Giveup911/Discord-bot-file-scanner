@@ -1,0 +1,134 @@
+[rule]
+description = """
+Identifies memory regions unexpectedly marked as inaccessible. This may indicate an attempt to hide injected code from
+memory scanners.
+"""
+id = "f72e1e5b-acc3-42aa-9f75-88badc64401e"
+license = "Elastic License v2"
+name = "Suspicious Memory Page Protection"
+os_list = ["windows"]
+version = "1.0.10"
+
+query = '''
+api where
+ process.Ext.api.name in ("VirtualProtect", "VirtualProtectEx") and
+  (
+   process.Ext.api.behaviors in ("hidden_code", "guarded_code") or
+   (process.Ext.api.parameters.protection : "*GUARD*" and not process.Ext.api.parameters.protection_old : "*GUARD*") or
+   (process.Ext.api.parameters.protection_old : "*GUARD*" and not process.Ext.api.parameters.protection : "*GUARD*") or
+   (process.Ext.api.parameters.protection == "---")
+   ) and
+ _arraysearch(process.thread.Ext.call_stack_final_user_module.code_signature, $entry, $entry.trusted == false or $entry.exists == false) and
+ not process.thread.Ext.call_stack_final_user_module.protection_provenance like ("Kernel", "Kernel|*", "Undetermined") and
+ process.thread.Ext.call_stack_final_user_module.name != "Undetermined" and
+ not _arraysearch(process.thread.Ext.call_stack_final_user_module.code_signature, $entry, $entry.trusted == true and
+                  $entry.subject_name : ("Microsoft Windows Hardware Compatibility Publisher", "Microsoft Windows Software Compatibility Publisher")) and
+ not process.thread.Ext.call_stack_final_user_module.path :
+                                ("c:\\program files\\*", "c:\\program files (x86)\\*",
+                                 "c:\\windows\\assembly\\nativeimages_*.dll",
+                                 "c:\\windows\\system32\\spool\\drivers\\x64\\3\\*.dll") and
+ not (process.Ext.api.parameters.size == 12288 and process.thread.Ext.call_stack_final_user_module.name == "jvm.dll") and
+ not _arraysearch(process.thread.Ext.call_stack, $entry,
+                  $entry.symbol_info: ("c:\\program files\\sentinelone\\sentinel agent*\\inprocessclient32.dll*",
+                                       "c:\\program files (x86)\\common files\\intuit shared\\*\\bin\\client\\jvm.dll*")) and
+ not (process.executable : ("C:\\Program Files (x86)\\*.exe", "C:\\Program Files\\*.exe") and
+      process.thread.Ext.call_stack_final_user_module.path like "c:\\windows\\assembly\\nativeimages*dll") and
+ not (process.thread.Ext.call_stack_final_user_module.protection_provenance == "chrome_elf.dll" and process.thread.Ext.call_stack_final_user_module.name == "ntdll.dll") and
+ not process.thread.Ext.call_stack_final_user_module.hash.sha256 in
+                                         ("b0968a364408aad11a33343cb9fdf66b994dbd251cc64237f8894d66efe96f19",
+                                          "20fd2dc66d81acd93b7e8637a05068fd200b09c9c1b62c7929d6abf1e8c17947",
+                                          "01b97babae60d36afe65aca64e003eecf541eaea4c5e14eba9638706975f70b7",
+                                          "22ea1a2a7027e8abd2bf9abd86090f8e516313f75863ce77aec51f60aebb12ff",
+                                          "e7efa5fe27806ba4250af12ff5ca062cff53b417299068a280ca6a3edd3fc07f",
+                                          "d32b9f057abc3dda988d443cf9866d70a3e986a57f2c6f82379e45b8b900128b",
+                                          "8bc3607f8b8a57d713e858b7184cdfed945cfb1a9da156c34530042697e96f9f",
+                                          "ae6cf7164d0fe4a67a9fe5eb63199644221507f3137d1e74334675c2a218f1f2",
+                                          "e6d0513d318659ffef650adc7bc0d7b281096b072c111d1c65cf9db956abdc29",
+                                          "1240b0ea281791197e1b666222598ce64d04f4a34069703e13ff4ee16b6b20ae",
+                                          "c545668ecbd33a0362e594980a1a59b64bffce663c177750b457125b9e4ecfe8",
+                                          "5b0c9fe8d89b25f44c4d99bd8b51923d7a9f0c581a2ca3e338179a3e52693fca",
+                                          "8de3be9033f632fa0419df7ac908314c8c4988481c655559a9e0ac326fffd36e",
+                                          "246d64c447d819520b2834e40cf08a91e959999382827fd915a2a03a47c7d7b1",
+                                          "d5dc7e48951b2e48a3495d859310c2918a9ce1cbb3eff6115d41fd5073f6a991",
+                                          "d35f27257c523399b7c9a7a4557ac3827cbb7179c807887b8c9a66f4955e5a14",
+                                          "f404ec5734f17b776e2b97ae248505dade6a3e9502d173a64a301d0060abc47d",
+                                          "9cefa5d9c48c558ae54ac6c7450c944d3bdc0dacf2a09152a93e6aa780c5ee34",
+                                          "83d7eb6ec24f4639c3fdb34049bdf6208b7de1eb0155e05766b4bee40ef6fec9",
+                                          "886748c092683079296cc7f334994698899ff04f5a344ba021d6443cef13a3ff",
+                                          "bbff088a88a0a754dc9d312e52ef7e60dd93537d78d73f79c89aa5b5091457fc",
+                                          "25d49934fc220b169cadeb21fc99dc2a8fb1dd5a4f244265799392f0f5f2f8f8",
+                                          "aad7e7ac9d74ac18892801950c9728e9c4eacd3b676cbb5d6f63382da2ce0559",
+                                          "7a94bc02118f56e337709f1e71f730ebe1245e8c641027326e30db213169abe7",
+                                          "a32c3fbbf74699a10e7642bf4901191f29c88c5aec93ae7ba28c79ab28462a69", 
+                                          "b57b7886ba87c5e65e37dbac6cf2711ddfa47581e545eee9cd6757e4ffa81101", 
+                                          "0f2e933d5af1f775aba02e4d0ca52fca9bbfa6b2b2b06f2bd2b8a09282a32a52",
+                                          "621cd08540f41ec7313533c9e516115244bac3f8d42aa9f08295cae1551e5fe1", 
+                                          "a6972aac814d4344b84f1461092ead49e315ae6cbabadd9a60dddb4f397ff723",
+                                          "c30b2b5f344a2f84ba0cb1d63f51888794d0b0c2bd74afe2aca4cbc73be47c61", 
+                                          "5254b706b4d8d73f3a5343890bea83b7172a8d4fb3e65df0530934f9c68eab7a", 
+                                          "2c26e3994367eaad1156ca137e99e229fffac3ec7203373ca3c11bb5e9aee052", 
+                                          "c8f242570144ac4ba77967a1dc59d6681ca2d8a6a85c4db2a30e1e4629db843a",
+                                          "7090edd64e7f0cbfa7bdcc6f48cdae692e94a04c7b8121a1bd96f15f24374830",
+                                          "f572e4057d7504a04dabc6fcf154e12c79af313e32f63105ae9874d97d5d3593",
+                                          "709e4e2af91135b8ed78c551de0bff2f161e498341ec2ae7b89a7d9898c4e93b",
+                                          "71587b6b0b06301ac1a4037955a2ba6729a3d40103f1bc625d4ab62aef13ebb5",
+                                          "ea71387e40682bcc23f676df2b856dca15853aeb854b94168c85bc0479ef1aed",
+                                          "c953034220bda1e5751c4ebd61c4951224db6919394b0bf7901d66cd5ec99c27",
+                                          "3c3c62d2118b3029c27c60c8995f50b90b5329a24bb6dd9ccc9b8f83e9f3446c",
+                                          "2f3361f43762299182a183372fa446bffa756d98d219935aee780018368067ba",
+                                          "17ca0c6b2c3539f8e8af8ab166419d0602397270f43f370d93d9b99bf9751790",
+                                          "8bd2eda8551d7198ebc8a70573e31c06e5fe56054e869d357d88f33c5b90d0f3",
+                                          "e958d03db79e9f1d2770c70a5bc24904aa3e2d27a8d5637684cf8166b38908f2",
+                                          "8094af5ee310714caebccaeee7769ffb08048503ba478b879edfef5f1a24fefe",
+                                          "a68bd14e096ad75ed540a9ce0d60e2033fdfa44de415d2dc3febb50ef8d21311",
+                                          "dc5f61ebae311c3f99a335f36acd4d96bd4b60e56b9825555561898509f72925",
+                                          "8094af5ee310714caebccaeee7769ffb08048503ba478b879edfef5f1a24fefe",
+                                          "e3886ed0bc0261ac34b088a0905779b86106ae54aa10cd2271c24ad3eed3ea8e",
+                                          "a6407bb570e7243afe3fe8bd6d35676fa4140aeb9e3208c06e1652343aea67ff",
+                                          "b3034b1b920bd44f589a1957dbc90ad96f82b0a15774ab4d7d102099b7b10272",
+                                          "7570ed9a44a6e251fe24697d62df9dfcadad2b10ba6803818a928f9247822721",
+                                          "37ba4ae6d60d08de22b6b0fe1f24de264cd781ca80bfcdae14c661c36d8a5d57",
+                                          "1eb27475909563236c3c87e5138da5406a1a8cb611229e73d0ae275f784e75e3",
+                                          "4706af5ee53476bc4701b81aff0f5f655aea433f1de39365bef271b24a29cd85",
+                                          "54a8497dda5a1e9b60e724292672465bbfbbf5828012f301ec63bd723f2a4c99",
+                                          "a65f0144101d93656c5f9ad445b3993336e1f295a838351aeca6332c0949b463",
+                                          "11daac36176d514ae3a85dd578a2425850df61af4ad7ccad66e4a20297a18dd7",
+                                          "db351dcd1d0317fee8a03d49c21a1bb89c4044a9c8a72a8bbf410d82c05ef990",
+                                          "c2887bb114336c7a80004136d0703063fde440367319631695a5ef757a165911",
+                                          "88f810995dc3dd58a8a3f36a2c780e899d8114a03a6945ddd5b94a85b43b8d1a",
+                                          "e8bc4d680c47c09a5f5a0b774f43eda7cd3ad0574240578a97d5ad117899953b",
+                                          "19c8c989b43446df7fc1997e0bb78e8dc729c38bd4f9b52521517c88396b5410",
+                                          "fb703a94c37289dba2ebbb73391f158935823d7a96decc2d38c788c899fa4c27")
+'''
+
+min_endpoint_version = "8.10.0"
+[[actions]]
+action = "kill_process"
+field = "process.entity_id"
+state = 0
+
+[[optional_actions]]
+action = "rollback"
+field = "process.entity_id"
+state = 0
+
+[[threat]]
+framework = "MITRE ATT&CK"
+[[threat.technique]]
+id = "T1564"
+name = "Hide Artifacts"
+reference = "https://attack.mitre.org/techniques/T1564/"
+
+[[threat.technique]]
+id = "T1620"
+name = "Reflective Code Loading"
+reference = "https://attack.mitre.org/techniques/T1620/"
+
+
+[threat.tactic]
+id = "TA0005"
+name = "Defense Evasion"
+reference = "https://attack.mitre.org/tactics/TA0005/"
+
+[internal]
+min_endpoint_version = "8.10.0"

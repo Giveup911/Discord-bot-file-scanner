@@ -1,0 +1,318 @@
+:toc:
+:toclevels: 2
+
+= DanaBot Indicators of Compromise (IoCs)
+
+== DanaBot Indicators of Compromise (IoCs) - 2025
+
+For more information about DanaBot, please refer to the following article:
+https://www.welivesecurity.com/en/eset-research/danabot-analyzing-fallen-empire/
+
+=== ESET Detection Names
+
+.DanaBot
+* Win32/Spy.Danabot.X
+* Win32/Spy.Danabot.O
+* Win32/Spy.Danabot.AC
+
+.Lockbit payload (variant Black) distributed by Danabot.
+* MSIL/Kryptik.AMBV
+
+=== File indicators
+
+.DanaBot
+* `6D361CD9ADBF1630AF7B323584168E0CBD9315FB`
+* `A7475753CB865AEC8DC4A6CEA27F2AA594EE25E8`
+* `787EAB54714F76099EC350E029154ADFD5EDF079`
+
+.Lockbit payload (variant Black) distributed by Danabot.
+* `17B78AD12B1AE1C037C5D39DBE7AA0E7DE4EC809`
+
+=== Network indicators
+
+.Backup Tor C&C servers
+* `zycoai2iteopflv5y2arhc7m6xa7tnuxda7jco6holsjclmwmajyn4ad.onion`
+* `y3wg3owz34ybihfulzr4blznkb6g6zf2eeuffhqrdvwdp43xszjknwad.onion`
+* `toap6g3aekh6izyjwcchghsffcevnkegxqooo5ozk6pcolmqjkpb3qqd.onion`
+* `qwqh2zt4xkaowrdiyg4jrg4goafln26hjsincrghfkdxfu4yzwhq6had.onion`
+* `irwdfmrhz5nwbzlcroyutzig2swvgzon6q2laali3aulj76b7weuq7id.onion`
+* `d7iylohtrcyqroekzy2hgsnr3kuzm6mcqqmrqe74k23rsjcxslgqcgid.onion`
+* `bp7dbshjqlmpyursci5nf736w6gvrtvnmerdp5bqfg5jctqcdvw6tmyd.onion`
+* `d75ur2qjrkgnn6tsmayvvigigtemmj6ihz6j6b55mls6h4makin5obyd.onion`
+* `prqoj26kjq2zoydpn5ypniwinu34cygcgntaocndqmxn7mqw6hebu7ad.onion`
+* `ockiwumgv77jgrppj4na362q4z6flsm3uno5td423jj4lj2f2meqt6ad.onion`
+* `ve26y33z2wsb7steaucpvdgiuw5borube6an2g4fdchyglrqljyw43id.onion`
+* `5mvvx4qvlg3tgbxvlusdztsixyv64r2xxdn7hbiyqe6ixy4d5j4jf6ad.onion`
+* `upnyi655ihx6onugxgyqavhfezagkwm4xsdw652nuswzjaryt3fzvzqd.onion`
+* `erdakarwa6wfmf4pgto3rnzv3fs5e3bvjg4tymch2pew35n2k53qtwid.onion`
+* `2c5xqavyj6gl3bmhy6hrh7p67rbiwb2wbxd3fbecds46xwprvjehm3ad.onion`
+
+.C&C servers
+* `38.180.137.43`
+* `89.185.80.189`
+* `185.42.163.8`
+* `194.32.76.77`
+* `45.76.251.57`
+* `23.137.105.251`
+* `23.137.105.250`
+* `23.137.105.249`
+* `91.242.163.44`
+* `87.121.221.68`
+* `194.102.104.73`
+* `212.22.82.33`
+* `89.208.97.7`
+* `31.177.108.229`
+* `88.151.192.8`
+* `178.253.55.80`
+* `91.242.163.37`
+* `51.159.226.6`
+* `95.183.51.15`
+* `95.183.50.85`
+* `89.185.80.159`
+* `89.185.80.87`
+* `89.185.80.116`
+* `212.111.89.174`
+* `195.26.224.34`
+* `77.238.250.130`
+* `185.245.107.212`
+* `81.19.140.67`
+* `45.95.233.253`
+* `185.39.207.8`
+* `85.208.139.8`
+* `87.121.221.124`
+* `193.150.70.54`
+* `95.164.55.3`
+* `195.26.227.134`
+* `93.123.109.71`
+* `196.251.116.36`
+* `77.91.76.17`
+* `77.239.101.139`
+* `77.239.99.248`
+* `196.251.86.101`
+* `196.251.86.102`
+* `185.122.171.132`
+* `46.229.55.74`
+* `185.38.142.253`
+* `185.45.195.110`
+* `91.202.233.244`
+* `95.164.55.20`
+* `212.18.104.129`
+* `138.124.78.173`
+* `45.150.34.9`
+* `89.23.103.52`
+* `194.156.102.24`
+* `212.18.104.245`
+* `212.18.104.246`
+* `185.33.87.221`
+* `78.47.15.143`
+* `135.125.225.51`
+* `38.146.25.235`
+* `185.14.31.210`
+* `86.54.42.5`
+* `176.113.115.220`
+* `185.81.68.133`
+* `185.81.68.2`
+* `35.199.78.101`
+* `34.86.163.86`
+* `35.188.245.50`
+* `34.88.132.37`
+* `34.39.133.178`
+* `34.145.152.177`
+* `34.147.254.81`
+* `34.65.186.210`
+* `35.228.203.62`
+* `34.48.14.112`
+* `35.199.48.244`
+* `34.139.186.110`
+* `34.130.235.182`
+* `34.168.204.101`
+* `34.65.47.39`
+* `34.88.131.212`
+* `34.168.202.91`
+* `34.66.104.146`
+* `34.85.143.191`
+* `8.215.11.96`
+* `8.222.178.224`
+* `35.243.180.101`
+* `34.22.151.45`
+* `34.77.22.163`
+* `104.199.4.160`
+* `35.237.76.147`
+* `34.125.95.100`
+* `34.65.245.112`
+* `34.130.217.52`
+* `34.125.235.184`
+* `34.65.101.100`
+* `34.83.30.53`
+* `35.243.202.240`
+* `35.196.59.72`
+* `34.22.185.224`
+* `34.130.190.88`
+* `34.16.215.110`
+* `34.65.116.208`
+* `34.22.185.239`
+* `34.19.91.158`
+* `34.173.227.183`
+* `34.55.79.212`
+* `35.229.82.243`
+* `34.118.84.190`
+* `35.237.124.176`
+* `34.65.151.241`
+* `34.48.98.228`
+* `34.65.43.145`
+* `34.116.129.66`
+* `35.185.234.134`
+* `34.65.57.162`
+* `34.118.88.103`
+* `34.56.177.4`
+* `34.56.126.5`
+* `34.75.145.157`
+* `34.168.233.46`
+* `34.125.118.20`
+* `35.225.11.131`
+* `34.77.245.191`
+* `34.22.169.101`
+* `34.41.167.204`
+* `34.76.196.66`
+* `34.169.131.165`
+* `34.118.110.116`
+* `34.168.100.35`
+* `34.75.119.225`
+* `35.237.63.108`
+* `35.197.94.36`
+* `35.233.91.250`
+* `34.168.203.116`
+* `35.205.12.222`
+* `34.22.161.131`
+* `35.223.14.193`
+* `34.34.145.103`
+* `34.169.99.17`
+* `34.83.67.185`
+* `35.195.45.98`
+* `34.118.58.27`
+* `34.118.99.223`
+* `190.97.165.214`
+* `85.239.62.80`
+* `162.0.223.164`
+* `69.49.244.37`
+* `190.97.165.214`
+* `85.239.62.80`
+* `162.0.223.164`
+* `69.49.244.37`
+* `65.38.120.39`
+* `79.110.52.60`
+* `176.117.68.39`
+* `46.30.45.192`
+* `91.92.246.63`
+* `95.142.39.217`
+* `176.117.68.38`
+* `85.208.108.134`
+* `45.80.158.189`
+* `89.32.41.41`
+* `217.28.130.18`
+* `176.105.253.65`
+* `78.40.116.123`
+
+.Websites used in Danabot distribution
+* `advanced-ip-scanned.com`
+* `gfind.org`
+* `mic-tests.com`
+
+== DanaBot Indicators of Compromise (IoCs) - 2018
+
+For more information about DanaBot, please refer to the following articles on
+https://www.welivesecurity.com/[WeLiveSecurity].
+
+* 2018-12-06
+  https://www.welivesecurity.com/2018/12/06/danabot-evolves-beyond-banking-trojan-new-spam/[DanaBot
+  evolves beyond banking Trojan with new spam-sending capability]
+* 2018-08-21
+  https://www.welivesecurity.com/2018/09/21/danabot-targeting-europe-adds-new-features/[DanaBot
+  shifts its targeting to Europe, adds new features]
+
+=== ESET Detection Names
+
+.DanaBot
+* VBS/TrojanDownloader.Agent.PYC
+* JS/TrojanDropper.Agent.NPQ
+* Win32/TrojanDropper.Danabot.I
+* Win32/TrojanDownloader.Danabot.I
+* Win32/Spy.Danabot
+
+.GootKit
+* Win32/Kryptik.GNNS
+
+=== Network indicators
+
+==== Webmail services targeted by email-address-harvesting feature
+
+* *any service based on Roundcube*
+* *any service based on Horde*
+* *any service based on Open-Xchange*
+* `aruba.it`
+* `bluewin.ch`
+* `email.it`
+* `gmx.net`
+* `libero.it`
+* `mail.yahoo.com`
+* `mail.google.com`
+* `mail.one.com`
+* `outlook.live.com`
+* `tecnocasa.it`
+* `tim.it`
+* `tiscali.it`
+* `vianova.it`
+
+==== Webmail services targeted by spam-sending feature
+
+*  *any service based on Open-Xchange*
+
+==== Domains used by the VBS file to download malware (GootKit at the time of writing)
+
+* `amd.cibariefoodconsulting.it`
+* `dcc.fllimorettinilegnaegiardini.it`
+* `icon.fllimorettinilegnaegiardini.it`
+* `job.hitjob.it`
+* `vps.hitjob.it`
+* `latest.hitweb.it`
+* `team.hitweb.it`
+* `pph.picchio-intl.com`
+
+==== Example domains used by the GootKit downloader module
+
+* `ricci.bikescout24.fr`
+* `vps.cibariefoodconsulting.it`
+* `drk.fm604.com`
+* `gtdspr.space`
+* `it.sunballast.de`
+
+==== Active DanaBot C&C servers (as of December 6, 2018)
+
+* `5.8.55.205`
+* `31.214.157.12`
+* `47.74.130.165`
+* `149.154.157.106`
+* `176.119.1.99`
+* `176.119.1.100`
+* `176.119.1.120`
+* `176.119.1.176`
+* `176.223.133.15`
+* `185.254.121.44`
+* `188.68.208.77`
+* `192.71.249.50`
+
+=== File indicators
+
+.Example of .VBS file from a spam email sent by DanaBot downloading GootKit
+[options="headers"]
+|====
+|SHA-1 |ESET detection name
+|`A05A71F11D84B75E8D33B06E9E1EBFE84FAE0C76` | VBS/Kryptik.KY
+|====
+
+.Example of GootKit downloaded by DanaBot .VBS file
+[options="headers"]
+|====
+|SHA-1 |ESET detection name
+|`0C2389B3E0A489C8E101FFD0E3E2F00E0C461B31` | Win32/Kryptik.GNNS
+|====

@@ -1,0 +1,60 @@
+[rule]
+description = """
+Detects when Powershell (pwsh) spawns a highly abnormal or suspicious child process. Powershell usage on Linux is rare,
+and leveraging Powershell to launch any of this list of suspicious utilities may indicate malicious behavior.
+"""
+id = "e9731cea-c3fc-4183-a76c-9a798ae0a2b0"
+license = "Elastic License v2"
+name = "Linux Powershell Suspicious Child Process"
+os_list = ["linux"]
+version = "1.0.10"
+
+query = '''
+process where event.type == "start" and event.action == "exec" and process.parent.name == "pwsh" and
+process.name like (
+  "nc", "ncat", "netcat", "socat", "nc.openbsd", "ngrok", "ping", "python*", "php*", "perl*", "ruby*", "lua*", "openssl",
+  "telnet"
+) and
+not (
+  (process.name like "python*" and process.args == "azure.cli") or
+  process.parent.executable like~ (
+    "/opt/ansible*/Evaluate-STIG/powershell/pwsh", "/evaluate/Evaluate-STIG/powershell/pwsh",
+    "/opt/Evaluate-STIG/powershell/pwsh"
+  ) or
+  process.working_directory like "/opt/azurevstsagent/agent*" or
+  process.args like "/home/*/.local/bin/az"
+)
+'''
+
+min_endpoint_version = "7.15.0"
+optional_actions = []
+[[actions]]
+action = "kill_process"
+field = "process.entity_id"
+state = 0
+
+[[actions]]
+action = "kill_process"
+field = "process.parent.entity_id"
+state = 0
+
+[[threat]]
+framework = "MITRE ATT&CK"
+[[threat.technique]]
+id = "T1059"
+name = "Command and Scripting Interpreter"
+reference = "https://attack.mitre.org/techniques/T1059/"
+[[threat.technique.subtechnique]]
+id = "T1059.001"
+name = "PowerShell"
+reference = "https://attack.mitre.org/techniques/T1059/001/"
+
+
+
+[threat.tactic]
+id = "TA0002"
+name = "Execution"
+reference = "https://attack.mitre.org/tactics/TA0002/"
+
+[internal]
+min_endpoint_version = "7.15.0"

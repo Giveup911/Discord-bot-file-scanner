@@ -1,0 +1,98 @@
+== DeceptiveDevelopment: From primitive crypto theft to sophisticated AI-based deception – Indicators of Compromise
+
+The blog post on DeceptiveDevelopment is available on WeLiveSecurity at https://www.welivesecurity.com/en/eset-research/deceptivedevelopment-from-primitive-crypto-theft-to-sophisticated-ai-based-deception
+
+=== Files
+
+[width="100%",cols="25%,25%,25%,25%",options="header",]
+|===
+|SHA-1 |Filename |Detection |Description
+|`E34A43ACEF5AF1E5197D940B94FC37BC4EFF0B2A` |nvidiadrivers.zip |WinGo/DeceptiveDevelopment.F |A trojanized project containing WeaselStore.
+|`3405469811BAE511E62CB0A4062AADB523CAD263` |VCam1.update |WinGo/DeceptiveDevelopment.F |A trojanized project containing WeaselStore.
+|`C0BAA450C5F3B6AACDE2807642222F6D22D5B4BB` |VCam2.update |WinGo/DeceptiveDevelopment.F |A trojanized project containing WeaselStore.
+|`DAFB44DA364926BDAFC72D72DBD9DD728067EFBD` |nvidia.js |JS/Spy.DeceptiveDevelopment.Q |WeaselStore downloader for Windows.
+|`015583535D2C8AB710D1232AA8A72136485DB4EC` |ffmpeg.sh |OSX/DeceptiveDevelopment.B |WeaselStore downloader for OSX/Linux.
+|`CDA0F15C9430B6E0FF1ACDA4D44DA065D547AF1C` |DriverMinUpdate |OSX/DeceptiveDevelopment.B |Fake prompt requesting user's login on macOS.
+|`214F0B10E9474F0F5D320158FB71995AF852B216` |nvidiaupdate.exe |WinGo/DeceptiveDevelopment.B |Compiled WeaselStore binary for Windows.
+|`4499C80DDA6DBB492F8667D11D3FFBFEEC7A3926` |bow |Python/DeceptiveDevelopment.C |InvisibleFerret.
+|`B20BFBAB8BA732D428AFBA7A688E6367232B9430` |N/A |Python/DeceptiveDevelopment.C |Browserstealer module of InvisibleFerret.
+|`C6888FB1DE8423D9AEF9DDEA6B1C96C939A06CF5` |Windows Update Script.pyw |Python/TsunamiKit.A |TsunamiInjector.
+|`4AAF0473599D7E3A503841ED10281FDC186633D2` |Runtime Broker.exe |MSIL/DeceptiveDevelopment.A |TsunamiInstaller.
+|`251CF5F4A8E73F8C5F91071BB043B4AA7F29D519` |Tsunami Payload.exe |MSIL/DeceptiveDevelopment.A |TsunamiClientInstaller.
+|`D469D1BAA3417080DED74CCB9CFB5324BDB88209` |Tsunami Payload.dll |MSIL/DeceptiveDevelopment.A |TsunamiClient.
+|`0C0F8152F3462B662318566CDD2F62D8E350A15E` |Runtime Broker.exe |Win64/Riskware.Tor.A |Tor Proxy.
+|`F42CC34C1CFAA826B96291E9AF81F1A67620E631` |autopart.zip |Win64/DeceptiveDevelopment.C +
+JS/Spy.DeceptiveDevelopment.A |A trojanized project containing BeaverTail and a downloader of Tropidoor.
+|`02A2CD54948BC0E2F696DE412266DD59D150D8C5` |hoodygang.zip |Win64/DeceptiveDevelopment.C +
+JS/Spy.DeceptiveDevelopment.A |A trojanized project containing BeaverTail and a downloader of Tropidoor.
+|`6E787E129215AC153F3A4C05A3B5198586D32C9A` |tailwind.config.js |JS/Spy.DeceptiveDevelopment.A |A trojanized JavaScript containing BeaverTail.
+|`FE786EAC26B61743560A39BFB905E6FB3BB3DA17` |tailwind.config.js |JS/Spy.DeceptiveDevelopment.A |A trojanized JavaScript containing BeaverTail.
+|`86784A31A2709932FF10FDC40818B655C68C7215` |img++_++layer++_++generate.dll |Win64/DeceptiveDevelopment.C |A downloader of the Tropidoor RAT.
+|`90378EBD8DB757100A833EB8D00CCE13F6C68E64` |N/A |Win64/DeceptiveDevelopment.D |Tropidoor RAT.
+|`C86EEDF02B73ADCE08164F5C871E643E6A32056B` |drivfixer.sh |OSX/DeceptiveDevelopment.C |A trojanized macOS installer and launcher of Node.js.
+|`4E4D31C559CA16F8B7D49B467AA5D057897AB121` |ClickFix-1.bat |PowerShell/DeceptiveDevelopment.B |An initial stage on Windows: BAT downloading a malicious nvidiaRelease.zip archive.
+|`A9C94486161C07AE6935F62CFCC285CD342CDB35` |driv.zip |JS/Spy.DeceptiveDevelopment.A +
+OSX/DeceptiveDevelopment.C |A ZIP archive containing BeaverTail.
+|`F01932343D7F13FF10949BC0EA27C6516F901325` |nvidiaRelease.zip |JS/Spy.DeceptiveDevelopment.A +
+Win32/DeceptiveDevelopment.A +
+VBS/DeceptiveDevelopment.B +
+BAT/DeceptiveDevelopment.A |A ZIP archive containing BeaverTail and AkdoorTea.
+|`BD63D5B0E4F2C72CCFBF318AF291F7E578FB0D90` |mac-v-j1722.fixer |OSX/DeceptiveDevelopment.D |An initial stage on macOS: a bash script downloading a malicious driv.zip archive.
+|`10C967386460027E7492B6138502AB61CA828E37` |main.js |JS/Spy.DeceptiveDevelopment.A |An obfuscated BeaverTail script, automatically loaded by Node.js.
+|`59BA52C644370B4D627F0B84C48BDA73D97F1610` |run.vbs |VBS/DeceptiveDevelopment.B |A VBS script executing AkdoorTea and shell.bat
+|`792AFE735D6D356FD30D2E7D0A693E3906DECCA7` |drvUpdate.exe |Win32/DeceptiveDevelopment.A |AkdoorTea, a TCP RAT.
+|===
+
+==== Network
+
+[width="100%",cols="20%,20%,20%,20%,20%",options="header",]
+|===
+|IP |Domain |Hosting provider |First seen |Details
+|`++199.188.200.147++` |`++driverservices.store++` |Namecheap, Inc. |2025-08-08 |remote storage for DeceptiveDevelopment.
+|`++103.231.75.101++` |`N/A` |THE-HOSTING-MNT |2025-08-10 |C&C of AkdoorTea.
+|`++45.159.248.110++` |`N/A` |THE-HOSTING-MNT |2025-06-29 |C&C server of BeaverTail.
+|`++45.8.146.93++` |`N/A` |STARK INDUSTRIES SOLUTIONS LTD |2024-10-26 |C&C server of Tropidoor.
+|`++86.104.72.247++` |`N/A` |STARK INDUSTRIES SOLUTIONS LTD |2024-10-31 |C&C server of Tropidoor.
+|`++103.35.190.170++` |`N/A` |STARK INDUSTRIES SOLUTIONS LTD |2024-06-24 |C&C server of Tropidoor.
+|`N/A` |`++n34kr3z26f3jzp4ckmwuv5ipqyatumdxhgjgsmucc65jac56khdy5zqd.onion++` |N/A |2023-10-06 |C&C server of TsunamiClient.
+|`++116.125.126.38++` |`++www.royalsevres.com++` |SK Broadband Co Ltd |2024-06-25 |remote storage for Tropidoor.
+|===
+
+== DeceptiveDevelopment targets freelance developers – Indicators of Compromise
+
+The blog post on DeceptiveDevelopment is available on WeLiveSecurity at https://www.welivesecurity.com/en/eset-research/deceptivedevelopment-targets-freelance-developers/
+
+=== Files
+
+[width="100%",cols="25%,25%,25%,25%",options="header",]
+|===
+|SHA-1 |Filename |Detection |Description
+|`+48E75D6E2BDB2B00ECBF4801A98F96732E397858+` |FCCCall.exe |Win64/DeceptiveDevelopment.A |Trojanized conferencing app - native BeaverTail
+|`+EC8B6A0A7A7407CA3CD18DE5F93489166996116C+` |pay.py |Python/DeceptiveDevelopment.B |InvisibleFerret payload module
+|`+3F8EF8649E6B9162CFB0C739F01043A19E9538E7+` |bow.py |Python/DeceptiveDevelopment.C |InvisibleFerret browser module
+|`+F6517B68F8317504FDCD415653CF46530E19D94A+` |pay_u2GgOA8.py |Python/DeceptiveDevelopment.B |InvisibleFerret new payload module
+|`+01C0D61BFB4C8269CA56E0F1F666CBF36ABE69AD+` |setupTest.js |JS/Spy.DeceptiveDevelopment.A |BeaverTail
+|`+2E3E1B95E22E4A8F4C75334BA5FC30D6A54C34C1+` |tailwind.config.js |JS/Spy.DeceptiveDevelopment.A |BeaverTail
+|`+7C8724B75BF7A9B8F27F5E86AAC9445AAFCCB6AC+` |conf.ps1 |N/A |AnyDesk configuration PowerShell script
+|`+5F5D3A86437082FA512B5C93A6B4E39397E1ADC8+` |adc.py |Python/DeceptiveDevelopment.A |InvisibleFerret AnyDesk module
+|`+7C5B2CAFAEABBCEB9765D20C6A323A07FA928624+` |bow.py |Python/DeceptiveDevelopment.A |InvisibleFerret browser module
+|`+BA1A54F4FFA42765232BA094AAAFAEE5D3BB2B8C+` |pay.py |Python/DeceptiveDevelopment.A |InvisibleFerret payload module
+|`+6F049D8A0723DF10144CB51A43CE15147634FAFE+` |.npl |Python/DeceptiveDevelopment.A |InvisibleFerret loader module
+|`+8FECA3F5143D15437025777285D8E2E3AA9D6CAA+` |admin.model.js |JS/Spy.DeceptiveDevelopment.A |BeaverTail
+|`+380BD7EDA453487CF11509D548EF5E5A666ACD95+` |run.js |JS/Spy.DeceptiveDevelopment.A |BeaverTail
+|===
+
+==== Network
+
+[width="100%",cols="20%,20%,20%,20%,20%",options="header",]
+|===
+|IP |Domain |Hosting provider |First seen |Details
+|`+95.164.17[.]24+` |`+N/A+` |STARK INDUSTRIES SOLUTIONS LTD |2024-06-06 |BeaverTail/InvisibleFerret C&C.
+|`+185.235.241[.]208+` |`+N/A+` |STARK INDUSTRIES SOLUTIONS LTD |2021-04-12 |BeaverTail/InvisibleFerret C&C.
+|`+147.124.214[.]129+` |`+N/A+` |Majestic Hosting Solutions, LLC |2024-03-22 |BeaverTail/InvisibleFerret C&C.
+|`+23.106.253[.]194+` |`+N/A+` |LEASEWEB SINGAPORE PTE. LTD. |2024-05-28 |BeaverTail/InvisibleFerret C&C.
+|`+147.124.214[.]237+` |`+N/A+` |Majestic Hosting Solutions, LLC |2023-01-28 |BeaverTail/InvisibleFerret C&C.
+|`+67.203.7[.]171+` |`+N/A+` |Amaze Internet Services |2024-02-14 |BeaverTail/InvisibleFerret C&C.
+|`+45.61.131[.]218+` |`+N/A+` |RouterHosting LLC |2024-01-22 |BeaverTail/InvisibleFerret C&C.
+|`+135.125.248[.]56+` |`+N/A+` |OVH SAS |2023-06-30 |BeaverTail/InvisibleFerret C&C.
+|===

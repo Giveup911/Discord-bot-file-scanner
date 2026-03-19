@@ -5276,7 +5276,19 @@ async def stats_command(ctx: discord.ApplicationContext):
     e.add_field(name="Uptime", value=f"{hours}h {mins}m {secs}s", inline=True)
     if YARA_RULES:
         e.add_field(name="YARA Rules", value="Loaded", inline=True)
-    e.add_field(name="Guilds", value=str(len(bot.guilds)), inline=True)
+    # Server list
+    guilds = sorted(bot.guilds, key=lambda g: g.member_count or 0, reverse=True)
+    if guilds:
+        server_lines = []
+        for g in guilds:
+            members = f"{g.member_count:,}" if g.member_count else "?"
+            server_lines.append(f"**{g.name}** ({members} members)")
+        server_list = "\n".join(server_lines)
+        if len(server_list) > 1024:
+            server_list = server_list[:1020] + "\n..."
+        e.add_field(name=f"Servers ({len(guilds)})", value=server_list, inline=False)
+    else:
+        e.add_field(name="Servers", value="None", inline=True)
     await ctx.respond(embed=e, ephemeral=True)
 
 

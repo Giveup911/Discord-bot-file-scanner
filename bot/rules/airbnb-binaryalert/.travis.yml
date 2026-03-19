@@ -1,0 +1,13 @@
+language: python
+cache: pip
+python:
+  - "3.6"
+  - "3.7-dev"
+notifications:
+  email: false
+install:
+  - pip3 install -r requirements.txt
+script:
+  - tests/ci_tests.sh
+after_success:
+  - coveralls

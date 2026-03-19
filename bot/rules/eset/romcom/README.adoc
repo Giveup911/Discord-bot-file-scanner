@@ -1,0 +1,119 @@
+:toc:
+:toclevels: 2
+
+= RomCom -- Indicators of Compromise
+
+== RomCom exploits Firefox and Windows zero days in the wild
+
+The blog post on RomCom exploiting Firefox and Windows zero days is available
+on WeLiveSecurity at
+https://www.welivesecurity.com/en/eset-research/romcom-exploits-firefox-and-windows-zero-days-in-the-wild/
+
+=== Files
+
+[width="100%",cols="25%,25%,25%,25%",options="header",]
+|===
+|SHA-1 |Filename |Detection |Description
+|`+A4AAD0E2AC1EE0C8DD25968FA4631805689757B6+` |utils.js |JS/Exploit.Agent.NSF |RomCom Firefox exploit.
+|`+CA6F8966A3B2640F49B19434BA8C21832E77A031+` |main-tor.js |JS/Exploit.Agent.NSE |RomCom Firefox exploit.
+|`+21918CFD17B378EB4152910F1246D2446F9B5B11+` |main-128.js |JS/Exploit.Agent.NSE |RomCom Firefox exploit.
+|`+703A25F053E356EB6ECE4D16A048344C55DC89FD+` |main-129.js |JS/Exploit.Agent.NSE |RomCom Firefox exploit.
+|`+ABB54C4751F97A9FC1C9598FED1EC9FB9E6B1DB6+` |PocLowIL.dll |Win64/Runner.AD |RomCom's Firefox sandbox escape
+|`+A9D445B77F6F4E90C29E385264D4B1B95947ADD5+` |PocLowIL.dll |Win64/Runner.AD |RomCom's TOR browser sandbox escape
+|===
+
+=== Network
+
+[width="100%",cols="20%,20%,20%,20%,20%",options="header",]
+|===
+|IP |Domain |Hosting provider |First seen |Details
+|`+194.87.189[.]171+` |`+journalctd[.]live+` |Aeza International LTD |2024-10-08 |RomCom second-stage C&C server.
+|`+178.236.246[.]241+` |`+correctiv[.]sbs+` |AEZA INTERNATIONAL LTD |2024-10-09 |RomCom second-stage C&C server.
+|`+62.60.238[.]81+` |`+cwise[.]store+` |AEZA INTERNATIONAL LTD |2024-10-15 |RomCom second-stage C&C server.
+|`+147.45.78[.]102+` |`+redircorrectiv[.]com+` |AEZA INTERNATIONAL LTD |2024-10-10 |RomCom exploit delivery C&C server.
+|`+46.226.163[.]67+` |`+devolredir[.]com+` |AEZA INTERNATIONAL LTD |2024-10-14 |RomCom exploit delivery C&C server.
+|`+62.60.237[.]116+` |`+redirconnectwise[.]cloud+` |AEZA INTERNATIONAL LTD |2024-10-15 |RomCom exploit delivery C&C server.
+|`+62.60.237[.]38+` |`+redjournal[.]cloud+` |AEZA INTERNATIONAL LTD |2024-10-16 |RomCom exploit delivery C&C server.
+|`+194.87.189[.]19+` |`+1drv.us[.]com+` |AEZA INTERNATIONAL LTD |2024-10-08 |RomCom malware delivery C&C server.
+|`+45.138.74[.]238+` |`+economistjournal[.]cloud+` |AEZA INTERNATIONAL LTD |2024-10-16 |RomCom exploit redirection C&C server.
+|`+176.124.206[.]88+` |`+N/A+` |AEZA INTERNATIONAL LTD |2024-10-08 |RomCom second-stage C&C server.
+|===
+
+=== MITRE ATT&CK TECHNIQUES
+
+[width="100%",cols="25%,25%,25%",options="header",]
+|===
+|Tactic |ID |Name
+|*Resource Development* |T1583 |Acquire Infrastructure
+| |T1587.001 |Develop Capabilities: Malware
+| |T1587.004 |Develop Capabilities: Exploits
+| |T1588.003 |Obtain Capabilities: Code Signing Certificates
+| |T1588.005 |Obtain Capabilities: Exploits
+| |T1588.006 |Obtain Capabilities: Vulnerabilities
+| |T1608 |Stage Capabilities
+|*Initial Access* |T1189 |Drive-by Compromise
+|*Execution* |T1053.005 |Scheduled Task/Job: Scheduled Task
+|*Persistence* |T1546.015 |Event Triggered Execution: Component Object Model Hijacking
+|*Privilege Escalation* |T1068 |Exploitation for Privilege Escalation
+|*Defense Evasion* |T1622 |Debugger Evasion
+| |T1480 |Execution Guardrails
+| |T1027.011 |Obfuscated Files or Information: Fileless Storage
+| |T1553.002 |Subvert Trust Controls: Code Signing
+|*Credential Access* |T1555.003 |Credentials from Password Stores: Credentials from Web Browsers
+| |T1552.001 |Unsecured Credentials: Credentials In Files
+|*Discovery* |T1087 |Account Discovery
+| |T1518 |Software Discovery
+| |T1614 |System Location Discovery
+|*Lateral Movement* |T1021 |Remote Services
+|*Collection* |T1560 |Archive Collected Data
+| |T1185 |Man in the Browser
+| |T1005 |Data from Local System
+| |T1114.001 |Email Collection: Local Email Collection
+| |T1113 |Screen Capture
+|*Command and Control* |T1071.001 |Standard Application Layer Protocol: Web Protocols
+| |T1573.002 |Encrypted Channel: Asymmetric Cryptography
+|*Exfiltration* |T1041 |Exfiltration Over C2 Channel
+|*Impact* |T1565 |Data Manipulation
+| |T1657 |Financial Theft
+|===
+
+[separator=::]
+== Update WinRAR tools now: RomCom and others exploiting zero-day vulnerability -- Indicators of Compromise
+
+The blog post on Update WinRAR tools now: RomCom and others exploiting zero-day vulnerability is
+available on WeLiveSecurity at https://www.welivesecurity.com/en/eset-research/update-winrar-tools-now-romcom-and-others-exploiting-zero-day-vulnerability/
+
+=== ESET detection names
+
+- LNK/Agent.AJN
+- Win64/Agent.GMQ
+- Win64/Agent.GNV
+- Win64/Agent.GPM
+- Win64/TrojanDownloader.Agent.BZV
+
+=== Files
+
+|===
+|SHA-1 |Filename |Detection |Description
+|`+371A5B8BA86FBCAB80D4E0087D2AA0D8FFDDC70B+` |Adverse_Effect_Medical_Records_2025.rar |Win64/Agent.GPM |Archive exploiting CVE-2025-8088; found on VirusTotal.
+|`+D43F49E6A586658B5422EDC647075FFD405D6741+` |cv_submission.rar |Win64/Agent.GPM |Archive exploiting CVE-2025-8088.
+|`+F77DBA76010A9988C9CEB8E420C96AEBC071B889+` |Eli_Rosenfeld_CV2 - Copy (10).rar |Win64/Agent.GMQ |Archive exploiting CVE-2025-8088.
+|`+676086860055F6591FED303B4799C725F8466CF4+` |Datos adjuntos sin título 00170.dat |Win64/Agent.GPM |Archive exploiting CVE-2025-8088.
+|`+1F25E062E8E9A4F1792C3EAC6462694410F0F1CA+` |JobDocs_July2025.rar |Win64/TrojanDownloader.Agent.BZV |Archive exploiting CVE-2025-8088.
+|`+C340625C779911165E3983C77FD60855A2575275+` |cv_submission.rar |Win64/Agent.GPM |Archive exploiting CVE-2025-8088.
+|`+C94A6BD6EC88385E4E831B208FED2FA6FAED6666+` |Recruitment_Dossier_July_2025.rar |Win64/TrojanDownloader.Agent.BZV |Archive exploiting CVE-2025-8088.
+|`+01D32FE88ECDEA2B934A00805E138034BF85BF83+` |install_module_x64.dll |Win64/Agent.GNV |MeltingClaw.
+|`+AE687BEF963CB30A3788E34CC18046F54C41FFBA+` |msedge.dll |Win64/Agent.GMQ |Mythic agent used by RomCom.
+|`+AB79081D0E26EA278D3D45DA247335A545D0512E+` |Complaint.exe |Win64/TrojanDownloader.Agent.BZV |RustyClaw.
+|`+1AEA26A2E2A7711F89D06165E676E11769E2FD68+` |ApbxHelper.exe |Win64/Agent.GPM |SnipBot variant.
+|===
+
+=== Network
+
+|====
+|IP                   |First seen|Details
+|`162.19.175[.]44`    |2025-06-06|MeltingClaw C&C server.
+|`194.36.209[.]127`   |2025-07-09|C&C server of the Mythic agent used by RomCom.
+|`85.158.108[.]62`    |2025-07-07|RustyClaw C&C server.
+|`185.173.235[.]134`  |2025-07-18|C&C server of the SnipBot variant.
+|====

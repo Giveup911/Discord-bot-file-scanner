@@ -1,0 +1,33 @@
+== Unmasking AsyncRAT: Navigating the labyrinth of forks – Indicators of Compromise
+
+The blog post on AsyncRAT is available on WeLiveSecurity at
+https://www.welivesecurity.com/en/eset-research/unmasking-asyncrat-navigating-labyrinth-forks/
+
+=== SHA-1 hashes
+
+[width="100%",cols="25%,25%,25%,25%",options="header",]
+|===
+|SHA-1 |Filename |Detection |Description
+|`F8E31B338123E38757F8B7099797119A038A3538` |Screamer.dll |MSIL/AsyncRAT.C |NonEuclid jump scare plugin
+|`98223D2F8DF2F9E832AE081CD6E072A440C9A3CD` |Piano.dll |MSIL/AsyncRAT.C |NonEuclid audio player plugin
+|`CDEC9A1C73E3E21B1D70DDAA6BF139D8D2A197A5` |Maps.dll |MSIL/AsyncRAT.C |NonEuclid geolocation plugin
+|`932C49EEE087D432D0DA10CC0640B11FD2C91203` |Service.dll |MSIL/AsyncRAT.C |NonEuclid service management plugin
+|`2FA98D088486BAC57FF60E072E28FEE5830E7B28` |WormUsb.dll |MSIL/AsyncRAT.C |NonEuclid malware spreader plugin
+|`62C9FEFA84067F695032A6939F07C3799AAD80A3` |Brute.dll |MSIL/AsyncRAT.C |NonEuclid SSH and FTP brute forcer plugin
+|`FAD946F7ACF017F0C50C81BF379AABA3528AFBB3` |Signature Antivirus.dll |MSIL/AsyncRAT.C |NonEuclid signature-based file matcher plugin
+|`51B8A5818B7031EDB59A2B2ECF160A78505880BA` |cliper.dll |MSIL/AsyncRAT.C |NonEuclid clipboard hijacker plugin
+|`4FB0CAAD6E345947EE2D30E795B711F91C6A4819` |Stub.exe |MSIL/AsyncRAT.A |AsyncRAT client
+|`FD9CF01CEA7DE8631C34B988A7AAD55587A162FA` |Stub.exe |MSIL/AsyncRAT.A |3LoshRAT client
+|`B8AB93E958E0DE4BE2766B2537832EDB37030429` |Client.exe |MSIL/AsyncRAT.A |DcRat client
+|`68B58483D0E4E7CC2478D6B4FC00064ADE3D7DB3` |Microsoft++_++Edge++_++Driver.exe |MSIL/AsyncRAT.A |VenomRAT client
+|`4F69E0CE283D273B724CE107DF89F11C556A7A4E` |Client.exe |MSIL/AsyncRAT.C |BoratRAT client
+|`E4F87568473536E35006D1BD4D4C26A8809F3F91` |Client.exe |MSIL/AsyncRAT.A |Anarchy Panel client
+|`D10B8197732437E9BF840FEA46A30EFF62892A4E` |Client.exe |MSIL/AsyncRAT.A |CollapseRAT client
+|`0DC28EA51F0D96E0D1BC78DF829C81A84332C5F1` |dwm.exe |MSIL/AsyncRAT.A |Shadow X RAT client
+|`E5B511E7550CBADE74E75EADE8F413A89D963FE5` |ClientAny.exe |MSIL/AsyncRAT.A |LMTeamRAT client
+|`3124F58428184FDF75E21B1E5A58CADF9DD2BA03` |Stub.exe |MSIL/AsyncRAT.A |PhoenixRAT client
+|`8402AA507CF5B1BBFAB53E3BF7A7D4500796A978` |Client.exe |MSIL/AsyncRAT.A |EchoRAT client
+|`AB2C6F9695346FAA9495B4AB837085C1524FFDDF` |Client.exe |MSIL/AsyncRAT.A |XieBroRAT client
+|`3E6CD9D07B8ECE706697F332AC9F32DE5ECAF086` |tempClient.exe |MSIL/AsyncRAT.C |NonEuclid RAT client
+|`FF4592A8BCB58F5CF6BD70B882E886EC6906EECD` |Servant.exe |MSIL/AsyncRAT.A |JasonRAT client
+|===
