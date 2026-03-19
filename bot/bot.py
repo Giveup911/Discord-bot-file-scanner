@@ -6204,25 +6204,51 @@ async def run_scan(
             if scan_msg:
                 await scan_msg.edit(content=scan_header, embeds=embeds, view=None)
                 if files_to_send:
-                    # Discord limits to 10 files per message — batch if needed
-                    for i in range(0, len(files_to_send), 10):
-                        batch = files_to_send[i:i + 10]
-                        try:
-                            await safe_send(files=batch, reference=discord.MessageReference.from_message(scan_msg))
-                        except (TypeError, Exception):
-                            await safe_send(files=batch)
+                    if private:
+                        # Private: send zip as ephemeral DM to the requester
+                        for i in range(0, len(files_to_send), 10):
+                            batch = files_to_send[i:i + 10]
+                            try:
+                                await ctx.followup.send(
+                                    content="\U0001F512 Private scan logs:",
+                                    files=batch,
+                                    ephemeral=True,
+                                )
+                            except Exception:
+                                pass
+                    else:
+                        # Public: send in channel
+                        for i in range(0, len(files_to_send), 10):
+                            batch = files_to_send[i:i + 10]
+                            try:
+                                await safe_send(files=batch, reference=discord.MessageReference.from_message(scan_msg))
+                            except (TypeError, Exception):
+                                await safe_send(files=batch)
             else:
                 # First message: embeds + up to 10 files
-                first_batch = files_to_send[:10]
+                first_batch = files_to_send[:10] if not private else []
                 await safe_send(
                     content=scan_header,
                     embeds=embeds,
                     files=first_batch,
                 )
-                # Remaining files in follow-up messages
-                for i in range(10, len(files_to_send), 10):
-                    batch = files_to_send[i:i + 10]
-                    await safe_send(files=batch)
+                if private and files_to_send:
+                    # Private: send zip as ephemeral DM
+                    for i in range(0, len(files_to_send), 10):
+                        batch = files_to_send[i:i + 10]
+                        try:
+                            await ctx.followup.send(
+                                content="\U0001F512 Private scan logs:",
+                                files=batch,
+                                ephemeral=True,
+                            )
+                        except Exception:
+                            pass
+                else:
+                    # Remaining files in follow-up messages
+                    for i in range(10, len(files_to_send), 10):
+                        batch = files_to_send[i:i + 10]
+                        await safe_send(files=batch)
         finally:
             for f_obj in files_to_send:
                 try:
