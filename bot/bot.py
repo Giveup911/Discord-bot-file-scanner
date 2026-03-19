@@ -5288,6 +5288,39 @@ async def stats_command(ctx: discord.ApplicationContext):
     e.add_field(name="Uptime", value=f"{hours}h {mins}m {secs}s", inline=True)
     if YARA_RULES:
         e.add_field(name="YARA Rules", value="Loaded", inline=True)
+    # Scanned file database (includes offline scans)
+    scanned_dir = MASTER_DIR / "scanned"
+    if scanned_dir.exists():
+        try:
+            scanned_dirs = [d for d in scanned_dir.iterdir() if d.is_dir()]
+            total_scanned = len(scanned_dirs)
+            # Count unique variants from IOC files
+            variants = {}
+            for sd in scanned_dirs:
+                iocs = list((sd / "logs").glob("*_iocs.json")) if (sd / "logs").is_dir() else []
+                if iocs:
+                    try:
+                        ioc_data = json.loads(iocs[0].read_text(encoding="utf-8"))
+                        v = ioc_data.get("variant", "unknown").lower()
+                        variants[v] = variants.get(v, 0) + 1
+                    except Exception:
+                        pass
+            catalog_count = len(file_catalog)
+            offline_count = total_scanned - catalog_count
+            db_lines = [f"**{total_scanned}** files scanned total"]
+            db_lines.append(f"{catalog_count} via Discord, {offline_count} offline")
+            db_lines.append(f"{len(approved_exceptions)} exception(s) approved")
+            # Show top variants (exclude unknown)
+            known = {k: v for k, v in variants.items() if k != "unknown"}
+            if known:
+                top = sorted(known.items(), key=lambda x: x[1], reverse=True)[:5]
+                db_lines.append("**Top variants:** " + ", ".join(f"{v} ({c})" for v, c in top))
+            unknown_count = variants.get("unknown", 0)
+            if unknown_count:
+                db_lines.append(f"{unknown_count} clean/unknown")
+            e.add_field(name="Scan Database", value="\n".join(db_lines), inline=False)
+        except Exception:
+            pass
     # Server list
     guilds = sorted(bot.guilds, key=lambda g: g.member_count or 0, reverse=True)
     if guilds:

@@ -5,3 +5,99 @@
 # Format: sha256_hash  # optional comment about the file
 # Example: abc123def456...  # DoomsDay Client v2.1 from doomsdayclient.com
 52ffa795e30f7cc9852c9685b16515ebfbbb7043a53499fbe0d83c162987a2ea  # viewbobbingmod-1.6.jar
+
+# ── Legitimate Fabric/Forge mods (verified 2026-03-19) ──
+d183bacb845167f09264c2f90322b7ecffe8826debda6f60e597889264bef4af  # fabric-api-0.119.4+1.21.4.jar
+2a3c56fc1dd6e922a9bee35a4c0ba4bc0d967763f2e952ff49b74ec3c641f50b  # fabric-language-kotlin-1.13.4+kotlin.2.2.0.jar
+0dd5e9203552024e38e73a0f5b46a82eb66f0318b23289c6842b268663274a79  # ferritecore-7.1.1-fabric.jar
+2c69fd817304bb6975cd4b62fd32bf21a5d5c8f0c3523eacc734c0c2507eda77  # ferritecore-8.0.2-fabric.jar
+92b79623fc00f0f948005a0ae416cb42a51646f2423b4036e27e867e4001a47e  # sodium-fabric-0.6.13+mc1.21.4.jar
+c621f2b4575edf3eea1e18134dcf6e19bb8d882e471583b891f37609241d03e4  # sodium-extra-fabric-0.6.1+mc1.21.4.jar
+b42fc0424050f076c8e1f77b7549e48ec6e07605fbf868ed5d0ef47848665dd2  # reeses-sodium-options-fabric-1.8.3+mc1.21.4.jar
+6434855916199dadc7ad290e21349264f18a1fbc4072437067914a7899eb10ff  # c2me-fabric-mc1.21.4-0.3.2+alpha.0.30.jar
+94f195819b24e5da64effdc9da15cdd84836cc75e8ff0fd098bab6bc2f49e3fe  # krypton-0.2.8.jar
+d633096f0e702ff3f0b0d4841ece0c1c9a63caf3d585b8623f9f5d9d74502702  # NoChatReports-FABRIC-1.21.4-v2.11.0.jar
+df706a1e5456023566d02874278bff84d7b6c61b01f1e065751dcbcd74b050c2  # YetAnotherConfigLib-3.6.2+1.21.4-fabric.jar
+03a08e558ebb4d89abbed112eef96b9db7e200dbc4491ade2193b84011184ca0  # yet_another_config_lib_v3-3.7.1+1.21.4-fabric.jar
+bdf49d2c41726eaa43b9c015a7a3f8884c90ef2a1cb00af34b531c1be064bda7  # entityculling-fabric-1.8.0-mc1.21.4.jar
+67d0ef6753c2874f22c41e354a0576dcd9128f1357cb153784d617630c7e5fe8  # Clumps-fabric-1.21.4-22.0.0.1.jar
+fdb311a6ba3280578e717d5efe4961e82f153cfe80c2ff3fd68e81cf5bc7607a  # enhancedblockentities-0.11.3+1.21.4.jar
+aeafde8d92510e827e3562c2012077b54e39cfddb918619f57255917a82e2ce3  # cullleaves-fabric-4.0.3.jar
+f6767f5f6b42576fd4c184439e40230410616fe3519fe3896f9d6a70f8a0b5b2  # Zoomify-2.14.2+1.21.3.jar
+43e9c0d6c6da796e2a361a3a933a061cecb8fa8861a52d2ac1d7ee3c0af12388  # language-reload-1.7.4+1.21.4.jar
+07e2c7569378e37059b35c0cf7a6530554f756737c8e341e1a8c2312dc2d4548  # malilib-fabric-1.21.4-0.23.5.jar
+1e1f2e3f0f0385bc705c3cab9ef71a532ae22840bf69bf71d4aba58f59456dd6  # ForgeConfigAPIPort-v21.4.1-1.21.4-Fabric.jar
+d87561a739436eacb540f61277524fcc2992a40ceb6cbcbb7a8235abdb25ed5a  # BetterFps-1.2.0.jar
+ea4b1cdb0b6e47ad1515e7dc903a176cc8c674288e137b9bc81064bdd244d89c  # FpsReducer-mc1.8.9-1.10.3.jar
+8b99dc166a607a0e21111cc1d0de18e45ad638a500c0cd6ffeb9a0616ae7b5c0  # fadeless-2.0.2.jar
+bc800711a9c2fdd1614f1a88527b6514a79a5fb1fae6bafb00dd2c2188062510  # fastquit-3.0.0+1.21.4.jar
+2acd5f80195606f1b6a3eb0b2dfd4f3b80e2aa7d0e8b053d3b12f02c02dabb5d  # fabrishot-1.14.4.jar
+51236490094b7e018a2d29f7626f882253ba208af957b526b57c58656fb912d1  # moreculling-fabric-1.21.4-1.2.10.jar
+aaf784c4993bd7304d766e76fb3ea49950a9d4a34de81adbf7499a86b546ebf6  # puzzle-fabric-2.0.5+1.21.4.jar
+527b7d53abc7e08db5a0eaf756762fa818a89c25929372df8669ebe7da09a39c  # Debugify-1.21.4+1.1.jar
+5d8c348b5516560f8ae951c343f47914cd1b3205cc6c78d23aa06f59b4e36b5c  # ViaFabric-0.4.17+102-main.jar
+87e046a7699b3bbf61af858cc69d3c6df808e4b153d89549d696797b84b6f136  # modelfix-1.21.3-1.10-fabric.jar
+db4c744fd71f5617639cb0fdff72378b08d2852004f4045c62090de1bf53afcb  # yosbr-0.1.2.jar
+26ca21a27706cfa4561868f31c4fd07c542e8cc759419f5884ddff1f3a126a99  # mixintrace-1.1.1+1.17.jar
+0c9123d9cbeb5085bb167422dee745c2f9942001163cc3fe80b4b0f55981a42a  # entity_model_features_fabric_1.21.4-2.4.1.jar
+30875192e8fdcdc2e5add10cfb3e8a97e7096095e7783868bb91c989598114b1  # entity_texture_features_fabric_1.21.4-6.2.10.jar
+aaca8ebab1b326d70e9d8ae656f9d20478a237867f7913293dad8d0ffef3397a  # entity-view-distance-1.4.0+1.21.4.jar
+0e2fe3c8d60a4987680d8b6c1bb5d44479de80a26ec042f22138ec4b73a8e22d  # cwb-fabric-3.0.0+mc1.21.3.jar
+7a70028c2407ba6bec26fa470e0141978a1df26d1eb3e6982e2c1d4c90b97a1e  # rrls-5.1.2+mc1.21.4-fabric.jar
+657a1c9427c6246932016a74504ec4265580feff1801c804b2938133aa127f51  # optigui-2.3.0-beta.7+1.21.2.jar
+4fa464b4a417d6c5bc75031d8de30964a6b26d8b09b7dd02b0b341db27302a70  # paginatedadvancements-2.6.1+1.21.4.jar
+9cf0db9ef594e8bba7bcc98445150f6bfebc4644e0791d7b42393552220b6656  # placeholder-api-2.5.1+1.21.3.jar
+c1b850b68c1bef49184c58f953a4e07b5fcfdac72719a92c3829d261cc0214f0  # no-resource-pack-warnings-1.4.0.jar
+bd4dedfbdb81260f8272587c19abbb3a133cd11cfc6f079dfea768d5ae46d2ab  # memoryusagetitle-fabric-1.0.1.jar
+39aab1fdc172ab6ca7531137495d8a2e741c946acef9b1c919706e3929b9e1de  # main-menu-credits-1.2.0.jar
+4723ebac23c3a210117f2231155bc869942e6e4cdcee4b0f26c6fcf355458330  # bettermounthud-1.2.5.jar
+d61b0ed3aa9426d142ba461c0d6a516cc38fef922328c0e3186dbee130739e2e  # NoFov-MC1.8-1.0.jar
+c7a9602cb95109c6cd371d805b7bf35cc79488a16bc5b5d37f266a29093a38c4  # TexFix V-1.8.9-4.0.jar
+7bbf4e6cde47bfffcf3c63afbe7ee33436c36301111f420ae34791bd18e278d8  # itlt-1.8.8-9-1.0.2.jar
+e0ec72408077abac1b25482fc8f8dbca5107a91ae8cd15177c2b7bbb62d8c6df  # animatica-0.6.1+1.21.4.jar
+24bf2dad8d524b297952bd028dc3b2b4496035bce9d0a3dc22ada2b3cc9142f0  # BetterGrassify-1.7.0+fabric.1.21.4.jar
+e8404b8bfc8b59e889a7b6137c00d60af9201740641441ee91a235e4cbf6370c  # meteor-crash-addon-0.6.jar
+5a23b8cf3142def3fd7ad8cd29e14abafbc7bc718372219c22078e5a93f578a7  # orion-0.2.jar
+
+# ── GamerPotion server-side mods ──
+8c88323b8f5fae9f96855b4d7dfaaea961996ee5eca2bf813be5e8a3f209cd3c  # darkcap-fabric-1.21-1.1.7a.jar
+99a6062fc634a0fcaea4f5c3e892bf24e5304cd1653492baca564abe8a899a28  # darkdeath-fabric-1.21-1.1.5a.jar
+300a970adf4926b1869e91a746d3dd7fe3f1f30eee2ddc08c12882736b350a7d  # darkflight-fabric-1.21-1.1.8a.jar
+f56f65245885cb7256e4e254a078ecab11f45c6639eae652b18a4ab34db7301c  # darkglint-fabric-1.21-1.1.4b.jar
+a2aacd4bf614968c69f36139ad22654c43387f50e88e5c6b8a7994d4523abe7f  # darkheads-fabric-1.21-1.1.5a.jar
+7edfb157f9fada49c6e7cb117a5f1fcbebc0bcf523f81af00d1e34d940f55b6f  # darkrtp-fabric-1.21-1.1.9a.jar
+23f871b2d27afac6fb398644301d64bf120c8b46e4dee60f18d9dcbf6845b4b7  # darksleep-fabric-1.21.1-1.0.1a.jar
+93a6eb55ac2af56dfde7ad789eeee60a5c2f1c164b14bb1455e5bae3769bccb1  # darksmelting-fabric-1.21-1.1.5a.jar
+421316aa059fa4baa3e81c3266261d3b76acee44a6bbded160d4adf9b1b85d01  # darksmithing-fabric-1.21-1.1.7a.jar
+5e7ab44d172ff7e0b779430fe5b4f7a5b80c048e441fd79a0ee2e8f05c52303f  # darkspawn-fabric-1.21-1.1.5a.jar
+7b2dfa2767a27fe4e02238f783f4597fe7369def7e4a31a8aee5ce2bd6d7dc88  # darktimer-fabric-1.21-1.2.1a.jar
+e9b97e78a389a9279d90196d782f2301ae2b885b1a16bd39636d0973c29b8b8d  # darkwooly-fabric-1.21-1.1.5a.jar
+72f30491ec743a058c1ba23445ed7bf2e7e3f4d8e6337d69689d9c442d4053bd  # darkzoom-fabric-1.21-1.0.8a.jar
+ef938227f6a081651fe9e8cd8af2754d3ec9a983833e3142c1ddcb48a2528cbc  # morningglory-fabric-1.21.1-1.0.1a.jar
+faf2632f650ee3697efce53de7ed51df7cb75a14d962e6d61aed86e3e2b341e2  # armorstandarms-fabric-1.21-1.0.1a.jar
+ab8bff2f5616261a0634513091f7c1a0d42268d4a87907b600e23cf38358c16b  # breadvariants-fabric-1.21-1.0.1b.jar
+75bb0303d1c2e0431d986cbd8a88c8254ceb09491f77201e53e3c653e6049a13  # breadvariants-fabric-1.21.6-1.0.4a.jar
+7c139d7282c6b928804d8952c0c3dbea7a6a97680e85348e4c4d6e2a994e7ca6  # goldenfeather-fabric-1.21-1.0.3c.jar
+c136101d02db422969563dfe2041dac2bb052f0ad3365d1ff19a07f1f3609436  # macevariants-fabric-1.21-1.0.4b.jar
+
+# ── LWJGL native libraries ──
+00f42898fbe7b99ec319e86ddf5d890c89bebedfc4e5f2df4e49d07e81dd4ec2  # depth0_lwjgl-nanovg-3.3.3-natives-linux.jar
+839e3604aacabca0641f5a9eb28fee81acf928115d07828e78953679f694801f  # depth0_lwjgl-nanovg-3.3.3-natives-macos-arm64.jar
+638ac68bcfe14318959cb8c6c6663337a80fe93609422d5037bc1df3cd432d84  # depth0_lwjgl-nanovg-3.3.3-natives-macos.jar
+2d35eaeb4940c61bcb1b55633a5356f62b5a744ea6e3b5055709091908ab5e7f  # depth0_lwjgl-nanovg-3.3.3-natives-windows.jar
+e59998e0504b6caf5cb870cc6ca5b3f55040db09dc5a4e32aa56e8f89c55cd1f  # depth0_lwjgl-nanovg-3.3.3.jar
+54b1d4dca920b46944e52c7bf773518a39580e60c93edaeb517fe2467ad544fb  # depth0_lwjgl-stb-3.3.3-natives-linux.jar
+d5abf8a960df44fe32c454be8b8e5d215ffa958c687f3d41446caf0b71e7f570  # depth0_lwjgl-stb-3.3.3-natives-macos-arm64.jar
+b02a1e2d2fc33f7911588d9438d829c783a2dcb018203a5542395801f5c017e2  # depth0_lwjgl-stb-3.3.3-natives-macos.jar
+9fa2f372db7e475c41b2a82cd285b7ac765a16398b467d908941b8e427eb29a1  # depth0_lwjgl-stb-3.3.3-natives-windows.jar
+94bbff1f6241522ad37b2a4860d02b1dc7fc25f46e20d2a103b1fc7e6bae596c  # depth0_lwjgl-stb-3.3.3.jar
+
+# ── Misc utility mods ──
+a72c9d37310bf9addd819602e07058ef4020f3871164e7322838f6857e960a6e  # AntiP2W-Tools-v2+b13+81710df.jar
+437b0ee057586cb0f6de71f9c7a49289abdd81b18265ec9a8d46e50649eda733  # dupemate-1.0.0.jar
+e5f7f40af419826f68234163993f3983917729ec505cc8d39a0fcb250a8545b9  # dupersunited-public-addon-1.21.11-3.3.7.jar
+2be9dc08fec4183fa56aac7e77d43a638b14739fb7ced4c981251211fba8de96  # telelo-UwU-0.3.17.jar
+4143b4ad74eb37c012af726d55ae37f7e555e999331e3ff308082ee6682c0ef2  # exploit-addon-public-1.21.4-1.0.0.jar
+e7de4240357ebd898ab08883d27ecfb01a430259249c1a576094b33dd9921c29  # vicore-addon-7.1.2-1.21.6.jar
+d63236061e8caa4d138ee3c0ebb9a92ee1d68e3a6fae0aacfe11ce41eafad93b  # Cyemer-Client-Fabric-1.21.1_1.jar
+1335ba10485577a6f3c8b02cd340b630af9c88f2c121952dce44754979c01018  # CakeHaus-protected.jar
