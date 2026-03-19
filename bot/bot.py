@@ -34,13 +34,18 @@ from typing import Optional
 import yaml
 
 # ─── Deobfuscation ──────────────────────────────────────────────────────────
-# Add tools/ to path so we can import deobfuscate_dasho
+# Add tools/ to path so we can import deobfuscators
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 try:
     from deobfuscate_dasho import deobfuscate_jar as _deobfuscate_jar
     DEOBFUSCATOR_AVAILABLE = True
 except ImportError:
     DEOBFUSCATOR_AVAILABLE = False
+try:
+    from deobfuscate_generic import deobfuscate_jar as _deobfuscate_generic
+    GENERIC_DEOBFUSCATOR_AVAILABLE = True
+except ImportError:
+    GENERIC_DEOBFUSCATOR_AVAILABLE = False
 
 # ─── Logging ────────────────────────────────────────────────────────────────
 
@@ -3283,7 +3288,7 @@ def build_embeds(
 
     # ── Deobfuscated strings ──
     if deobfuscation and deobfuscation.get("detected"):
-        deob_lines = [f"**DashO string encryption cracked** — {deobfuscation['total_decrypted']} strings "
+        deob_lines = [f"**String encryption cracked** — {deobfuscation['total_decrypted']} strings "
                       f"from {deobfuscation['classes_with_strings']} classes"]
         algos = deobfuscation.get("algorithms", [])
         if algos:
@@ -5350,6 +5355,20 @@ async def save_command(
     log.info(f"Sample saving set to {enabled} by {ctx.author}")
 
 
+# ─── /die command (emergency kill) ───────────────────────────────────────────
+
+@bot.slash_command(name="die", description="Emergency shutdown — kills the bot immediately (alert IDs only)", **_install_params)
+async def die_command(ctx: discord.ApplicationContext):
+    alert_ids = _get_alert_user_ids()
+    if ctx.author.id not in alert_ids:
+        return await ctx.respond("You are not authorized to use this command.", ephemeral=True)
+    log.critical(f"EMERGENCY SHUTDOWN triggered by {ctx.author} ({ctx.author.id})")
+    await ctx.respond("Shutting down immediately.", ephemeral=True)
+    await asyncio.to_thread(stop_tor)
+    await bot.close()
+    os._exit(0)
+
+
 # ─── Scan Runner ─────────────────────────────────────────────────────────────
 
 async def run_scan(
@@ -5806,6 +5825,33 @@ async def run_scan(
                     deobfuscation = None
             except Exception as exc:
                 log.warning(f"Deobfuscation failed: {exc}")
+
+        # ── Generic string deobfuscation (XOR, base64, ROT, hex, etc.) ──
+        if GENERIC_DEOBFUSCATOR_AVAILABLE and is_zip:
+            try:
+                generic_result = await asyncio.to_thread(_deobfuscate_generic, str(dl_path))
+                if generic_result and generic_result.get("detected"):
+                    log.info(f"Generic deobfuscation: {generic_result['total_decrypted']} strings from "
+                             f"{generic_result['classes_with_strings']} classes "
+                             f"(algorithms: {', '.join(generic_result.get('algorithms', []))})")
+                    if deobfuscation and deobfuscation.get("detected"):
+                        # Merge generic results into existing DashO results
+                        existing_keys = {(s["class"], s["decrypted"]) for s in deobfuscation.get("strings", [])}
+                        new_strings = [s for s in generic_result.get("strings", [])
+                                       if (s["class"], s["decrypted"]) not in existing_keys]
+                        if new_strings:
+                            deobfuscation["strings"].extend(new_strings)
+                            deobfuscation["total_decrypted"] += len(new_strings)
+                            deobfuscation["classes_with_strings"] = len(
+                                {s["class"] for s in deobfuscation["strings"]})
+                            existing_algos = set(deobfuscation.get("algorithms", []))
+                            for a in generic_result.get("algorithms", []):
+                                if a not in existing_algos:
+                                    deobfuscation["algorithms"].append(a)
+                    else:
+                        deobfuscation = generic_result
+            except Exception as exc:
+                log.warning(f"Generic deobfuscation failed: {exc}")
 
         # ── Entropy analysis ──
         stage_details["Local Analysis"] = "Analyzing entropy..."

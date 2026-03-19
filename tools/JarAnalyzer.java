@@ -752,6 +752,7 @@ public class JarAnalyzer {
         // Locate all available decompilers
         String vineflowerPath = findDecompiler("vineflower.jar");
         String jadxPath = findDecompiler("jadx");
+        String procyonPath = findDecompiler("procyon-decompiler.jar");
         String decompilerUsed = "none";
 
         banner();
@@ -762,7 +763,8 @@ public class JarAnalyzer {
         ilog("MD5        : " + jarMd5);
         ilog("Size       : " + String.format("%,d", jarSize) + " bytes");
         ilog("Decompilers: CFR=" + cfrPath + " Vineflower=" + vineflowerPath
-            + (jadxPath != null ? " JADX=" + jadxPath : ""));
+            + (jadxPath != null ? " JADX=" + jadxPath : "")
+            + (procyonPath != null ? " Procyon=" + procyonPath : ""));
         ilog("");
         ok("SHA-256: " + jarSha256);
 
@@ -836,7 +838,7 @@ public class JarAnalyzer {
         ok("Stripped JAR: " + strippedClasses + " class(es) to decompile (library classes excluded)");
 
         step("Decompiling full JAR to source/...");
-        decompilerUsed = decompileFullJar(decompileTarget, sourceDir, vineflowerPath, jadxPath, cfrPath);
+        decompilerUsed = decompileFullJar(decompileTarget, sourceDir, vineflowerPath, jadxPath, procyonPath, cfrPath);
         ok("Full decompilation complete (used: " + decompilerUsed + ")");
 
         // Also build the in-memory source string + per-file map for pattern matching
@@ -3521,10 +3523,10 @@ public class JarAnalyzer {
         return cleanJar;
     }
 
-    /** Decompile a full JAR using cascade: Vineflower -> JADX -> CFR.
+    /** Decompile a full JAR using cascade: Vineflower -> JADX -> Procyon -> CFR.
      *  After each decompiler, checks that critical files actually decompiled
      *  (not just error stubs). Falls through if key files have "Couldn't be decompiled". */
-    static String decompileFullJar(String jarPath, Path sourceDir, String vineflower, String jadx, String cfr) {
+    static String decompileFullJar(String jarPath, Path sourceDir, String vineflower, String jadx, String procyon, String cfr) {
         // Try Vineflower first (best output quality)
         if (vineflower != null) {
             try {
@@ -3545,7 +3547,7 @@ public class JarAnalyzer {
                 } else if (fileCount > 0 && failedCount > 0) {
                     warn("  Vineflower produced " + fileCount + " file(s) but " + failedCount + " failed to decompile — trying other decompilers for failed files");
                     // Keep Vineflower output but supplement with other decompilers
-                    String supplement = supplementFailedFiles(jarPath, sourceDir, jadx, cfr);
+                    String supplement = supplementFailedFiles(jarPath, sourceDir, jadx, procyon, cfr);
                     return "Vineflower+" + supplement;
                 }
             } catch (Exception e) {
@@ -3570,6 +3572,27 @@ public class JarAnalyzer {
                 }
             } catch (Exception e) {
                 warn("  JADX failed: " + e.getMessage());
+            }
+        }
+
+        // Try Procyon (handles complex control flow well)
+        if (procyon != null) {
+            try {
+                step("  Trying Procyon...");
+                Process p = new ProcessBuilder("java", "-Xmx512m", "-jar", procyon,
+                        "-jar", jarPath, "-o", sourceDir.toString())
+                    .redirectErrorStream(true).start();
+                p.getInputStream().transferTo(OutputStream.nullOutputStream());
+                boolean done = p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS);
+                if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
+                else p.destroyForcibly();
+                long fileCount = countJavaFiles(sourceDir);
+                if (fileCount > 0) {
+                    ok("  Procyon produced " + fileCount + " .java file(s)");
+                    return "Procyon";
+                }
+            } catch (Exception e) {
+                warn("  Procyon failed: " + e.getMessage());
             }
         }
 
@@ -3608,27 +3631,113 @@ public class JarAnalyzer {
         } catch (Exception e) { return 0; }
     }
 
-    /** Re-decompile files that Vineflower failed on using JADX or CFR */
-    static String supplementFailedFiles(String jarPath, Path sourceDir, String jadx, String cfr) {
+    /** Re-decompile files that Vineflower failed on using JADX, Procyon, or CFR */
+    static String supplementFailedFiles(String jarPath, Path sourceDir, String jadx, String procyon, String cfr) {
         try {
             // Find which .java files failed
-            List<Path> failedFiles = new ArrayList<>();
+            List<Path> failedFiles;
             try (var walker = Files.walk(sourceDir)) {
-                walker.filter(p -> p.toString().endsWith(".java"))
-                    .forEach(p -> {
+                failedFiles = new ArrayList<>(walker.filter(p -> p.toString().endsWith(".java"))
+                    .filter(p -> {
                         try {
                             String content = Files.readString(p);
-                            if (content.contains("Couldn't be decompiled") || content.contains("// Failed to decompile")) {
-                                failedFiles.add(p);
-                            }
-                        } catch (Exception ignored) {}
-                    });
+                            return content.contains("Couldn't be decompiled") || content.contains("// Failed to decompile");
+                        } catch (Exception e) { return false; }
+                    })
+                    .collect(java.util.stream.Collectors.toList()));
             }
 
             if (failedFiles.isEmpty()) return "none";
 
-            // Try CFR on the whole JAR, then copy over only the failed files
-            if (cfr != null) {
+            List<String> supplementsUsed = new ArrayList<>();
+
+            // Try JADX for failed files (good deobfuscation)
+            if (jadx != null && !failedFiles.isEmpty()) {
+                Path jadxTmp = Files.createTempDirectory("jadx_supplement_");
+                try {
+                    step("  Supplementing " + failedFiles.size() + " failed file(s) with JADX...");
+                    Process p = new ProcessBuilder("java", "-jar", jadx, "--deobf", "-d", jadxTmp.toString(), jarPath)
+                        .redirectErrorStream(true).start();
+                    p.getInputStream().transferTo(OutputStream.nullOutputStream());
+                    boolean done = p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS);
+                    if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
+                    else p.destroyForcibly();
+
+                    int replaced = 0;
+                    List<Path> stillFailed = new ArrayList<>();
+                    for (Path failed : failedFiles) {
+                        String rel = sourceDir.relativize(failed).toString();
+                        Path jadxFile = jadxTmp.resolve(rel);
+                        if (Files.exists(jadxFile)) {
+                            String jadxContent = Files.readString(jadxFile);
+                            if (!jadxContent.contains("Couldn't be decompiled") && !jadxContent.contains("// Failed to decompile")) {
+                                Files.copy(jadxFile, failed, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                                replaced++;
+                            } else {
+                                stillFailed.add(failed);
+                            }
+                        } else {
+                            stillFailed.add(failed);
+                        }
+                    }
+                    if (replaced > 0) {
+                        ok("  JADX supplemented " + replaced + " of " + failedFiles.size() + " failed file(s)");
+                        supplementsUsed.add("JADX");
+                    }
+                    failedFiles.clear();
+                    failedFiles.addAll(stillFailed);
+                    cleanUp(jadxTmp);
+                } catch (Exception e) {
+                    warn("  JADX supplement failed: " + e.getMessage());
+                    cleanUp(jadxTmp);
+                }
+            }
+
+            // Try Procyon for remaining failed files (handles complex control flow)
+            if (procyon != null && !failedFiles.isEmpty()) {
+                Path procTmp = Files.createTempDirectory("procyon_supplement_");
+                try {
+                    step("  Supplementing " + failedFiles.size() + " failed file(s) with Procyon...");
+                    Process p = new ProcessBuilder("java", "-Xmx512m", "-jar", procyon,
+                            "-jar", jarPath, "-o", procTmp.toString())
+                        .redirectErrorStream(true).start();
+                    p.getInputStream().transferTo(OutputStream.nullOutputStream());
+                    boolean done = p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS);
+                    if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
+                    else p.destroyForcibly();
+
+                    int replaced = 0;
+                    List<Path> stillFailed = new ArrayList<>();
+                    for (Path failed : failedFiles) {
+                        String rel = sourceDir.relativize(failed).toString();
+                        Path procFile = procTmp.resolve(rel);
+                        if (Files.exists(procFile)) {
+                            String procContent = Files.readString(procFile);
+                            if (!procContent.contains("Couldn't be decompiled") && !procContent.contains("// Failed to decompile")) {
+                                Files.copy(procFile, failed, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                                replaced++;
+                            } else {
+                                stillFailed.add(failed);
+                            }
+                        } else {
+                            stillFailed.add(failed);
+                        }
+                    }
+                    if (replaced > 0) {
+                        ok("  Procyon supplemented " + replaced + " of " + failedFiles.size() + " failed file(s)");
+                        supplementsUsed.add("Procyon");
+                    }
+                    failedFiles.clear();
+                    failedFiles.addAll(stillFailed);
+                    cleanUp(procTmp);
+                } catch (Exception e) {
+                    warn("  Procyon supplement failed: " + e.getMessage());
+                    cleanUp(procTmp);
+                }
+            }
+
+            // Try CFR for remaining failed files
+            if (cfr != null && !failedFiles.isEmpty()) {
                 Path cfrTmp = Files.createTempDirectory("cfr_supplement_");
                 try {
                     step("  Supplementing " + failedFiles.size() + " failed file(s) with CFR...");
@@ -3640,27 +3749,30 @@ public class JarAnalyzer {
                     if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
                     else p.destroyForcibly();
 
-                    // For each failed file, find the corresponding CFR output
                     int replaced = 0;
                     for (Path failed : failedFiles) {
                         String rel = sourceDir.relativize(failed).toString();
                         Path cfrFile = cfrTmp.resolve(rel);
                         if (Files.exists(cfrFile)) {
                             String cfrContent = Files.readString(cfrFile);
-                            if (!cfrContent.contains("Couldn't be decompiled")) {
+                            if (!cfrContent.contains("Couldn't be decompiled") && !cfrContent.contains("// Failed to decompile")) {
                                 Files.copy(cfrFile, failed, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
                                 replaced++;
                             }
                         }
                     }
-                    ok("  CFR supplemented " + replaced + " of " + failedFiles.size() + " failed file(s)");
+                    if (replaced > 0) {
+                        ok("  CFR supplemented " + replaced + " of " + failedFiles.size() + " failed file(s)");
+                        supplementsUsed.add("CFR");
+                    }
                     cleanUp(cfrTmp);
-                    return "CFR";
                 } catch (Exception e) {
                     warn("  CFR supplement failed: " + e.getMessage());
                     cleanUp(cfrTmp);
                 }
             }
+
+            return supplementsUsed.isEmpty() ? "none" : String.join("+", supplementsUsed);
         } catch (Exception e) {
             warn("  Supplement failed: " + e.getMessage());
         }
