@@ -5074,6 +5074,12 @@ async def _wait_for_bot_ready():
 @bot.slash_command(name="giverat", description="Scan a file for RAT/malware signatures", **_install_params)
 async def giverat_command(
     ctx: discord.ApplicationContext,
+    private: discord.Option(
+        bool,
+        description="Private scan — local only, no uploads to VT/MB/HA",
+        required=False,
+        default=False,
+    ),
     file: discord.Option(
         discord.Attachment,
         description="File to scan (up to 100MB)",
@@ -5160,8 +5166,9 @@ async def giverat_command(
         scan_targets.append((None, url, sid, url[:60]))
 
     # ephemeral ack
+    private_tag = " (private — local only)" if private else ""
     if len(scan_targets) == 1:
-        ack_text = f"Scanning `{scan_targets[0][3]}` \u2014 results will be posted publicly.\nScan ID: `{scan_targets[0][2]}`"
+        ack_text = f"Scanning `{scan_targets[0][3]}`{private_tag} \u2014 results will be posted publicly.\nScan ID: `{scan_targets[0][2]}`"
     else:
         lines = [f"Queuing **{len(scan_targets)}** file(s) for scanning:"]
         for _, _, sid, dname in scan_targets:
@@ -5228,7 +5235,7 @@ async def giverat_command(
         try:
             # Use create_task so multiple files scan concurrently (up to semaphore limit)
             asyncio.create_task(
-                scan_queue.submit(run_scan(ctx, attach, scan_url, scan_id), on_dequeue=_on_dequeue)
+                scan_queue.submit(run_scan(ctx, attach, scan_url, scan_id, private=private), on_dequeue=_on_dequeue)
             )
         except Exception as e:
             log.exception(f"Scan submit failed for {display_name}")
@@ -5351,6 +5358,7 @@ async def run_scan(
     url: Optional[str],
     scan_id: str,
     local_file: Optional[str] = None,  # for multi-JAR ZIP: path to an already-extracted JAR
+    private: bool = False,  # private scan: local analysis only, no uploads to VT/MB/HA
 ):
     start = time.time()
     work_dir = tempfile.mkdtemp(prefix="scan_")
@@ -5408,6 +5416,8 @@ async def run_scan(
             pass
 
     try:
+        scanned_path = None
+
         # ── Download / locate file ──
         if local_file:
             # Already extracted (multi-JAR ZIP sub-scan)
@@ -5483,9 +5493,11 @@ async def run_scan(
         await ensure_http_session()
 
         # ── Build stage tracker ──
-        vt_enabled = CFG["virustotal"]["enabled"] and CFG["virustotal"]["api_key"]
-        mb_enabled = CFG.get("malwarebazaar", {}).get("enabled", True)
-        ha_enabled = CFG.get("hybrid_analysis", {}).get("enabled", True) and CFG.get("hybrid_analysis", {}).get("api_key", "")
+        # Private scan: skip all external API uploads/lookups
+        vt_enabled = CFG["virustotal"]["enabled"] and CFG["virustotal"]["api_key"] and not private
+        mb_enabled = CFG.get("malwarebazaar", {}).get("enabled", True) and not private
+        ha_enabled = (CFG.get("hybrid_analysis", {}).get("enabled", True)
+                      and CFG.get("hybrid_analysis", {}).get("api_key", "") and not private)
         stages = {
             "Local Analysis": "pending",
             "VirusTotal": "pending" if vt_enabled else "skipped",
@@ -5493,6 +5505,8 @@ async def run_scan(
             "MalwareBazaar": "pending" if mb_enabled else "skipped",
             "Hybrid Analysis": "pending" if ha_enabled else "skipped",
         }
+        if private:
+            log.info(f"[{scan_id}] Private scan — external APIs disabled")
 
         # Send initial progress embed
         await update_progress(stages, filename, file_size, hashes)
@@ -5718,7 +5732,7 @@ async def run_scan(
                         inner_name = os.path.basename(inner_jar)
                         log.info(f"[{scan_id}] Multi-JAR ZIP: spawning sub-scan {sub_scan_id} for {inner_name}")
                         asyncio.create_task(
-                            scan_queue.submit(run_scan(ctx, None, None, sub_scan_id, local_file=inner_jar))
+                            scan_queue.submit(run_scan(ctx, None, None, sub_scan_id, local_file=inner_jar, private=private))
                         )
                     # Clean up the current scan — sub-scans handle everything
                     if scan_msg:
@@ -6177,6 +6191,10 @@ async def run_scan(
             zip_files.extend(package_logs(ld, work_dir, mod_name))
 
         # ── Send main results — replace progress embed ──
+        scan_header = f"Scan requested by {ctx.author.mention}"
+        if private:
+            scan_header += " \U0001F512 **Private scan** — no external uploads"
+
         files_to_send = []
         for zp in zip_files:
             if os.path.getsize(zp) > 0:
@@ -6184,7 +6202,7 @@ async def run_scan(
 
         try:
             if scan_msg:
-                await scan_msg.edit(content=f"Scan requested by {ctx.author.mention}", embeds=embeds, view=None)
+                await scan_msg.edit(content=scan_header, embeds=embeds, view=None)
                 if files_to_send:
                     # Discord limits to 10 files per message — batch if needed
                     for i in range(0, len(files_to_send), 10):
@@ -6197,7 +6215,7 @@ async def run_scan(
                 # First message: embeds + up to 10 files
                 first_batch = files_to_send[:10]
                 await safe_send(
-                    content=f"Scan requested by {ctx.author.mention}",
+                    content=scan_header,
                     embeds=embeds,
                     files=first_batch,
                 )
@@ -6299,7 +6317,7 @@ def start_tor():
     tor_proxy = CFG["scanner"].get("tor_proxy", "socks5://127.0.0.1:9050")
 
     if _is_tor_running(tor_proxy):
-        log.info("Tor is already running")
+        log.info("Tor is already running on %s", tor_proxy)
         return
 
     tor_exe = _find_tor_exe()
@@ -6307,14 +6325,24 @@ def start_tor():
         log.warning(
             "Tor not found. Place the Tor Expert Bundle in master/tor/ "
             "or install Tor and ensure it's on PATH. "
-            "URL downloads will fail if require_tor_for_urls is true."
+            "URL downloads will fall back to direct connections."
         )
         return
 
+    tor_dir = Path(tor_exe).parent
+    data_dir = tor_dir / "data"
+
+    # Remove stale lock file from previous crash
+    lock_file = data_dir / "lock"
+    if lock_file.exists():
+        try:
+            lock_file.unlink()
+            log.info("Removed stale Tor lock file")
+        except OSError:
+            pass
+
     log.info(f"Starting Tor from {tor_exe}...")
     try:
-        # Launch Tor as a background process (DEVNULL prevents pipe buffer deadlock)
-        tor_dir = Path(tor_exe).parent
         torrc = tor_dir / "torrc"
         cmd = [tor_exe]
         if torrc.exists():
@@ -6341,8 +6369,23 @@ def start_tor():
                 log.error(f"Tor process exited with code {_tor_process.returncode}"
                           + (f": {stderr_out}" if stderr_out else ""))
                 _tor_process = None
+                # If it failed due to lock/address in use, try one more time
+                if i == 0:
+                    log.info("Retrying Tor startup...")
+                    if lock_file.exists():
+                        try:
+                            lock_file.unlink()
+                        except OSError:
+                            pass
+                    _tor_process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        cwd=str(tor_dir),
+                    )
+                    continue
                 return
-        log.warning("Tor started but proxy not responding after 30s — URL downloads may fail")
+        log.warning("Tor started but proxy not responding after 30s — URL downloads will fall back to direct")
     except Exception as e:
         log.error(f"Failed to start Tor: {e}")
         _tor_process = None
