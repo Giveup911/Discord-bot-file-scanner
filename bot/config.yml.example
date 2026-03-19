@@ -33,7 +33,7 @@ hybrid_analysis:
 
 scanner:
   java_path: "java"
-  max_file_size_mb: 50
+  max_file_size_mb: 100
   scan_timeout_seconds: 300
   max_concurrent_scans: 3
   cooldown_seconds: 30
@@ -50,3 +50,12 @@ scanner:
 yara:
   enabled: true
   rules_dir: "rules"
+
+# Alert notifications — DM these user IDs when thresholds are hit
+alerts:
+  user_ids:
+    - 123456789012345678
+  # Alert when total file storage exceeds this (GB)
+  storage_threshold_gb: 10
+  # Alert when scan requests exceed this in a rolling 1-hour window
+  hourly_request_threshold: 20

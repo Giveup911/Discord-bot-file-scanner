@@ -555,3 +555,146 @@ rule Scheduled_Delayed_Payload {
     condition:
         ($timer or $sched1 or $sched2) and ($proc1 or $exec1 or $loader1 or $loader2 or $unsafe)
 }
+
+rule PyInstaller_PyArmor_Packed {
+    meta:
+        description = "PyInstaller executable with PyArmor obfuscation — likely Python RAT/stealer"
+        author = "RatScanner"
+        severity = "high"
+    strings:
+        $mz = "MZ"
+        $pyinst1 = "PYZ-00.pyz" ascii
+        $pyinst2 = "MEIPASS" ascii
+        $pyinst3 = "pyimod" ascii
+        $pyinst4 = "PyInstaller" ascii
+        $pyarmor1 = "__pyarmor__" ascii
+        $pyarmor2 = "PY000000" ascii
+        $pyarmor3 = "pyarmor_runtime" ascii
+    condition:
+        $mz at 0 and 2 of ($pyinst*) and any of ($pyarmor*)
+}
+
+rule PyInstaller_Stealer_Toolkit {
+    meta:
+        description = "PyInstaller bundle with credential theft and exfiltration modules"
+        author = "RatScanner"
+        severity = "critical"
+    strings:
+        $mz = "MZ"
+        $pyinst1 = "PYZ-00.pyz" ascii
+        $pyinst2 = "MEIPASS" ascii
+        $win32crypt = "win32crypt" ascii
+        $dpapi = "CryptUnprotectData" ascii
+        $cv2 = "cv2" ascii
+        $pynput = "pynput" ascii
+        $requests = "requests" ascii
+        $aiohttp = "aiohttp" ascii
+        $psutil = "psutil" ascii
+    condition:
+        $mz at 0 and any of ($pyinst*) and (
+            ($win32crypt or $dpapi) and ($requests or $aiohttp)
+            or $pynput
+            or ($cv2 and ($requests or $aiohttp))
+            or ($psutil and ($win32crypt or $pynput or $cv2))
+        )
+}
+
+rule Zipbomb_Dropper {
+    meta:
+        description = "Rust-based zipbomb dropper that deploys disguised executables"
+        author = "RatScanner"
+        severity = "critical"
+    strings:
+        $mz = "MZ"
+        $fatal_copy = "FATAL: copy payload" ascii
+        $fatal_worker = "FATAL: worker" ascii
+        $fatal_dirs = "FATAL: no writable dirs" ascii
+        $zipbomb_pdb = "zipbomb" ascii nocase
+        $updhelper = "updhelper.exe" ascii
+        $cfgsync = "cfgsync.exe" ascii
+        $logrotate = "logrotate.exe" ascii
+    condition:
+        $mz at 0 and (
+            any of ($fatal*)
+            or $zipbomb_pdb
+            or 2 of ($updhelper, $cfgsync, $logrotate)
+        )
+}
+
+rule MSHTA_Settings_Tel_Dropper {
+    meta:
+        description = "MSHTA dropper using settings.tel hosting for stage2"
+        author = "RatScanner"
+        severity = "critical"
+    strings:
+        $mshta = "mshta" ascii nocase
+        $settings_tel = "settings.tel" ascii
+        $cmd = "cmd.exe" ascii
+        $proc1 = "ProcessBuilder" ascii
+        $proc2 = "Runtime" ascii
+    condition:
+        $settings_tel or ($mshta and ($proc1 or $proc2) and $cmd)
+}
+
+rule qProtect_Evasion {
+    meta:
+        description = "qProtect obfuscator with .class/ trailing slash ZIP entry evasion"
+        author = "RatScanner"
+        severity = "high"
+    strings:
+        $pk = "PK"
+        $qprotect = "qProtect" ascii nocase
+        $trailing1 = ".class/" ascii
+        $config_marker = "userWebhook" ascii
+        $config_marker2 = "ratfileUrl" ascii
+        $donut_c2 = "donutsmp.net" ascii
+    condition:
+        $pk at 0 and (
+            $qprotect
+            or ($trailing1 and ($config_marker or $config_marker2))
+            or $donut_c2
+        )
+}
+
+rule GambleRig_Casino_RAT {
+    meta:
+        description = "GambleRigger/4E casino rig RAT family with session theft and auto-pay"
+        author = "RatScanner"
+        severity = "critical"
+    strings:
+        $pk = "PK"
+        $donut = "donutsmp.net" ascii
+        $user_webhook = "userWebhook" ascii
+        $ratfile = "ratfileUrl" ascii
+        $download_url = "downloadUrl" ascii
+        $auto_pay = "/pay " ascii
+        $session_token = "accessToken" ascii
+        $launcher_accts = "launcher_accounts" ascii
+    condition:
+        $pk at 0 and (
+            $donut
+            or ($user_webhook and $ratfile)
+            or $download_url
+            or ($auto_pay and $session_token and $launcher_accts)
+        )
+}
+
+rule Dupemate_MSHTA_Stealer {
+    meta:
+        description = "Dupemate-style stealer using stack-string obfuscation and mshta dropper"
+        author = "RatScanner"
+        severity = "high"
+    strings:
+        $pk = "PK"
+        $unloadchunk = ".unloadchunk" ascii
+        $settings_tel = "settings.tel" ascii
+        $mshta = "mshta" ascii
+        $texture_names = "loadTextureAtlas" ascii
+        $mipmap = "calculateMipmapLevels" ascii
+    condition:
+        $pk at 0 and (
+            $unloadchunk
+            or $settings_tel
+            or ($mshta and ($texture_names or $mipmap))
+        )
+}

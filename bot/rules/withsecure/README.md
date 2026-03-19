@@ -1,1 +1,0 @@
-Contains indicators of compromise (IOCs) from published reports and investigations

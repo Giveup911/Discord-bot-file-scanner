@@ -2,6 +2,9 @@
 bot/config.yml
 bot/stats.json
 
+# Runtime data
+bot/catalog.json
+
 # Environment and secrets
 .env
 *.env
@@ -16,13 +19,11 @@ service-account.json
 # Logs and scan output
 logs/
 scanned/
-scanner.log
-scanner.log.*
-webhook.log
+*.log
+bot/logs/
 
 # Uploaded samples
-PUT_JAR_HERE/*.jar
-PUT_JAR_HERE/*.zip
+PUT_JAR_HERE/
 
 # Python
 __pycache__/
@@ -58,8 +59,49 @@ Thumbs.db
 .DS_Store
 desktop.ini
 
-# Large YARA repos (download separately — see download script in rules/)
+# Downloaded YARA repos (users run download script — see rules/)
+# Only minecraft_rat.yar, minecraft_malware.yar, and download script are tracked
+bot/rules/100daysofyara-*/
+bot/rules/airbnb-*/
+bot/rules/anyrun/
+bot/rules/bartblaze/
+bot/rules/chronicle-*/
+bot/rules/citizenlab/
+bot/rules/cuckoo-*/
+bot/rules/darkencode/
+bot/rules/deadbits/
 bot/rules/defender-yara/
+bot/rules/delivrto/
+bot/rules/ditekshen/
+bot/rules/elastic-*/
+bot/rules/embee/
+bot/rules/eset/
+bot/rules/fboldewin/
+bot/rules/filescan/
+bot/rules/godaddy/
+bot/rules/h3x2b/
+bot/rules/inquest/
+bot/rules/jeff0falltrades/
+bot/rules/jpcert/
+bot/rules/malpedia-*/
+bot/rules/mandiant-*/
+bot/rules/mcafee-*/
+bot/rules/nsacyber/
+bot/rules/phishingkit/
+bot/rules/reversinglabs/
+bot/rules/russianpanda/
+bot/rules/sentinelone/
+bot/rules/sifalcon/
+bot/rules/signature-base/
+bot/rules/sivolko/
+bot/rules/sophos/
+bot/rules/strangerealIntel/
+bot/rules/stratosphere/
+bot/rules/telekom/
+bot/rules/trellix-*/
+bot/rules/volexity/
+bot/rules/withsecure/
+bot/rules/yara-rules-community/
 
 # Testing / scratch work
 testing/
@@ -67,6 +109,6 @@ testing/
 # Docs (local analysis, write-ups, malware samples)
 docs/
 
-# YARA repo .git dirs (should already be removed)
+# YARA repo .git dirs
 bot/rules/**/.git/
 bot/rules/**/.github/

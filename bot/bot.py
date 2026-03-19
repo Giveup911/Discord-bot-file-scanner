@@ -44,6 +44,8 @@ except ImportError:
 
 # ─── Logging ────────────────────────────────────────────────────────────────
 
+from logging.handlers import RotatingFileHandler
+
 _log_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 _log_dir = Path(__file__).resolve().parent / "logs"
 _log_dir.mkdir(exist_ok=True)
@@ -52,8 +54,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(
+        RotatingFileHandler(
             str(_log_dir / f"scanner_{_log_ts}.log"), encoding="utf-8",
+            maxBytes=50 * 1024 * 1024,  # 50 MB per log file
+            backupCount=5,  # keep 5 rotated files
         ),
     ],
 )
@@ -81,7 +85,7 @@ DEFAULT_CFG = {
     "hybrid_analysis": {"api_key": "", "enabled": True},
     "scanner": {
         "java_path": "java",
-        "max_file_size_mb": 50,
+        "max_file_size_mb": 100,
         "scan_timeout_seconds": 300,
         "max_concurrent_scans": 3,
         "cooldown_seconds": 30,
@@ -92,6 +96,11 @@ DEFAULT_CFG = {
         "tor_proxy": "socks5://127.0.0.1:9050",
     },
     "yara": {"enabled": True, "rules_dir": "rules"},
+    "alerts": {
+        "user_ids": [],
+        "storage_threshold_gb": 10,
+        "hourly_request_threshold": 20,
+    },
 }
 
 
@@ -377,6 +386,84 @@ async def update_stats(**increments):
             scan_stats[key] = scan_stats.get(key, 0) + delta
         save_stats(scan_stats)
 
+
+# ─── Alert System ──────────────────────────────────────────────────────────
+
+_hourly_requests: list[float] = []  # timestamps of scan requests in last hour
+_alert_cooldowns: dict[str, float] = {}  # alert_type -> last_sent_time (prevent spam)
+ALERT_COOLDOWN_SECONDS = 600  # don't repeat same alert within 10 minutes
+
+
+def _get_alert_user_ids() -> list[int]:
+    """Return configured alert recipient user IDs."""
+    raw = CFG.get("alerts", {}).get("user_ids", [])
+    if isinstance(raw, list):
+        return [int(uid) for uid in raw if uid]
+    return []
+
+
+def _get_storage_usage_bytes() -> int:
+    """Calculate total disk usage of scanned files, logs, and samples."""
+    total = 0
+    for check_dir in [MASTER_DIR / "logs", MASTER_DIR / "scanned",
+                      BOT_DIR / "logs", MASTER_DIR / "PUT_JAR_HERE"]:
+        if check_dir.exists():
+            for entry in check_dir.rglob("*"):
+                try:
+                    if entry.is_file():
+                        total += entry.stat().st_size
+                except OSError:
+                    pass
+    return total
+
+
+def _track_hourly_request():
+    """Record a scan request timestamp and prune entries older than 1 hour."""
+    now = time.time()
+    _hourly_requests.append(now)
+    cutoff = now - 3600
+    while _hourly_requests and _hourly_requests[0] < cutoff:
+        _hourly_requests.pop(0)
+
+
+def _hourly_request_count() -> int:
+    """Return number of scan requests in the last rolling hour."""
+    now = time.time()
+    cutoff = now - 3600
+    while _hourly_requests and _hourly_requests[0] < cutoff:
+        _hourly_requests.pop(0)
+    return len(_hourly_requests)
+
+
+async def send_alert(alert_type: str, title: str, description: str):
+    """Send a DM alert to all configured alert user IDs. Respects cooldown."""
+    now = time.time()
+    last_sent = _alert_cooldowns.get(alert_type, 0)
+    if now - last_sent < ALERT_COOLDOWN_SECONDS:
+        return  # cooldown active, don't spam
+
+    user_ids = _get_alert_user_ids()
+    if not user_ids:
+        return
+
+    _alert_cooldowns[alert_type] = now
+    log.warning(f"ALERT [{alert_type}]: {title} — {description}")
+
+    for uid in user_ids:
+        try:
+            user = await bot.fetch_user(uid)
+            dm = await user.create_dm()
+            embed = discord.Embed(
+                title=f"\u26A0\uFE0F Alert: {title}",
+                description=description,
+                color=0xFF6600,
+                timestamp=datetime.now(tz=timezone.utc),
+            )
+            embed.set_footer(text=f"RATScanner Alert • {alert_type}")
+            await dm.send(embed=embed)
+        except Exception as e:
+            log.warning(f"Failed to send alert DM to {uid}: {e}")
+
 # ─── File Catalog ────────────────────────────────────────────────────────────
 
 
@@ -599,6 +686,23 @@ def run_yara(filepath: str) -> list[dict]:
 
 VT_BASE = "https://www.virustotal.com/api/v3"
 
+# VT free tier: 4 requests/minute, 500/day. Use a lock to serialize.
+_vt_rate_lock: Optional[asyncio.Lock] = None
+_vt_last_request: float = 0.0
+
+
+async def _vt_rate_limit():
+    """Ensure at least 15 seconds between VT API calls (4/min limit)."""
+    global _vt_rate_lock, _vt_last_request
+    if _vt_rate_lock is None:
+        _vt_rate_lock = asyncio.Lock()
+    async with _vt_rate_lock:
+        now = time.time()
+        elapsed = now - _vt_last_request
+        if elapsed < 15:
+            await asyncio.sleep(15 - elapsed)
+        _vt_last_request = time.time()
+
 
 async def vt_lookup(sha256: str, session: aiohttp.ClientSession) -> Optional[dict]:
     log.info(f"vt_lookup called for {sha256[:16]}...")
@@ -606,6 +710,7 @@ async def vt_lookup(sha256: str, session: aiohttp.ClientSession) -> Optional[dic
     if not api_key or not CFG["virustotal"]["enabled"]:
         return None
     headers = {"x-apikey": api_key}
+    await _vt_rate_limit()
     try:
         async with session.get(f"{VT_BASE}/files/{sha256}", headers=headers) as resp:
             if resp.status == 200:
@@ -644,6 +749,7 @@ async def vt_upload(filepath: str, sha256: str, session: aiohttp.ClientSession) 
         return None
     headers = {"x-apikey": api_key}
     permalink = f"https://www.virustotal.com/gui/file/{sha256}"
+    await _vt_rate_limit()
     try:
         file_size = os.path.getsize(filepath)
         if file_size > 32 * 1024 * 1024:
@@ -671,6 +777,7 @@ async def vt_upload(filepath: str, sha256: str, session: aiohttp.ClientSession) 
         # Poll for completion with longer total wait
         for wait in [5, 10, 15, 20, 30, 40, 50, 60]:
             await asyncio.sleep(wait)
+            await _vt_rate_limit()
             async with session.get(
                 f"{VT_BASE}/analyses/{analysis_id}", headers=headers
             ) as resp:
@@ -957,6 +1064,7 @@ async def vt_get_sandbox_links(sha256: str, session: aiohttp.ClientSession) -> O
     if not api_key or not CFG["virustotal"]["enabled"]:
         return None
     headers = {"x-apikey": api_key}
+    await _vt_rate_limit()
     try:
         async with session.get(
             f"{VT_BASE}/files/{sha256}/behaviours",
@@ -1213,13 +1321,13 @@ def extract_strings(filepath: str) -> dict:
     found = {k: set() for k in STRING_PATTERNS}
     try:
         with open(filepath, "rb") as f:
-            raw = f.read()
+            raw = f.read(20 * 1024 * 1024)  # Cap at 20 MB to prevent OOM
         _scan_bytes(raw, found)
 
         try:
             with zipfile.ZipFile(filepath, "r") as zf:
                 for entry in zf.namelist():
-                    if entry.endswith((".class", ".properties", ".json", ".yml", ".xml", ".txt", ".cfg")):
+                    if entry.endswith((".class", ".class/", ".properties", ".json", ".yml", ".xml", ".txt", ".cfg")):
                         try:
                             data = zf.read(entry)
                             _scan_bytes(data, found)
@@ -1464,12 +1572,71 @@ def analyze_pe(filepath: str) -> Optional[dict]:
     except Exception:
         pass
 
-    # UPX check
+    # UPX check + PyInstaller/PyArmor detection
     try:
         with open(filepath, "rb") as f:
             raw = f.read()
         if b"UPX!" in raw:
             result["packers"].append("UPX")
+
+        # PyInstaller detection
+        pyinstaller_markers = [b"PYZ-00.pyz", b"MEIPASS", b"_MEIPASS", b"_MEI", b"pyimod", b"PyInstaller"]
+        pyinstaller_hits = sum(1 for m in pyinstaller_markers if m in raw)
+        if pyinstaller_hits >= 2:
+            result["packers"].append("PyInstaller")
+            result["warnings"].append("PyInstaller-packed executable")
+
+            # PyArmor detection inside PyInstaller bundles
+            if b"__pyarmor__" in raw or b"PY000000" in raw or b"pyarmor_runtime" in raw:
+                result["packers"].append("PyArmor")
+                result["warnings"].append("PyArmor obfuscation — all code encrypted at rest")
+
+            # Scan PyInstaller TOC for dangerous bundled modules
+            dangerous_modules = {
+                b"win32crypt": "DPAPI credential theft",
+                b"pynput": "keylogger",
+                b"cv2": "webcam capture",
+                b"mss": "screenshot capture",
+                b"psutil": "process enumeration",
+                b"sqlite3": "database access",
+                b"PyCryptodome": "encryption toolkit",
+                b"pycryptodome": "encryption toolkit",
+                b"Crypto": "encryption toolkit",
+                b"aiohttp": "async HTTP (C2 capable)",
+                b"socketio": "real-time C2 framework",
+                b"websocket": "websocket C2",
+                b"requests": "HTTP requests",
+                b"win32com": "COM automation",
+                b"PIL": "image processing",
+            }
+            found_modules = []
+            for mod, desc in dangerous_modules.items():
+                if mod in raw:
+                    found_modules.append(f"{mod.decode()}: {desc}")
+            if found_modules:
+                result["bundled_modules"] = found_modules
+                # Flag dangerous combos
+                mod_names = {mod for mod in dangerous_modules if mod in raw}
+                if b"win32crypt" in mod_names:
+                    result["warnings"].append("Bundles win32crypt (DPAPI credential theft)")
+                if b"pynput" in mod_names:
+                    result["warnings"].append("Bundles pynput (keylogger)")
+                if b"cv2" in mod_names:
+                    result["warnings"].append("Bundles OpenCV (webcam capture)")
+                if {b"win32crypt", b"requests"} <= mod_names or {b"win32crypt", b"aiohttp"} <= mod_names:
+                    result["warnings"].append("Stealer toolkit: credential theft + exfiltration")
+
+        # Rust zipbomb dropper detection
+        if b"zipbomb" in raw or b"FATAL: copy payload" in raw:
+            result["warnings"].append("Zipbomb dropper signatures detected")
+            result["packers"].append("Zipbomb-Dropper")
+        if b".pdb" in raw:
+            # Check for suspicious PDB paths
+            pdb_matches = re.findall(rb'[A-Z]:\\[^\x00]{5,80}\.pdb', raw)
+            for pdb in pdb_matches:
+                pdb_str = pdb.decode("utf-8", errors="replace")
+                if any(s in pdb_str.lower() for s in ["zipbomb", "malware", "rat", "stealer", "dropper", "payload"]):
+                    result["warnings"].append(f"Suspicious PDB path: {pdb_str}")
     except Exception:
         pass
 
@@ -1500,6 +1667,43 @@ def _analyze_pe_basic(filepath: str) -> Optional[dict]:
 
     if b"UPX!" in data:
         result["packers"].append("UPX")
+
+    # PyInstaller/PyArmor detection (same logic as full analyze_pe)
+    pyinstaller_markers = [b"PYZ-00.pyz", b"MEIPASS", b"_MEIPASS", b"_MEI", b"pyimod", b"PyInstaller"]
+    pyinstaller_hits = sum(1 for m in pyinstaller_markers if m in data)
+    if pyinstaller_hits >= 2:
+        result["packers"].append("PyInstaller")
+        result["warnings"].append("PyInstaller-packed executable")
+        if b"__pyarmor__" in data or b"PY000000" in data or b"pyarmor_runtime" in data:
+            result["packers"].append("PyArmor")
+            result["warnings"].append("PyArmor obfuscation — all code encrypted at rest")
+        dangerous_modules = {
+            b"win32crypt": "DPAPI credential theft", b"pynput": "keylogger",
+            b"cv2": "webcam capture", b"mss": "screenshot capture",
+            b"psutil": "process enumeration", b"requests": "HTTP requests",
+            b"aiohttp": "async HTTP (C2 capable)", b"socketio": "real-time C2 framework",
+        }
+        found_modules = []
+        mod_names = set()
+        for mod, desc in dangerous_modules.items():
+            if mod in data:
+                found_modules.append(f"{mod.decode()}: {desc}")
+                mod_names.add(mod)
+        if found_modules:
+            result["bundled_modules"] = found_modules
+            if b"win32crypt" in mod_names:
+                result["warnings"].append("Bundles win32crypt (DPAPI credential theft)")
+            if b"pynput" in mod_names:
+                result["warnings"].append("Bundles pynput (keylogger)")
+            if b"cv2" in mod_names:
+                result["warnings"].append("Bundles OpenCV (webcam capture)")
+            if {b"win32crypt", b"requests"} <= mod_names or {b"win32crypt", b"aiohttp"} <= mod_names:
+                result["warnings"].append("Stealer toolkit: credential theft + exfiltration")
+
+    # Rust zipbomb dropper
+    if b"zipbomb" in data or b"FATAL: copy payload" in data:
+        result["warnings"].append("Zipbomb dropper signatures detected")
+        result["packers"].append("Zipbomb-Dropper")
 
     for category, apis in SUSPICIOUS_IMPORTS.items():
         for api in apis:
@@ -2097,8 +2301,44 @@ def detect_obfuscators(jar_path: str) -> list[str]:
             names = zf.namelist()
             class_names = [n for n in names if n.endswith(".class")]
 
+            # .class/ trailing slash evasion (qProtect, GambleRigger-family)
+            # ZIP entries ending with ".class/" are directories, not class files,
+            # causing decompilers to skip them entirely
+            trailing_slash_classes = [n for n in names if n.endswith(".class/")]
+            if trailing_slash_classes:
+                found.add(f"Trailing-slash evasion ({len(trailing_slash_classes)} .class/ entries)")
+                # Treat them as class names for further analysis
+                class_names.extend(trailing_slash_classes)
+
+            # qProtect detection — O/0 confusable class name patterns
+            o0_pattern = re.compile(r'^(?:.*/)?((?:[O0o]+)\.class/?)')
+            o0_names = sum(1 for n in class_names if o0_pattern.match(n))
+            if o0_names >= 3:
+                found.add("qProtect (O/0 confusable names)")
+
+            # META-INF marker files (GambleRigger/4E family)
+            marker_files = [n for n in names if re.match(r'^META-INF/[a-f0-9]{8,}$', n)]
+            if marker_files:
+                found.add(f"Suspicious META-INF marker ({marker_files[0]})")
+
+            # HTML injection in ZIP entry names
+            html_entries = [n for n in names if "<html>" in n.lower() or "<img " in n.lower()]
+            if html_entries:
+                found.add("HTML injection in ZIP entry names")
+
+            # Encrypted config files (MD5-named .txt with high entropy)
+            hex_configs = [n for n in names if re.match(r'^[a-f0-9]{16,}\.txt$', n)]
+            for hc in hex_configs[:3]:
+                try:
+                    data = zf.read(hc)
+                    if len(data) > 32 and shannon_entropy(data) > 6.0:
+                        found.add("Encrypted config file")
+                        break
+                except Exception:
+                    pass
+
             short_root = sum(
-                1 for n in class_names if "/" not in n and len(n.replace(".class", "")) <= 2
+                1 for n in class_names if "/" not in n and len(n.replace(".class", "").replace("/", "")) <= 2
             )
             if short_root > 10:
                 found.add("Generic (short class names)")
@@ -2367,10 +2607,16 @@ def compute_risk_score(
     # YARA
     score += min(len(yara_matches) * 5, 15)
 
-    # obfuscators — low weight since hacked clients and legitimate mods
-    # routinely use obfuscation for IP protection, not just malware
+    # obfuscators — low weight for generic, high weight for evasion techniques
     if obfuscators:
-        score += min(len(obfuscators) * 2, 6)
+        obf_str = " ".join(obfuscators)
+        evasion_obfs = sum(1 for o in obfuscators if any(
+            x in o for x in ["Trailing-slash", "qProtect", "HTML injection",
+                              "Encrypted config", "META-INF marker"]))
+        if evasion_obfs:
+            score += min(evasion_obfs * 10, 25)
+        generic_obfs = len(obfuscators) - evasion_obfs
+        score += min(generic_obfs * 2, 6)
 
     # entropy — moderate weight; obfuscated but legitimate code often has high entropy
     if entropy:
@@ -2415,9 +2661,39 @@ def compute_risk_score(
                 score += 10
             if si.get("network") and si.get("persistence"):
                 score += 10
-            if format_analysis.get("packers"):
-                score += 10
-            score += min(len(format_analysis.get("warnings", [])) * 3, 15)
+
+            packers = format_analysis.get("packers", [])
+            if packers:
+                # PyInstaller+PyArmor combo is near-certain malware
+                has_pyinstaller = "PyInstaller" in packers
+                has_pyarmor = "PyArmor" in packers
+                has_zipbomb = "Zipbomb-Dropper" in packers
+                if has_pyinstaller and has_pyarmor:
+                    score += 35  # encrypted Python = almost always a RAT/stealer
+                elif has_pyinstaller:
+                    score += 15  # PyInstaller alone is suspicious but not definitive
+                elif has_zipbomb:
+                    score += 40  # zipbomb dropper
+                else:
+                    score += 10  # generic packer (UPX, etc)
+
+            # Dangerous bundled module combos
+            bundled = format_analysis.get("bundled_modules", [])
+            if bundled:
+                mod_str = " ".join(bundled)
+                if "credential theft" in mod_str or "keylogger" in mod_str:
+                    score += 15
+                if "webcam" in mod_str or "screenshot" in mod_str:
+                    score += 10
+                if "C2" in mod_str:
+                    score += 10
+
+            warnings = format_analysis.get("warnings", [])
+            # Weight specific warnings higher
+            stealer_warns = sum(1 for w in warnings if "Stealer toolkit" in w or "credential theft" in w)
+            score += min(stealer_warns * 10, 20)
+            other_warns = len(warnings) - stealer_warns
+            score += min(other_warns * 3, 15)
 
         elif fa_type == "PDF":
             if format_analysis.get("js_found") and format_analysis.get("auto_action"):
@@ -3047,6 +3323,9 @@ def build_embeds(
                 pe_lines.append(f"**Compiled:** {format_analysis['timestamp']}")
             if format_analysis.get("packers"):
                 pe_lines.append(f"**Packers:** {', '.join(f'`{p}`' for p in format_analysis['packers'])}")
+            if format_analysis.get("bundled_modules"):
+                mod_text = ", ".join(f"`{m.split(':')[0].strip()}`" for m in format_analysis["bundled_modules"][:8])
+                pe_lines.append(f"**Bundled Modules:** {mod_text}")
             if format_analysis.get("import_count"):
                 pe_lines.append(f"**Imports:** {format_analysis['import_count']}")
             for w in format_analysis.get("warnings", [])[:5]:
@@ -4080,19 +4359,49 @@ def package_logs(log_dir: str, work_dir: str, mod_name: str) -> list[str]:
 # ─── Archival ────────────────────────────────────────────────────────────────
 
 
-def archive_scan(log_dir: str, original_file: str):
+def archive_scan(log_dir: str, original_file: str, sha256: str = ""):
+    """Archive scan results. If sha256 matches an existing scanned/ folder, reuse it."""
     scanned_dir = MASTER_DIR / "scanned"
     scanned_dir.mkdir(exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = Path(original_file).stem
-    dest = scanned_dir / f"{ts}_{fname}"
-    dest.mkdir(parents=True, exist_ok=True)
 
+    # ── Dupe detection: check catalog for existing scanned_path ──
+    dest = None
+    if sha256:
+        cat_entry = file_catalog.get(sha256)
+        if cat_entry and cat_entry.get("scanned_path"):
+            existing = Path(cat_entry["scanned_path"])
+            if existing.exists() and existing.is_dir():
+                dest = existing
+                log.info(f"Dupe detected (SHA256={sha256[:16]}...) — reusing {dest.name}")
+
+    if dest is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = Path(original_file).stem
+        dest = scanned_dir / f"{ts}_{fname}"
+        dest.mkdir(parents=True, exist_ok=True)
+
+    # Move logs — if dest already has logs, merge into it
     log_path = Path(log_dir)
     if log_path.exists():
-        shutil.move(str(log_path), str(dest / "logs"))
+        dest_logs = dest / "logs"
+        if dest_logs.exists():
+            # Merge: copy new log files into existing logs dir
+            for item in log_path.iterdir():
+                target = dest_logs / item.name
+                if item.is_file():
+                    shutil.copy2(str(item), str(target))
+                elif item.is_dir():
+                    if target.exists():
+                        shutil.rmtree(str(target), ignore_errors=True)
+                    shutil.copytree(str(item), str(target))
+            shutil.rmtree(str(log_path), ignore_errors=True)
+        else:
+            shutil.move(str(log_path), str(dest_logs))
+
     if os.path.exists(original_file):
         shutil.copy2(original_file, str(dest / os.path.basename(original_file)))
+
+    return str(dest)
 
 
 def cleanup_old_scans():
@@ -4128,7 +4437,7 @@ except ImportError:
     pass
 
 URL_PATTERN = re.compile(r'^https?://[a-zA-Z0-9\-._~:/?#\[\]@!$&\'()*+,;=%]+$')
-MAX_URL_DOWNLOAD = 50 * 1024 * 1024  # 50MB
+MAX_URL_DOWNLOAD = 100 * 1024 * 1024  # 100MB
 
 # Known IP grabber / redirect tracking domains
 IP_GRABBER_DOMAINS = {
@@ -4140,6 +4449,39 @@ IP_GRABBER_DOMAINS = {
     "webhook.site", "requestbin.com", "pipedream.com",
     "canarytokens.com", "canarytokens.org",
     "canary.tools", "thinkst.com",
+}
+
+# Domains that serve web pages / streaming content, not downloadable files
+NON_DOWNLOAD_DOMAINS = {
+    # Video / streaming
+    "youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com",
+    "twitch.tv", "www.twitch.tv", "clips.twitch.tv",
+    "vimeo.com", "dailymotion.com", "tiktok.com", "www.tiktok.com",
+    "vm.tiktok.com", "rumble.com", "odysee.com",
+    # Social media
+    "twitter.com", "x.com", "facebook.com", "www.facebook.com",
+    "instagram.com", "www.instagram.com", "reddit.com", "www.reddit.com",
+    "old.reddit.com", "linkedin.com", "www.linkedin.com",
+    "threads.net", "bsky.app", "mastodon.social",
+    # Search engines / portals
+    "google.com", "www.google.com", "bing.com", "www.bing.com",
+    "duckduckgo.com", "yahoo.com", "www.yahoo.com",
+    # Chat / communication
+    "discord.com", "discord.gg", "t.me", "web.telegram.org",
+    # Wiki / docs
+    "wikipedia.org", "en.wikipedia.org", "docs.google.com",
+    "stackoverflow.com", "stackexchange.com",
+    # News / media
+    "medium.com", "substack.com", "nytimes.com", "cnn.com",
+    # Gaming (non-download)
+    "store.steampowered.com", "steamcommunity.com",
+    "namemc.com", "minecraft.net", "www.minecraft.net",
+    # Paste / code viewing (not raw file downloads)
+    "pastebin.com", "hastebin.com", "gist.github.com",
+    "codepen.io", "jsfiddle.net", "replit.com",
+    # URL shorteners (suspicious for file downloads)
+    "bit.ly", "tinyurl.com", "t.co", "is.gd", "v.gd",
+    "rb.gy", "s.id", "shorturl.at",
 }
 
 # Content types that indicate a file, not a tracking pixel/page
@@ -4216,12 +4558,84 @@ async def _resolve_and_check(hostname: str) -> Optional[str]:
     return None
 
 
+async def _do_download(session, url: str, work_dir: str, dl_path: str, display_name: str) -> tuple[str, str, int]:
+    """Execute the actual GET download. Returns (filepath, display_name, total_bytes)."""
+    from urllib.parse import urlparse
+
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=120),
+                           allow_redirects=True, max_redirects=5) as resp:
+        if resp.status != 200:
+            raise ValueError(f"Download failed: HTTP {resp.status}")
+
+        # Re-check final URL after GET redirects
+        final_url = str(resp.url)
+        final_parsed = urlparse(final_url)
+        if final_parsed.scheme not in ("http", "https"):
+            raise ValueError(f"Redirect to unsafe scheme: {final_parsed.scheme}")
+        final_host = final_parsed.hostname or ""
+        final_block = _is_blocked_host(final_host)
+        if final_block:
+            raise ValueError(f"Redirect blocked: {final_block}")
+        final_dns_block = await _resolve_and_check(final_host)
+        if final_dns_block:
+            raise ValueError(f"Redirect blocked: {final_dns_block}")
+
+        # Check content-length
+        content_length = resp.content_length
+        if content_length and content_length > MAX_URL_DOWNLOAD:
+            raise ValueError(f"File too large ({content_length / 1024 / 1024:.1f} MB)")
+
+        # Content type check on GET
+        ct = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        if ct == "text/html":
+            cd = resp.headers.get("Content-Disposition", "")
+            if "attachment" not in cd.lower():
+                raise ValueError(
+                    "URL serves an HTML page, not a file download.\n"
+                    "Please provide a **direct download link** to a file."
+                )
+
+        # Try to get filename from content-disposition
+        cd = resp.headers.get("Content-Disposition", "")
+        if "filename=" in cd:
+            match = re.search(r'filename[*]?=["\']?([^"\';]+)', cd)
+            if match:
+                cd_name = re.sub(r"[^\w.\-]", "_", match.group(1))[:100]
+                # Block Windows reserved device names
+                stem = cd_name.split(".")[0].upper()
+                _WIN_RESERVED = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
+                                 "LPT1", "LPT2", "LPT3", "CLOCK$"}
+                if stem in _WIN_RESERVED:
+                    cd_name = f"_{cd_name}"
+                if cd_name:
+                    display_name = cd_name
+                    dl_path = os.path.join(work_dir, display_name)
+
+        total = 0
+        try:
+            async with aiofiles.open(dl_path, "wb") as f:
+                async for chunk in resp.content.iter_chunked(65536):
+                    total += len(chunk)
+                    if total > MAX_URL_DOWNLOAD:
+                        raise ValueError(f"File too large (>{MAX_URL_DOWNLOAD / 1024 / 1024:.0f} MB)")
+                    await f.write(chunk)
+        except Exception:
+            # Clean up partial file on error
+            try:
+                os.unlink(dl_path)
+            except OSError:
+                pass
+            raise
+
+    return dl_path, display_name, total
+
+
 async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
     """Download a file from URL via Tor (if configured). Returns (filepath, display_filename)."""
     from urllib.parse import urlparse
 
     if not URL_PATTERN.match(url):
-        raise ValueError("Invalid URL format")
+        raise ValueError("Invalid URL format. Please provide a direct `http://` or `https://` link to a file.")
 
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
@@ -4230,6 +4644,16 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
     block_reason = _is_blocked_host(hostname)
     if block_reason:
         raise ValueError(f"Blocked: {block_reason}")
+
+    # Block non-download domains (YouTube, social media, etc.)
+    hn_lower = hostname.lower()
+    for nd_domain in NON_DOWNLOAD_DOMAINS:
+        if hn_lower == nd_domain or hn_lower.endswith("." + nd_domain):
+            raise ValueError(
+                f"**{nd_domain}** is not a file download link.\n"
+                "This command scans files for malware — please provide a direct download URL "
+                "(e.g. a `.jar`, `.zip`, or `.exe` link)."
+            )
 
     # Resolve DNS and check resolved IPs against private ranges (anti-SSRF)
     dns_block = await _resolve_and_check(hostname)
@@ -4258,9 +4682,11 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
         display_name = "download"
 
     dl_path = os.path.join(work_dir, display_name)
+    total = 0
 
     # Build session — through Tor or direct
     connector = None
+    tor_failed = False
     if use_tor and AIOHTTP_SOCKS_AVAILABLE:
         connector = ProxyConnector.from_url(tor_proxy)
 
@@ -4293,85 +4719,92 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
                     cd = head_resp.headers.get("Content-Disposition", "")
                     if "attachment" not in cd.lower():
                         raise ValueError(
-                            "URL returns an HTML page, not a file. "
-                            "This may be a tracking page or IP grabber. "
-                            "If this is a legitimate download, use the direct file link."
+                            "URL returns an HTML page, not a downloadable file.\n"
+                            "Please provide a **direct download link** to a file "
+                            "(e.g. a `.jar`, `.zip`, or `.exe` URL)."
                         )
+        except (asyncio.TimeoutError, TimeoutError, OSError, ConnectionError) as tor_err:
+            if use_tor:
+                log.warning(f"Tor proxy failed for HEAD request: {tor_err}")
+                tor_failed = True
+            else:
+                raise ValueError(f"Connection failed: {tor_err}")
         except aiohttp.ClientError as head_err:
             log.warning(f"HEAD request failed for URL: {head_err}")
             if use_tor:
-                raise ValueError(
-                    "HEAD request failed — cannot verify URL safety through Tor. "
-                    "The URL may be unreachable or an IP grabber."
-                )
+                # Could be Tor proxy down — flag it
+                err_name = type(head_err).__name__
+                if "proxy" in err_name.lower() or "socks" in str(head_err).lower() or "connect" in err_name.lower():
+                    tor_failed = True
+                else:
+                    raise ValueError(
+                        "HEAD request failed — cannot verify URL safety through Tor. "
+                        "The URL may be unreachable or an IP grabber."
+                    )
 
-        # Actual download
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=120),
-                               allow_redirects=True, max_redirects=5) as resp:
-            if resp.status != 200:
-                raise ValueError(f"Download failed: HTTP {resp.status}")
-
-            # Re-check final URL after GET redirects
-            final_url = str(resp.url)
-            final_parsed = urlparse(final_url)
-            if final_parsed.scheme not in ("http", "https"):
-                raise ValueError(f"Redirect to unsafe scheme: {final_parsed.scheme}")
-            final_host = final_parsed.hostname or ""
-            final_block = _is_blocked_host(final_host)
-            if final_block:
-                raise ValueError(f"Redirect blocked: {final_block}")
-            final_dns_block = await _resolve_and_check(final_host)
-            if final_dns_block:
-                raise ValueError(f"Redirect blocked: {final_dns_block}")
-
-            # Check content-length
-            content_length = resp.content_length
-            if content_length and content_length > MAX_URL_DOWNLOAD:
-                raise ValueError(f"File too large ({content_length / 1024 / 1024:.1f} MB)")
-
-            # Content type check on GET
-            ct = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
-            if ct == "text/html":
-                cd = resp.headers.get("Content-Disposition", "")
-                if "attachment" not in cd.lower():
-                    raise ValueError("URL serves HTML, not a file download. Possibly an IP grabber.")
-
-            # Try to get filename from content-disposition
-            cd = resp.headers.get("Content-Disposition", "")
-            if "filename=" in cd:
-                match = re.search(r'filename[*]?=["\']?([^"\';]+)', cd)
-                if match:
-                    cd_name = re.sub(r"[^\w.\-]", "_", match.group(1))[:100]
-                    # Block Windows reserved device names
-                    stem = cd_name.split(".")[0].upper()
-                    _WIN_RESERVED = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
-                                     "LPT1", "LPT2", "LPT3", "CLOCK$"}
-                    if stem in _WIN_RESERVED:
-                        cd_name = f"_{cd_name}"
-                    if cd_name:
-                        display_name = cd_name
-                        dl_path = os.path.join(work_dir, display_name)
-
-            total = 0
+        if not tor_failed:
+            # Actual download via current session (Tor or direct)
             try:
-                async with aiofiles.open(dl_path, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(65536):
-                        total += len(chunk)
-                        if total > MAX_URL_DOWNLOAD:
-                            raise ValueError(f"File too large (>{MAX_URL_DOWNLOAD / 1024 / 1024:.0f} MB)")
-                        await f.write(chunk)
-            except Exception:
-                # Clean up partial file on error
-                try:
-                    os.unlink(dl_path)
-                except OSError:
-                    pass
-                raise
+                dl_path, display_name, total = await _do_download(
+                    session, url, work_dir, dl_path, display_name
+                )
+            except (asyncio.TimeoutError, TimeoutError, OSError, ConnectionError) as dl_err:
+                if use_tor:
+                    log.warning(f"Tor proxy failed during download: {dl_err}")
+                    tor_failed = True
+                else:
+                    raise ValueError(f"Download failed: {dl_err}")
+            except aiohttp.ClientError as dl_err:
+                if use_tor:
+                    err_str = f"{type(dl_err).__name__}: {dl_err}"
+                    if any(k in err_str.lower() for k in ("proxy", "socks", "connect", "timeout")):
+                        log.warning(f"Tor proxy failed during download: {dl_err}")
+                        tor_failed = True
+                    else:
+                        raise ValueError(f"Download failed: {dl_err}")
+                else:
+                    raise ValueError(f"Download failed: {dl_err}")
 
-    if use_tor and AIOHTTP_SOCKS_AVAILABLE:
-        log.info(f"Downloaded via Tor: {display_name} ({total} bytes)")
-    else:
-        log.info(f"Downloaded direct: {display_name} ({total} bytes)")
+    # ── Tor fallback: retry without proxy ──
+    if tor_failed:
+        log.warning("Tor proxy unreachable — falling back to direct download (no Tor)")
+        async with aiohttp.ClientSession() as direct_session:
+            # Re-do HEAD check without Tor
+            try:
+                async with direct_session.head(url, timeout=aiohttp.ClientTimeout(total=15),
+                                                allow_redirects=True, max_redirects=5) as head_resp:
+                    final_url = str(head_resp.url)
+                    final_parsed = urlparse(final_url)
+                    if final_parsed.scheme not in ("http", "https"):
+                        raise ValueError(f"Redirect to unsafe scheme: {final_parsed.scheme}")
+                    final_host = final_parsed.hostname or ""
+                    final_block = _is_blocked_host(final_host)
+                    if final_block:
+                        raise ValueError(f"Redirect blocked: {final_block} (redirected to {final_host})")
+                    ct = head_resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+                    if ct and ct.startswith("text/html"):
+                        cd = head_resp.headers.get("Content-Disposition", "")
+                        if "attachment" not in cd.lower():
+                            raise ValueError(
+                                "URL returns an HTML page, not a downloadable file.\n"
+                                "Please provide a **direct download link** to a file."
+                            )
+            except aiohttp.ClientError as head_err:
+                raise ValueError(f"Download failed (Tor down, direct also failed): {head_err}")
+            except (asyncio.TimeoutError, TimeoutError) as head_err:
+                raise ValueError(f"Download timed out (Tor down, direct also timed out): {head_err}")
+
+            try:
+                dl_path, display_name, total = await _do_download(
+                    direct_session, url, work_dir, dl_path, display_name
+                )
+            except (asyncio.TimeoutError, TimeoutError, aiohttp.ClientError) as dl_err:
+                raise ValueError(f"Download failed (Tor down, direct also failed): {dl_err}")
+
+    download_method = "via Tor" if (use_tor and AIOHTTP_SOCKS_AVAILABLE and not tor_failed) else "direct"
+    if tor_failed:
+        download_method = "direct (Tor was down)"
+    log.info(f"Downloaded {download_method}: {display_name} ({total} bytes)")
 
     return dl_path, display_name
 
@@ -4537,6 +4970,8 @@ async def on_ready():
         await asyncio.to_thread(cleanup_old_scans)
         if not update_presence.is_running():
             update_presence.start()
+        if not monitor_alerts.is_running():
+            monitor_alerts.start()
     log.info(f"Bot ready as {bot.user} — serving {len(bot.guilds)} guild(s)")
     log.info(f"VT enabled: {CFG['virustotal']['enabled'] and bool(CFG['virustotal']['api_key'])}")
     log.info(f"YARA enabled: {YARA_AVAILABLE and CFG['yara']['enabled']}")
@@ -4559,6 +4994,81 @@ async def update_presence():
         )
 
 
+@tasks.loop(minutes=5)
+async def monitor_alerts():
+    """Periodic monitoring: storage usage, request rate, stale state cleanup."""
+    try:
+        # ── Storage alert ──
+        threshold_gb = CFG.get("alerts", {}).get("storage_threshold_gb", 10)
+        usage_bytes = await asyncio.to_thread(_get_storage_usage_bytes)
+        usage_gb = usage_bytes / (1024 ** 3)
+        if usage_gb >= threshold_gb:
+            await send_alert(
+                "storage_high",
+                "Storage Threshold Exceeded",
+                f"File storage is at **{usage_gb:.1f} GB** (threshold: {threshold_gb} GB).\n"
+                f"Consider running cleanup or increasing `auto_cleanup_days`.\n"
+                f"Checked: `logs/`, `scanned/`, `bot/logs/`, `PUT_JAR_HERE/`",
+            )
+
+        # ── Hourly request rate alert ──
+        threshold_hr = CFG.get("alerts", {}).get("hourly_request_threshold", 20)
+        req_count = _hourly_request_count()
+        if req_count >= threshold_hr:
+            await send_alert(
+                "high_request_rate",
+                "High Request Rate",
+                f"**{req_count}** scan requests in the last hour (threshold: {threshold_hr}).\n"
+                f"Active scans: **{scan_queue.active}** | Queued: **{scan_queue.pending}**",
+            )
+
+        # ── Stale state cleanup (prevents unbounded memory growth) ──
+        # Clean user_cooldowns older than 2x cooldown period
+        cd = CFG["scanner"].get("cooldown_seconds", 30)
+        cutoff = time.time() - (cd * 2)
+        stale_users = [uid for uid, ts in user_cooldowns.items() if ts < cutoff]
+        for uid in stale_users:
+            del user_cooldowns[uid]
+
+        # Clean cancelled scans older than 10 minutes
+        # (can't track age directly, but limit set size)
+        if len(_cancelled_scans) > 100:
+            _cancelled_scans.clear()
+
+        # Clean old bot log files (keep last 20)
+        bot_log_dir = BOT_DIR / "logs"
+        if bot_log_dir.exists():
+            log_files = sorted(bot_log_dir.glob("scanner_*.log"), key=lambda p: p.stat().st_mtime)
+            if len(log_files) > 20:
+                for old_log in log_files[:-20]:
+                    try:
+                        old_log.unlink()
+                    except OSError:
+                        pass
+
+        # Clean old JarAnalyzer log directories (keep last 200)
+        jar_log_dir = MASTER_DIR / "logs"
+        if jar_log_dir.exists():
+            log_dirs = sorted(
+                [d for d in jar_log_dir.iterdir() if d.is_dir()],
+                key=lambda p: p.stat().st_mtime,
+            )
+            if len(log_dirs) > 200:
+                for old_dir in log_dirs[:-200]:
+                    try:
+                        shutil.rmtree(old_dir, ignore_errors=True)
+                    except OSError:
+                        pass
+
+    except Exception as e:
+        log.error(f"monitor_alerts error: {e}")
+
+
+@monitor_alerts.before_loop
+async def _wait_for_bot_ready():
+    await bot.wait_until_ready()
+
+
 # ─── /giverat command ────────────────────────────────────────────────────────
 
 @bot.slash_command(name="giverat", description="Scan a file for RAT/malware signatures", **_install_params)
@@ -4566,7 +5076,31 @@ async def giverat_command(
     ctx: discord.ApplicationContext,
     file: discord.Option(
         discord.Attachment,
-        description="File to scan (any file up to 50MB)",
+        description="File to scan (up to 100MB)",
+        required=False,
+        default=None,
+    ),
+    file2: discord.Option(
+        discord.Attachment,
+        description="Second file to scan",
+        required=False,
+        default=None,
+    ),
+    file3: discord.Option(
+        discord.Attachment,
+        description="Third file to scan",
+        required=False,
+        default=None,
+    ),
+    file4: discord.Option(
+        discord.Attachment,
+        description="Fourth file to scan",
+        required=False,
+        default=None,
+    ),
+    file5: discord.Option(
+        discord.Attachment,
+        description="Fifth file to scan",
         required=False,
         default=None,
     ),
@@ -4577,11 +5111,14 @@ async def giverat_command(
         default=None,
     ),
 ):
-    # Must provide exactly one
-    if not file and not url:
-        return await ctx.respond("Provide either a file attachment or a URL to scan.", ephemeral=True)
-    if file and url:
-        return await ctx.respond("Provide either a file **or** a URL, not both.", ephemeral=True)
+    # Collect all provided files
+    all_files = [f for f in [file, file2, file3, file4, file5] if f is not None]
+
+    # Must provide at least one input
+    if not all_files and not url:
+        return await ctx.respond("Provide at least one file attachment or a URL to scan.", ephemeral=True)
+    if all_files and url:
+        return await ctx.respond("Provide file(s) **or** a URL, not both.", ephemeral=True)
 
     # cooldown (atomic check-and-set)
     remaining = check_and_set_cooldown(ctx.author.id)
@@ -4591,103 +5128,124 @@ async def giverat_command(
             ephemeral=True,
         )
 
-    # validate size (attachment only)
+    # Track request for hourly rate alerting
+    _track_hourly_request()
+    threshold_hr = CFG.get("alerts", {}).get("hourly_request_threshold", 20)
+    req_count = _hourly_request_count()
+    if req_count >= threshold_hr and req_count % 5 == 0:  # alert every 5th request over threshold
+        asyncio.create_task(send_alert(
+            "high_request_rate",
+            "High Request Rate",
+            f"**{req_count}** scan requests in the last hour (threshold: {threshold_hr}).\n"
+            f"Active scans: **{scan_queue.active}** | Queued: **{scan_queue.pending}**",
+        ))
+
+    # validate size for all attachments
     max_bytes = CFG["scanner"]["max_file_size_mb"] * 1024 * 1024
-    if file and file.size > max_bytes:
-        return await ctx.respond(
-            f"File too large ({file.size / 1024 / 1024:.1f} MB). Max is {CFG['scanner']['max_file_size_mb']} MB.",
-            ephemeral=True,
-        )
+    for af in all_files:
+        if af.size > max_bytes:
+            return await ctx.respond(
+                f"File `{af.filename}` too large ({af.size / 1024 / 1024:.1f} MB). Max is {CFG['scanner']['max_file_size_mb']} MB.",
+                ephemeral=True,
+            )
+
+    # For multi-file: queue each file as a separate scan
+    scan_targets = []  # list of (attachment_or_None, url_or_None, scan_id, display_name)
+    if all_files:
+        for af in all_files:
+            sid = uuid.uuid4().hex[:8]
+            scan_targets.append((af, None, sid, af.filename))
+    else:
+        sid = uuid.uuid4().hex[:8]
+        scan_targets.append((None, url, sid, url[:60]))
 
     # ephemeral ack
-    scan_id = uuid.uuid4().hex[:8]
-    display_name = file.filename if file else url[:60]
-    await ctx.respond(
-        f"Scanning `{display_name}` \u2014 results will be posted publicly.\nScan ID: `{scan_id}`",
-        ephemeral=True,
-    )
+    if len(scan_targets) == 1:
+        ack_text = f"Scanning `{scan_targets[0][3]}` \u2014 results will be posted publicly.\nScan ID: `{scan_targets[0][2]}`"
+    else:
+        lines = [f"Queuing **{len(scan_targets)}** file(s) for scanning:"]
+        for _, _, sid, dname in scan_targets:
+            lines.append(f"  \u2022 `{dname}` (ID: `{sid}`)")
+        ack_text = "\n".join(lines)
+    await ctx.respond(ack_text, ephemeral=True)
 
-    # ── Queue with live position updates ──
-    queue_msg = None  # public message showing queue position
-
-    # Determine where to send messages (works in DMs and guilds)
+    # ── Queue each scan ──
     send_channel = ctx.channel
 
-    if scan_queue.active >= scan_queue._sem._value:
-        # Scan will be queued — send a live-updating queue position message
-        queue_text = (
-            f"Scan `{display_name}` by {ctx.author.mention} is queued — "
-            f"position **{scan_queue.pending + 1}**, {scan_queue.active} active scan(s)."
-        )
-        try:
-            queue_msg = await send_channel.send(queue_text)
-        except discord.Forbidden:
-            try:
-                queue_msg = await ctx.followup.send(queue_text)
-            except Exception:
-                pass
-        except Exception:
-            pass
+    for attach, scan_url, scan_id, display_name in scan_targets:
+        queue_msg = None
 
-        # Background task to keep updating the queue message
-        async def _update_queue_msg():
-            nonlocal queue_msg
-            if queue_msg is None:
-                return
-            while True:
-                await asyncio.sleep(3)
-                pos = scan_queue.pending
-                if pos <= 0:
-                    break
-                try:
-                    await queue_msg.edit(
-                        content=(
-                            f"Scan `{display_name}` by {ctx.author.mention} is queued — "
-                            f"position **{pos}**, {scan_queue.active} active scan(s)."
-                        )
-                    )
-                except Exception:
-                    break
-
-        update_task = asyncio.create_task(_update_queue_msg())
-    else:
-        update_task = None
-
-    async def _on_dequeue():
-        """Called when scan leaves queue and starts running — delete queue message."""
-        nonlocal queue_msg
-        if update_task is not None:
-            update_task.cancel()
-        if queue_msg is not None:
-            try:
-                await queue_msg.delete()
-            except Exception:
-                pass
-            queue_msg = None
-
-    try:
-        await scan_queue.submit(run_scan(ctx, file, url, scan_id), on_dequeue=_on_dequeue)
-    except Exception as e:
-        log.exception("Scan failed")
-        if update_task is not None:
-            update_task.cancel()
-        if queue_msg is not None:
-            try:
-                await queue_msg.delete()
-            except Exception:
-                pass
-        try:
-            err_embed = discord.Embed(
-                title="Scan Failed",
-                description=f"```{sanitize_path(str(e)[:1000])}```",
-                color=0xE74C3C,
+        if scan_queue.active >= scan_queue._sem._value:
+            queue_text = (
+                f"Scan `{display_name}` by {ctx.author.mention} is queued — "
+                f"position **{scan_queue.pending + 1}**, {scan_queue.active} active scan(s)."
             )
             try:
-                await send_channel.send(embed=err_embed)
+                queue_msg = await send_channel.send(queue_text)
             except discord.Forbidden:
-                await ctx.followup.send(embed=err_embed)
-        except Exception:
-            pass
+                try:
+                    queue_msg = await ctx.followup.send(queue_text)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+            _qm = queue_msg  # capture for closure
+            _dn = display_name
+
+            async def _update_queue_msg(_qm=_qm, _dn=_dn):
+                if _qm is None:
+                    return
+                while True:
+                    await asyncio.sleep(3)
+                    pos = scan_queue.pending
+                    if pos <= 0:
+                        break
+                    try:
+                        await _qm.edit(
+                            content=(
+                                f"Scan `{_dn}` by {ctx.author.mention} is queued — "
+                                f"position **{pos}**, {scan_queue.active} active scan(s)."
+                            )
+                        )
+                    except Exception:
+                        break
+
+            update_task = asyncio.create_task(_update_queue_msg())
+        else:
+            update_task = None
+            _qm = None
+
+        async def _on_dequeue(_ut=update_task, _qm=_qm):
+            if _ut is not None:
+                _ut.cancel()
+            if _qm is not None:
+                try:
+                    await _qm.delete()
+                except Exception:
+                    pass
+
+        try:
+            # Use create_task so multiple files scan concurrently (up to semaphore limit)
+            asyncio.create_task(
+                scan_queue.submit(run_scan(ctx, attach, scan_url, scan_id), on_dequeue=_on_dequeue)
+            )
+        except Exception as e:
+            log.exception(f"Scan submit failed for {display_name}")
+            if update_task is not None:
+                update_task.cancel()
+            try:
+                err_embed = discord.Embed(
+                    title="Scan Failed",
+                    description=f"`{display_name}`: ```{sanitize_path(str(e)[:1000])}```",
+                    color=0xE74C3C,
+                )
+                try:
+                    await send_channel.send(embed=err_embed)
+                except discord.Forbidden:
+                    await ctx.followup.send(embed=err_embed)
+            except Exception:
+                pass
 
 
 # ─── /stats command ──────────────────────────────────────────────────────────
@@ -4780,6 +5338,7 @@ async def run_scan(
     attachment: Optional[discord.Attachment],
     url: Optional[str],
     scan_id: str,
+    local_file: Optional[str] = None,  # for multi-JAR ZIP: path to an already-extracted JAR
 ):
     start = time.time()
     work_dir = tempfile.mkdtemp(prefix="scan_")
@@ -4837,8 +5396,13 @@ async def run_scan(
             pass
 
     try:
-        # ── Download ──
-        if attachment:
+        # ── Download / locate file ──
+        if local_file:
+            # Already extracted (multi-JAR ZIP sub-scan)
+            dl_path = local_file
+            filename = os.path.basename(local_file)
+            await progress(f"Scanning extracted JAR: {filename}")
+        elif attachment:
             await progress("Downloading file...")
             filename = re.sub(r"[^\w.\-]", "_", attachment.filename or "unknown")
             dl_path = os.path.join(work_dir, filename)
@@ -5128,6 +5692,29 @@ async def run_scan(
 
             if not jars_to_scan and not extracted_files:
                 jars_to_scan.append(jar_path)
+
+            # ── Multi-JAR ZIP: if a .zip contains multiple inner JARs, scan each separately ──
+            if dl_path.lower().endswith(".zip") and not local_file:
+                # Count inner JARs only (not the zip itself acting as a jar)
+                inner_jars = [j for j in jars_to_scan if j != jar_path and j != dl_path]
+                if len(inner_jars) > 1:
+                    await safe_send(
+                        content=f"ZIP `{filename}` contains **{len(inner_jars)} JAR files** — scanning each separately.",
+                    )
+                    for inner_jar in inner_jars:
+                        sub_scan_id = uuid.uuid4().hex[:8]
+                        inner_name = os.path.basename(inner_jar)
+                        log.info(f"[{scan_id}] Multi-JAR ZIP: spawning sub-scan {sub_scan_id} for {inner_name}")
+                        asyncio.create_task(
+                            scan_queue.submit(run_scan(ctx, None, None, sub_scan_id, local_file=inner_jar))
+                        )
+                    # Clean up the current scan — sub-scans handle everything
+                    if scan_msg:
+                        try:
+                            await scan_msg.delete()
+                        except Exception:
+                            pass
+                    return
         else:
             jars_to_scan.append(dl_path)
 
@@ -5472,6 +6059,9 @@ async def run_scan(
         guild_id = str(ctx.guild.id) if ctx.guild else "DM"
         prev_guilds = set(prev_scan.get("guilds", [])) if prev_scan else set()
         prev_guilds.add(guild_id)
+        # Preserve existing scanned_path if we didn't archive this time
+        existing_scanned_path = prev_scan.get("scanned_path", "") if prev_scan else ""
+        final_scanned_path = scanned_path or existing_scanned_path
         await catalog_update(sha256, {
             "filename": filename,
             "file_size": file_size,
@@ -5480,11 +6070,12 @@ async def run_scan(
             "level": level,
             "variant": (all_iocs.get("variant", "") if all_iocs else ""),
             "scan_count": (prev_scan.get("scan_count", 0) + 1) if prev_scan else 1,
-            "submitters": list(prev_submitters)[-50:],  # cap at 50 unique submitters
+            "submitters": list(prev_submitters)[-50:],
             "guilds": list(prev_guilds)[-50:],
             "yara_hits": len(yara_matches),
             "vt_detected": vt_result.get("detected", 0) if vt_result else 0,
             "vt_total": vt_result.get("total", 0) if vt_result else 0,
+            "scanned_path": final_scanned_path,
         })
 
         # ── Auto-research for exception candidates ──
@@ -5610,9 +6201,10 @@ async def run_scan(
                     pass
 
         # ── Archive (only if saving is enabled) ──
+        scanned_path = None
         if CFG["scanner"].get("save_samples", False):
             for ld in all_log_dirs:
-                archive_scan(ld, dl_path)
+                scanned_path = archive_scan(ld, dl_path, sha256=sha256)
         else:
             for ld in all_log_dirs:
                 try:
