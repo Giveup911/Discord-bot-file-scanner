@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import zipfile
@@ -30,6 +31,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import yaml
 
@@ -402,9 +404,15 @@ ALERT_COOLDOWN_SECONDS = 600  # don't repeat same alert within 10 minutes
 def _get_alert_user_ids() -> list[int]:
     """Return configured alert recipient user IDs."""
     raw = CFG.get("alerts", {}).get("user_ids", [])
-    if isinstance(raw, list):
-        return [int(uid) for uid in raw if uid]
-    return []
+    if not isinstance(raw, list):
+        return []
+    result = []
+    for uid in raw:
+        try:
+            result.append(int(uid))
+        except (ValueError, TypeError):
+            log.warning(f"Invalid alert user_id in config: {uid!r}")
+    return result
 
 
 def _get_storage_usage_bytes() -> int:
@@ -493,6 +501,24 @@ def save_catalog(catalog: dict):
 
 file_catalog = load_catalog()
 _catalog_lock = asyncio.Lock()
+_sha256_locks: dict[str, asyncio.Lock] = {}
+_sha256_locks_guard = asyncio.Lock()
+
+
+async def _get_sha256_lock(sha256: str) -> asyncio.Lock:
+    """Get or create a per-SHA256 lock for archive+catalog atomicity."""
+    async with _sha256_locks_guard:
+        if sha256 not in _sha256_locks:
+            _sha256_locks[sha256] = asyncio.Lock()
+        lock = _sha256_locks[sha256]
+        # Evict unlocked entries to prevent unbounded growth
+        if len(_sha256_locks) > 1000:
+            to_remove = [k for k, v in _sha256_locks.items() if not v.locked()]
+            for k in to_remove:
+                del _sha256_locks[k]
+            # Re-add our lock in case it was evicted
+            _sha256_locks[sha256] = lock
+        return lock
 
 
 async def catalog_update(sha256: str, entry: dict):
@@ -4505,7 +4531,7 @@ def _is_blocked_ip(ip_str: str) -> Optional[str]:
     try:
         addr = ipaddress.ip_address(ip_str)
     except ValueError:
-        return None
+        return "Invalid IP address"
     if addr.is_loopback:
         return "Loopback address"
     if addr.is_private:
@@ -4550,7 +4576,7 @@ async def _resolve_and_check(hostname: str) -> Optional[str]:
     """Resolve hostname to IPs and validate none are private/reserved."""
     import socket
     try:
-        infos = await asyncio.get_event_loop().run_in_executor(
+        infos = await asyncio.get_running_loop().run_in_executor(
             None, lambda: socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
         )
         for family, _, _, _, sockaddr in infos:
@@ -4563,10 +4589,26 @@ async def _resolve_and_check(hostname: str) -> Optional[str]:
     return None
 
 
+class _SafeResolver(aiohttp.DefaultResolver):
+    """Custom DNS resolver that blocks private/reserved IPs at connect time.
+
+    Prevents DNS rebinding attacks where a hostname resolves to a safe IP
+    during pre-flight check but rebinds to 127.0.0.1/169.254.x.x for the
+    actual connection.
+    """
+
+    async def resolve(self, host: str, port: int = 0, family: int = 0):
+        results = await super().resolve(host, port, family)
+        for entry in results:
+            ip_str = entry["host"]
+            block = _is_blocked_ip(ip_str)
+            if block:
+                raise OSError(f"DNS rebinding blocked: {host} resolved to {ip_str} ({block})")
+        return results
+
+
 async def _do_download(session, url: str, work_dir: str, dl_path: str, display_name: str) -> tuple[str, str, int]:
     """Execute the actual GET download. Returns (filepath, display_name, total_bytes)."""
-    from urllib.parse import urlparse
-
     async with session.get(url, timeout=aiohttp.ClientTimeout(total=120),
                            allow_redirects=True, max_redirects=5) as resp:
         if resp.status != 200:
@@ -4605,11 +4647,17 @@ async def _do_download(session, url: str, work_dir: str, dl_path: str, display_n
         if "filename=" in cd:
             match = re.search(r'filename[*]?=["\']?([^"\';]+)', cd)
             if match:
-                cd_name = re.sub(r"[^\w.\-]", "_", match.group(1))[:100]
+                cd_name = match.group(1)
+                # Strip RFC 5987 charset prefix (e.g., "UTF-8''filename.jar")
+                if "''" in cd_name:
+                    cd_name = cd_name.split("''", 1)[-1]
+                cd_name = re.sub(r"[^\w.\-]", "_", cd_name)[:100]
                 # Block Windows reserved device names
                 stem = cd_name.split(".")[0].upper()
-                _WIN_RESERVED = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
-                                 "LPT1", "LPT2", "LPT3", "CLOCK$"}
+                _WIN_RESERVED = {"CON", "PRN", "AUX", "NUL",
+                                 "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+                                 "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+                                 "CLOCK$"}
                 if stem in _WIN_RESERVED:
                     cd_name = f"_{cd_name}"
                 if cd_name:
@@ -4637,8 +4685,6 @@ async def _do_download(session, url: str, work_dir: str, dl_path: str, display_n
 
 async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
     """Download a file from URL via Tor (if configured). Returns (filepath, display_filename)."""
-    from urllib.parse import urlparse
-
     if not URL_PATTERN.match(url):
         raise ValueError("Invalid URL format. Please provide a direct `http://` or `https://` link to a file.")
 
@@ -4690,10 +4736,16 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
     total = 0
 
     # Build session — through Tor or direct
+    # When not using Tor, use SafeResolver to block DNS rebinding at connect time.
+    # When using Tor, DNS resolves at the exit node (not locally), so rebinding
+    # can't reach the bot's localhost/LAN. Pre-flight _resolve_and_check still
+    # catches obvious private IPs before the request is sent.
     connector = None
     tor_failed = False
     if use_tor and AIOHTTP_SOCKS_AVAILABLE:
         connector = ProxyConnector.from_url(tor_proxy)
+    else:
+        connector = aiohttp.TCPConnector(resolver=_SafeResolver())
 
     async with aiohttp.ClientSession(connector=connector) as session:
         # First, HEAD request to check for redirects and content type
@@ -4773,7 +4825,7 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
     # ── Tor fallback: retry without proxy ──
     if tor_failed:
         log.warning("Tor proxy unreachable — falling back to direct download (no Tor)")
-        async with aiohttp.ClientSession() as direct_session:
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=_SafeResolver())) as direct_session:
             # Re-do HEAD check without Tor
             try:
                 async with direct_session.head(url, timeout=aiohttp.ClientTimeout(total=15),
@@ -4786,6 +4838,9 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
                     final_block = _is_blocked_host(final_host)
                     if final_block:
                         raise ValueError(f"Redirect blocked: {final_block} (redirected to {final_host})")
+                    final_dns_block = await _resolve_and_check(final_host)
+                    if final_dns_block:
+                        raise ValueError(f"Redirect blocked: {final_dns_block}")
                     ct = head_resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
                     if ct and ct.startswith("text/html"):
                         cd = head_resp.headers.get("Content-Disposition", "")
@@ -5397,9 +5452,12 @@ async def die_command(ctx: discord.ApplicationContext):
         return await ctx.respond("You are not authorized to use this command.", ephemeral=True)
     log.critical(f"EMERGENCY SHUTDOWN triggered by {ctx.author} ({ctx.author.id})")
     await ctx.respond("Shutting down immediately.", ephemeral=True)
-    await asyncio.to_thread(stop_tor)
+    try:
+        await asyncio.wait_for(asyncio.to_thread(stop_tor), timeout=5)
+    except asyncio.TimeoutError:
+        log.warning("stop_tor timed out during emergency shutdown")
     await bot.close()
-    os._exit(0)
+    sys.exit(0)
 
 
 # ─── /scrapemods command ─────────────────────────────────────────────────────
@@ -5460,6 +5518,10 @@ async def scrapemods_command(
     if _scrape_task and not _scrape_task.done():
         return await ctx.respond("Scraper is already running. Use `/scrapemods stop` first.", ephemeral=True)
 
+    # Wait for previous task to fully finish if it was recently stopped
+    if _scrape_task and _scrape_task.done():
+        _scrape_task = None
+
     await ctx.respond("Starting mod scraper... will download and scan in batches of 20.", ephemeral=True)
 
     scraper_cfg = CFG.get("scraper", {})
@@ -5483,69 +5545,85 @@ async def scrapemods_command(
         global _scrape_runner
         runner = _scrape_runner
         batch_num = 0
+        # Capture the channel reference now — ctx.followup expires after 15 min
+        channel = ctx.channel
 
-        conn = aiohttp.TCPConnector(limit=20, limit_per_host=5)
-        async with aiohttp.ClientSession(connector=conn) as session:
-            while not runner.stopped:
-                batch_num += 1
-                log.info(f"[scraper] Batch {batch_num}: collecting {runner.batch_size} mods...")
-
-                try:
-                    batch = await runner.collect_batch(session)
-                except Exception as e:
-                    log.exception(f"[scraper] Batch collect error: {e}")
-                    await asyncio.sleep(10)
-                    continue
-
-                if not batch:
-                    log.info("[scraper] No more mods to download. Stopping.")
-                    break
-
-                log.info(f"[scraper] Batch {batch_num}: downloaded {len(batch)} JARs, scanning...")
-
-                # Send status update to channel
-                try:
-                    await ctx.followup.send(
-                        f"**Batch {batch_num}:** Downloaded {len(batch)} mods, scanning...\n"
-                        f"Session totals: {runner.stats['downloaded']} downloaded, "
-                        f"{runner.stats['scanned']} scanned",
-                        ephemeral=True,
-                    )
-                except Exception:
-                    pass
-
-                # Scan each JAR in the batch
-                for jar_path, mod_name, source in batch:
-                    if runner.stopped:
-                        break
-                    try:
-                        scan_id = f"scrape_{uuid.uuid4().hex[:8]}"
-                        log.info(f"[scraper] Scanning: {mod_name} ({jar_path.name})")
-                        await run_scan(
-                            ctx,
-                            attachment=None,
-                            url=None,
-                            scan_id=scan_id,
-                            local_file=str(jar_path),
-                            private=True,  # don't upload scraped mods to VT/MB/HA
-                        )
-                        runner.stats["scanned"] += 1
-                    except Exception as e:
-                        log.warning(f"[scraper] Scan error {mod_name}: {e}")
-
-                log.info(f"[scraper] Batch {batch_num} complete. "
-                         f"Stats: {runner.stats}")
-
-        log.info(f"[scraper] Finished. Final stats: {runner.stats}")
         try:
-            await ctx.followup.send(
-                f"**Scraper finished.**\n"
-                f"Downloaded: {runner.stats['downloaded']} | Scanned: {runner.stats['scanned']} | "
-                f"Skipped: {runner.stats['skipped']} | Errors: {runner.stats['errors']}",
-                ephemeral=True,
-            )
-        except Exception:
-            pass
+            conn = aiohttp.TCPConnector(limit=20, limit_per_host=5)
+            async with aiohttp.ClientSession(connector=conn) as session:
+                while not runner.stopped:
+                    batch_num += 1
+                    log.info(f"[scraper] Batch {batch_num}: collecting {runner.batch_size} mods...")
+
+                    try:
+                        batch = await runner.collect_batch(session)
+                    except Exception as e:
+                        log.exception(f"[scraper] Batch collect error: {e}")
+                        await asyncio.sleep(10)
+                        continue
+
+                    if not batch:
+                        log.info("[scraper] No more mods to download. Stopping.")
+                        break
+
+                    log.info(f"[scraper] Batch {batch_num}: downloaded {len(batch)} JARs, scanning...")
+
+                    # Send status update via channel (not ctx.followup which expires)
+                    try:
+                        await channel.send(
+                            f"**[Scraper] Batch {batch_num}:** Downloaded {len(batch)} mods, scanning...\n"
+                            f"Session totals: {runner.stats['downloaded']} downloaded, "
+                            f"{runner.stats['scanned']} scanned",
+                        )
+                    except discord.Forbidden:
+                        log.warning("[scraper] Lost channel access — status updates will only appear in logs")
+                    except discord.NotFound:
+                        log.warning("[scraper] Channel no longer exists — status updates will only appear in logs")
+                    except Exception as e:
+                        log.debug(f"[scraper] Channel send failed: {e}")
+
+                    # Scan each JAR in the batch
+                    for jar_path, mod_name, source in batch:
+                        if runner.stopped:
+                            break
+                        try:
+                            scan_id = f"scrape_{uuid.uuid4().hex[:8]}"
+                            log.info(f"[scraper] Scanning: {mod_name} ({jar_path.name})")
+                            await run_scan(
+                                ctx=None,
+                                attachment=None,
+                                url=None,
+                                scan_id=scan_id,
+                                local_file=str(jar_path),
+                                private=True,
+                                silent=True,  # no Discord output for background scrape scans
+                            )
+                            runner.stats["scanned"] += 1
+                        except Exception as e:
+                            log.warning(f"[scraper] Scan error {mod_name}: {e}")
+
+                    # Flush scrape progress to disk after each batch
+                    runner.progress.flush()
+
+                    log.info(f"[scraper] Batch {batch_num} complete. "
+                             f"Stats: {runner.stats}")
+
+            log.info(f"[scraper] Finished. Final stats: {runner.stats}")
+            runner.progress.flush()
+            try:
+                await channel.send(
+                    f"**[Scraper] Finished.**\n"
+                    f"Downloaded: {runner.stats['downloaded']} | Scanned: {runner.stats['scanned']} | "
+                    f"Skipped: {runner.stats['skipped']} | Errors: {runner.stats['errors']}",
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            log.exception(f"[scraper] Fatal error in scrape loop: {e}")
+            try:
+                await channel.send(f"**[Scraper] Crashed:** {e}")
+            except Exception:
+                pass
 
     _scrape_task = asyncio.create_task(_scrape_loop())
 
@@ -5553,12 +5631,13 @@ async def scrapemods_command(
 # ─── Scan Runner ─────────────────────────────────────────────────────────────
 
 async def run_scan(
-    ctx: discord.ApplicationContext,
+    ctx: Optional[discord.ApplicationContext],
     attachment: Optional[discord.Attachment],
     url: Optional[str],
     scan_id: str,
     local_file: Optional[str] = None,  # for multi-JAR ZIP: path to an already-extracted JAR
     private: bool = False,  # private scan: local analysis only, no uploads to VT/MB/HA
+    silent: bool = False,  # silent mode: skip all Discord messaging (for background scrape scans)
 ):
     start = time.time()
     work_dir = tempfile.mkdtemp(prefix="scan_")
@@ -5567,6 +5646,8 @@ async def run_scan(
 
     async def safe_send(**kwargs) -> Optional[discord.Message]:
         """Send to channel, falling back to followup if bot lacks channel access (user-install)."""
+        if silent or ctx is None:
+            return None
         if not _use_followup[0]:
             try:
                 return await ctx.channel.send(**kwargs)
@@ -5582,6 +5663,8 @@ async def run_scan(
             return None
 
     async def progress(msg: str):
+        if silent or ctx is None:
+            return
         try:
             await ctx.followup.send(f"`[{scan_id}]` {msg}", ephemeral=True)
         except Exception:
@@ -5595,6 +5678,8 @@ async def run_scan(
 
     async def update_progress(stages: dict, filename: str, file_size: int, hashes: dict, force: bool = False):
         nonlocal scan_msg
+        if silent or ctx is None:
+            return
         now = time.time()
         if not force and now - _last_edit[0] < 2.0:
             return
@@ -5603,10 +5688,10 @@ async def run_scan(
             embed = build_progress_embed(filename, file_size, hashes, scan_id, stages,
                                          stage_start_times=stage_start_times,
                                          stage_details=stage_details)
-            cancel_view = CancelScanView(scan_id, ctx.author.id)
+            cancel_view = CancelScanView(scan_id, ctx.author.id if ctx else 0)
             if scan_msg is None:
                 scan_msg = await safe_send(
-                    content=f"Scan requested by {ctx.author.mention}",
+                    content=f"Scan requested by {ctx.author.mention}" if ctx else "Background scan",
                     embed=embed,
                     view=cancel_view,
                 )
@@ -5614,6 +5699,8 @@ async def run_scan(
                 await scan_msg.edit(embed=embed, view=cancel_view)
         except discord.HTTPException:
             pass
+
+    _spawned_sub_scans = False  # Set True when multi-JAR sub-scans are spawned (skip work_dir cleanup)
 
     try:
         scanned_path = None
@@ -5868,10 +5955,11 @@ async def run_scan(
                 scan_time=time.time() - start, scan_id=scan_id,
                 zip_bomb_warning=zip_bomb_warning,
             )
+            zb_header = f"Scan requested by {ctx.author.mention}" if ctx else "Background scan"
             if scan_msg:
-                await scan_msg.edit(content=f"Scan requested by {ctx.author.mention}", embeds=embeds, view=None)
+                await scan_msg.edit(content=zb_header, embeds=embeds, view=None)
             else:
-                await safe_send(content=f"Scan requested by {ctx.author.mention}", embeds=embeds)
+                await safe_send(content=zb_header, embeds=embeds)
             return
 
         # ── Determine what to scan ──
@@ -5927,14 +6015,38 @@ async def run_scan(
                     await safe_send(
                         content=f"ZIP `{filename}` contains **{len(inner_jars)} JAR files** — scanning each separately.",
                     )
+                    # Schedule work_dir cleanup after all sub-scans complete
+                    async def _cleanup_after_sub_scans(tasks, wd):
+                        try:
+                            # Timeout: scan_timeout * number of tasks + buffer
+                            max_wait = CFG["scanner"].get("scan_timeout_seconds", 300) * len(tasks) + 60
+                            await asyncio.wait_for(
+                                asyncio.gather(*tasks, return_exceptions=True),
+                                timeout=max_wait,
+                            )
+                        except asyncio.TimeoutError:
+                            log.warning(f"Sub-scan cleanup timed out after {max_wait}s — forcing cleanup")
+                        try:
+                            shutil.rmtree(wd, ignore_errors=True)
+                        except Exception:
+                            pass
+                    sub_tasks = []
                     for inner_jar in inner_jars:
                         sub_scan_id = uuid.uuid4().hex[:8]
                         inner_name = os.path.basename(inner_jar)
                         log.info(f"[{scan_id}] Multi-JAR ZIP: spawning sub-scan {sub_scan_id} for {inner_name}")
-                        asyncio.create_task(
+                        def _sub_scan_done(t, _name=inner_name):
+                            if not t.cancelled() and t.exception():
+                                log.warning(f"[{scan_id}] Sub-scan for {_name} failed: {t.exception()}")
+                        task = asyncio.create_task(
                             scan_queue.submit(run_scan(ctx, None, None, sub_scan_id, local_file=inner_jar, private=private))
                         )
-                    # Clean up the current scan — sub-scans handle everything
+                        task.add_done_callback(_sub_scan_done)
+                        sub_tasks.append(task)
+                    asyncio.create_task(_cleanup_after_sub_scans(sub_tasks, work_dir))
+                    # Set flag AFTER all tasks are spawned — if spawning fails, finally block cleans up
+                    _spawned_sub_scans = True
+
                     if scan_msg:
                         try:
                             await scan_msg.delete()
@@ -6305,31 +6417,61 @@ async def run_scan(
         else:
             await update_stats(total_scans=1, clean=1)
 
-        # ── Update catalog ──
-        # Track unique submitters for reputation scoring
-        prev_submitters = set(prev_scan.get("submitters", [])) if prev_scan else set()
-        prev_submitters.add(str(ctx.author.id))
-        guild_id = str(ctx.guild.id) if ctx.guild else "DM"
-        prev_guilds = set(prev_scan.get("guilds", [])) if prev_scan else set()
-        prev_guilds.add(guild_id)
-        # Preserve existing scanned_path if we didn't archive this time
-        existing_scanned_path = prev_scan.get("scanned_path", "") if prev_scan else ""
-        final_scanned_path = scanned_path or existing_scanned_path
-        await catalog_update(sha256, {
-            "filename": filename,
-            "file_size": file_size,
-            "last_scan": datetime.now(timezone.utc).isoformat(),
-            "score": score,
-            "level": level,
-            "variant": (all_iocs.get("variant", "") if all_iocs else ""),
-            "scan_count": (prev_scan.get("scan_count", 0) + 1) if prev_scan else 1,
-            "submitters": list(prev_submitters)[-50:],
-            "guilds": list(prev_guilds)[-50:],
-            "yara_hits": len(yara_matches),
-            "vt_detected": vt_result.get("detected", 0) if vt_result else 0,
-            "vt_total": vt_result.get("total", 0) if vt_result else 0,
-            "scanned_path": final_scanned_path,
-        })
+        # ── Archive + catalog update (locked per SHA256 to prevent races) ──
+        sha_lock = await _get_sha256_lock(sha256)
+        async with sha_lock:
+            # Archive must happen before catalog update so scanned_path is set
+            if CFG["scanner"].get("save_samples", False):
+                for ld in all_log_dirs:
+                    scanned_path = archive_scan(ld, dl_path, sha256=sha256)
+
+            # Re-read catalog under lock to get latest submitters/guilds
+            prev_scan_locked = await catalog_lookup(sha256)
+            # Preserve insertion order: deduplicate while keeping most recent last
+            raw_submitters = [str(s) for s in (prev_scan_locked or {}).get("submitters", [])]
+            new_submitter = str(ctx.author.id) if ctx else "scraper"
+            # Remove dupe if present, then append (most recent last)
+            raw_submitters = [s for s in raw_submitters if s != new_submitter]
+            raw_submitters.append(new_submitter)
+            # Deduplicate preserving order (last occurrence wins)
+            seen_sub = set()
+            prev_submitters = []
+            for s in reversed(raw_submitters):
+                if s not in seen_sub:
+                    seen_sub.add(s)
+                    prev_submitters.append(s)
+            prev_submitters.reverse()
+
+            guild_id = str(ctx.guild.id) if (ctx and ctx.guild) else ("DM" if ctx else "scraper")
+            raw_guilds = [str(g) for g in (prev_scan_locked or {}).get("guilds", [])]
+            raw_guilds = [g for g in raw_guilds if g != guild_id]
+            raw_guilds.append(guild_id)
+            seen_guild = set()
+            prev_guilds = []
+            for g in reversed(raw_guilds):
+                if g not in seen_guild:
+                    seen_guild.add(g)
+                    prev_guilds.append(g)
+            prev_guilds.reverse()
+            existing_scanned_path = (prev_scan_locked or {}).get("scanned_path", "")
+            final_scanned_path = scanned_path or existing_scanned_path
+            prev_count = (prev_scan_locked or {}).get("scan_count", 0)
+
+            await catalog_update(sha256, {
+                "filename": filename,
+                "file_size": file_size,
+                "last_scan": datetime.now(timezone.utc).isoformat(),
+                "score": score,
+                "level": level,
+                "variant": (all_iocs.get("variant", "") if all_iocs else ""),
+                "scan_count": prev_count + 1,
+                "submitters": prev_submitters[-50:],
+                "guilds": prev_guilds[-50:],
+                "yara_hits": len(yara_matches),
+                "vt_detected": vt_result.get("detected", 0) if vt_result else 0,
+                "vt_total": vt_result.get("total", 0) if vt_result else 0,
+                "scanned_path": final_scanned_path,
+            })
 
         # ── Auto-research for exception candidates ──
         if score <= DETECTION_THRESHOLD and extracted_strings and http_session:
@@ -6418,7 +6560,7 @@ async def run_scan(
             zip_files.extend(package_logs(ld, work_dir, mod_name))
 
         # ── Send main results — replace progress embed ──
-        scan_header = f"Scan requested by {ctx.author.mention}"
+        scan_header = f"Scan requested by {ctx.author.mention}" if ctx else "Background scan"
         if private:
             scan_header += " \U0001F512 **Private scan** — no external uploads"
 
@@ -6433,16 +6575,17 @@ async def run_scan(
                 if files_to_send:
                     if private:
                         # Private: send zip as ephemeral DM to the requester
-                        for i in range(0, len(files_to_send), 10):
-                            batch = files_to_send[i:i + 10]
-                            try:
-                                await ctx.followup.send(
-                                    content="\U0001F512 Private scan logs:",
-                                    files=batch,
-                                    ephemeral=True,
-                                )
-                            except Exception:
-                                pass
+                        if ctx is not None:
+                            for i in range(0, len(files_to_send), 10):
+                                batch = files_to_send[i:i + 10]
+                                try:
+                                    await ctx.followup.send(
+                                        content="\U0001F512 Private scan logs:",
+                                        files=batch,
+                                        ephemeral=True,
+                                    )
+                                except Exception:
+                                    pass
                     else:
                         # Public: send in channel
                         for i in range(0, len(files_to_send), 10):
@@ -6459,7 +6602,7 @@ async def run_scan(
                     embeds=embeds,
                     files=first_batch,
                 )
-                if private and files_to_send:
+                if private and files_to_send and ctx is not None:
                     # Private: send zip as ephemeral DM
                     for i in range(0, len(files_to_send), 10):
                         batch = files_to_send[i:i + 10]
@@ -6483,12 +6626,8 @@ async def run_scan(
                 except Exception:
                     pass
 
-        # ── Archive (only if saving is enabled) ──
-        scanned_path = None
-        if CFG["scanner"].get("save_samples", False):
-            for ld in all_log_dirs:
-                scanned_path = archive_scan(ld, dl_path, sha256=sha256)
-        else:
+        # ── Cleanup log dirs if not archiving ──
+        if not CFG["scanner"].get("save_samples", False):
             for ld in all_log_dirs:
                 try:
                     shutil.rmtree(ld, ignore_errors=True)
@@ -6527,15 +6666,17 @@ async def run_scan(
             await safe_send(embed=error_embed)
     finally:
         _cancelled_scans.discard(scan_id)
-        try:
-            shutil.rmtree(work_dir, ignore_errors=True)
-        except Exception:
-            pass
+        if not _spawned_sub_scans:
+            try:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 # ─── Tor Auto-Launch ─────────────────────────────────────────────────────────
 
 _tor_process: Optional[subprocess.Popen] = None
+_tor_lock = threading.Lock()
 
 
 def _find_tor_exe() -> Optional[str]:
@@ -6647,17 +6788,18 @@ def start_tor():
 def stop_tor():
     """Shut down Tor if we started it."""
     global _tor_process
-    if _tor_process is not None:
-        log.info("Shutting down Tor...")
-        try:
-            _tor_process.terminate()
-            _tor_process.wait(timeout=10)
-        except Exception:
+    with _tor_lock:
+        if _tor_process is not None:
+            log.info("Shutting down Tor...")
             try:
-                _tor_process.kill()
+                _tor_process.terminate()
+                _tor_process.wait(timeout=4)
             except Exception:
-                pass
-        _tor_process = None
+                try:
+                    _tor_process.kill()
+                except Exception:
+                    pass
+            _tor_process = None
 
 
 import atexit

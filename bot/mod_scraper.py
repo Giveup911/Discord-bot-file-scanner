@@ -6,11 +6,13 @@ Sources: Modrinth, CurseForge, PlanetMinecraft, NexusMods, Hangar
 Sort: Most downloaded first (where API supports it)
 """
 import asyncio
+import aiofiles
 import aiohttp
 import json
 import logging
 import os
 import re
+import shutil
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -107,7 +109,11 @@ class BaseScraper(ABC):
                     if r.status == 200:
                         return await r.json()
                     if r.status == 429:
-                        wait = int(r.headers.get("Retry-After", 30))
+                        raw_retry = r.headers.get("Retry-After", "30")
+                        try:
+                            wait = int(raw_retry)
+                        except (ValueError, TypeError):
+                            wait = 30
                         log.warning(f"[{self.name}] 429, waiting {wait}s")
                         await asyncio.sleep(wait)
                         continue
@@ -129,7 +135,12 @@ class BaseScraper(ABC):
                     if r.status == 200:
                         return await r.text()
                     if r.status == 429:
-                        await asyncio.sleep(int(r.headers.get("Retry-After", 30)))
+                        raw_retry = r.headers.get("Retry-After", "30")
+                        try:
+                            retry_wait = int(raw_retry)
+                        except (ValueError, TypeError):
+                            retry_wait = 30
+                        await asyncio.sleep(retry_wait)
                         continue
                     if r.status in (404, 410):
                         return None
@@ -142,6 +153,10 @@ class BaseScraper(ABC):
     async def download(self, file_info: FileInfo, dest: Path) -> bool:
         if file_info.size and file_info.size > MAX_FILE_SIZE:
             return False
+        # Only allow http/https downloads (block file://, ftp://, etc.)
+        if not file_info.url.startswith(("https://", "http://")):
+            log.warning(f"[{self.name}] Blocked non-HTTP URL: {file_info.url[:100]}")
+            return False
         await self._wait()
         dest.parent.mkdir(parents=True, exist_ok=True)
         for attempt in range(RETRY_COUNT):
@@ -150,23 +165,31 @@ class BaseScraper(ABC):
                         timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT * 2)) as r:
                     if r.status != 200:
                         if r.status == 429:
-                            await asyncio.sleep(int(r.headers.get("Retry-After", 30)))
+                            raw_retry = r.headers.get("Retry-After", "30")
+                            try:
+                                retry_wait = int(raw_retry)
+                            except (ValueError, TypeError):
+                                retry_wait = 30
+                            await asyncio.sleep(retry_wait)
                             continue
                         if attempt < RETRY_COUNT - 1:
                             await asyncio.sleep(RETRY_DELAY * (attempt + 1))
                         continue
                     cl = r.headers.get("Content-Length")
-                    if cl and int(cl) > MAX_FILE_SIZE:
+                    if cl and cl.isdigit() and int(cl) > MAX_FILE_SIZE:
                         return False
                     total = 0
-                    with open(dest, "wb") as f:
+                    oversize = False
+                    async with aiofiles.open(dest, "wb") as f:
                         async for chunk in r.content.iter_chunked(8192):
                             total += len(chunk)
                             if total > MAX_FILE_SIZE:
-                                f.close()
-                                dest.unlink(missing_ok=True)
-                                return False
-                            f.write(chunk)
+                                oversize = True
+                                break
+                            await f.write(chunk)
+                    if oversize:
+                        dest.unlink(missing_ok=True)
+                        return False
                     return True
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 log.warning(f"[{self.name}] DL err ({attempt+1}): {e}")
@@ -520,20 +543,47 @@ class ScrapeProgress:
     def __init__(self, progress_file: Path):
         self._file = progress_file
         self._data = self._load()
+        # Build in-memory sets for O(1) lookups
+        self._done_sets: dict[str, set] = {}
+        for src, info in self._data.items():
+            if isinstance(info, dict) and "done" in info:
+                self._done_sets[src] = set(info["done"])
+        self._dirty = False
 
     def _load(self) -> dict:
-        if self._file.exists():
-            try:
-                return json.loads(self._file.read_text(encoding="utf-8"))
-            except Exception:
-                pass
+        for path in [self._file, Path(str(self._file) + ".bak")]:
+            if path.exists():
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        return data
+                except Exception:
+                    continue
         return {}
 
     def _save(self):
+        if not self._dirty:
+            return
         try:
-            self._file.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
+            # Keep a backup of the last good save
+            if self._file.exists():
+                bak = Path(str(self._file) + ".bak")
+                try:
+                    shutil.copy2(str(self._file), str(bak))
+                except Exception:
+                    pass
+            # Atomic write via temp file
+            tmp = str(self._file) + ".tmp"
+            Path(tmp).write_text(json.dumps(self._data, indent=2), encoding="utf-8")
+            os.replace(tmp, self._file)
+            self._dirty = False
         except Exception as e:
             log.warning(f"Failed to save scrape progress: {e}")
+
+    def flush(self):
+        """Save to disk if there are pending changes."""
+        if self._dirty:
+            self._save()
 
     def get_offset(self, source: str) -> int:
         return self._data.get(source, {}).get("offset", 0)
@@ -542,22 +592,27 @@ class ScrapeProgress:
         if source not in self._data:
             self._data[source] = {}
         self._data[source]["offset"] = offset
-        self._save()
+        self._dirty = True
 
     def is_done(self, source: str, file_id: str) -> bool:
-        done = set(self._data.get(source, {}).get("done", []))
-        return file_id in done
+        return file_id in self._done_sets.get(source, set())
 
     def mark_done(self, source: str, file_id: str):
         if source not in self._data:
             self._data[source] = {}
         if "done" not in self._data[source]:
             self._data[source]["done"] = []
-        self._data[source]["done"].append(file_id)
-        # Trim if too large (keep last 50k)
-        if len(self._data[source]["done"]) > 60000:
-            self._data[source]["done"] = self._data[source]["done"][-50000:]
-        self._save()
+        if source not in self._done_sets:
+            self._done_sets[source] = set()
+        if file_id not in self._done_sets[source]:
+            self._data[source]["done"].append(file_id)
+            self._done_sets[source].add(file_id)
+            self._dirty = True
+        # Trim if extremely large (500K+ per source = ~25MB JSON per source)
+        if len(self._data[source]["done"]) > 500000:
+            self._data[source]["done"] = self._data[source]["done"][-400000:]
+            self._done_sets[source] = set(self._data[source]["done"])
+            log.info(f"[{source}] Trimmed progress from 500K to 400K entries")
 
     @property
     def total_downloaded(self) -> int:
@@ -596,15 +651,11 @@ class ModScrapeRunner:
         if self.nx_api_key:
             scrapers.append(NexusModsScraper(session, self.nx_api_key))
 
-        if not scrapers:
-            return []
-
         # How many per source this batch
         per_source = max(1, self.batch_size // len(scrapers))
         remainder = self.batch_size - (per_source * len(scrapers))
 
         batch = []
-        sem = asyncio.Semaphore(3)
 
         for i, scraper in enumerate(scrapers):
             if self.stopped:
@@ -662,8 +713,7 @@ class ModScrapeRunner:
                         continue
 
                     # Download
-                    async with sem:
-                        ok = await scraper.download(fi, dest)
+                    ok = await scraper.download(fi, dest)
 
                     if ok and dest.exists():
                         self.progress.mark_done(source, fi.file_id)
