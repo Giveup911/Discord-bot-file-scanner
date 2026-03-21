@@ -27,6 +27,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 import uuid
+import tarfile
 import zipfile
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -2446,7 +2447,7 @@ def detect_obfuscators(jar_path: str) -> list[str]:
 def derive_log_dir_name(jar_path: str) -> str:
     """Mirror JarAnalyzer.java's log directory naming."""
     name = os.path.basename(jar_path)
-    name = re.sub(r"\.(jar|zip)(\.zip)?$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\.(jar|zip|tar|tar\.gz|tgz|tar\.bz2|tar\.xz)(\.zip)?$", "", name, flags=re.IGNORECASE)
     name = re.sub(r"[^a-zA-Z0-9_\-]", "_", name)
     return name
 
@@ -3807,12 +3808,13 @@ def _build_service_pending_embed(title: str, icon: str, eta: str, scan_id: str) 
 MAX_ENTRY_SIZE = 50 * 1024 * 1024  # 50MB per entry hard limit
 
 
-# File extensions worth extracting from zip archives for analysis
+# File extensions worth extracting from zip/tar archives for analysis
 SCANNABLE_EXTS = {
     ".jar", ".zip", ".exe", ".dll", ".scr", ".com", ".pif",
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
     ".lnk", ".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".js", ".jse",
     ".hta", ".wsf", ".msi", ".iso", ".img",
+    ".java", ".class", ".py", ".sh", ".tar", ".gz", ".tgz",
 }
 
 
@@ -3890,6 +3892,107 @@ def extract_files_from_zip(zip_path: str, extract_to: str, depth: int = 0, max_e
                     pass
     except zipfile.BadZipFile:
         pass
+    return extracted
+
+
+def _is_tar_archive(filepath: str) -> bool:
+    """Check if file is a tar archive (plain, gzip, bz2, or xz compressed)."""
+    try:
+        with open(filepath, "rb") as f:
+            magic = f.read(6)
+        # gzip (.tar.gz, .tgz)
+        if magic[:2] == b"\x1f\x8b":
+            return True
+        # bzip2 (.tar.bz2)
+        if magic[:3] == b"BZh":
+            return True
+        # xz (.tar.xz)
+        if magic[:6] == b"\xfd7zXZ\x00":
+            return True
+        # plain tar: "ustar" at offset 257
+        with open(filepath, "rb") as f:
+            f.seek(257)
+            ustar = f.read(5)
+        if ustar == b"ustar":
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def extract_files_from_tar(tar_path: str, extract_to: str, max_extract_bytes: int = 200 * 1024 * 1024) -> list[str]:
+    """Extract scannable files from a tar archive (plain, gz, bz2, xz) with size limits."""
+    extracted = []
+    total_extracted = 0
+    try:
+        with tarfile.open(tar_path, "r:*") as tf:
+            for member in tf.getmembers():
+                try:
+                    if not member.isfile():
+                        continue
+                    if member.size > max_extract_bytes or member.size > MAX_ENTRY_SIZE:
+                        log.warning(f"Tar entry {member.name} too large ({member.size} bytes), skipping")
+                        continue
+                    per_entry_limit = min(MAX_ENTRY_SIZE, max_extract_bytes - total_extracted)
+                    if per_entry_limit <= 0:
+                        log.warning(f"Tar extraction budget exhausted at {total_extracted} bytes")
+                        break
+
+                    # Path traversal protection
+                    safe_name = re.sub(r"[^\w.\-]", "_", os.path.basename(member.name))
+                    if not safe_name:
+                        safe_name = f"tar_entry_{len(extracted)}"
+                    dest = os.path.join(extract_to, f"tar_{safe_name}")
+                    if not os.path.abspath(dest).startswith(os.path.abspath(extract_to)):
+                        log.warning(f"Tar path traversal blocked: {member.name} -> {dest}")
+                        continue
+
+                    # Read content with size limit
+                    f_obj = tf.extractfile(member)
+                    if f_obj is None:
+                        continue
+                    chunks = []
+                    entry_size = 0
+                    while True:
+                        chunk = f_obj.read(65536)
+                        if not chunk:
+                            break
+                        entry_size += len(chunk)
+                        if entry_size > per_entry_limit:
+                            log.warning(f"Tar entry {member.name} exceeded limit ({entry_size} bytes), skipping")
+                            chunks = None
+                            break
+                        chunks.append(chunk)
+                    f_obj.close()
+                    if chunks is None:
+                        continue
+
+                    data = b"".join(chunks)
+                    total_extracted += len(data)
+
+                    # Check if this entry is worth extracting
+                    if _is_scannable_entry(member.name, data):
+                        with open(dest, "wb") as dst:
+                            dst.write(data)
+                        extracted.append(dest)
+                        # Recurse into nested zips/jars
+                        if len(data) >= 2 and data[:2] == b"PK":
+                            extracted.extend(extract_files_from_zip(dest, extract_to, depth=1,
+                                                                     max_extract_bytes=max_extract_bytes - total_extracted))
+                    else:
+                        # Even if not in SCANNABLE_EXTS, extract all files for YARA + string scanning
+                        # if they have code-like extensions
+                        ext = os.path.splitext(member.name)[1].lower()
+                        if ext in (".java", ".class", ".py", ".js", ".sh", ".bat", ".ps1",
+                                   ".yml", ".yaml", ".json", ".toml", ".properties", ".xml",
+                                   ".gradle", ".kt", ".scala", ".groovy"):
+                            with open(dest, "wb") as dst:
+                                dst.write(data)
+                            extracted.append(dest)
+                except Exception as e:
+                    log.debug(f"Tar entry extract error: {e}")
+    except (tarfile.TarError, OSError) as e:
+        log.warning(f"Failed to open tar archive {tar_path}: {e}")
     return extracted
 
 
@@ -5220,19 +5323,22 @@ async def giverat_command(
         default=None,
     ),
 ):
+    # Defer immediately to avoid interaction timeout during YARA loading
+    await ctx.defer(ephemeral=True)
+
     # Collect all provided files
     all_files = [f for f in [file, file2, file3, file4, file5] if f is not None]
 
     # Must provide at least one input
     if not all_files and not url:
-        return await ctx.respond("Provide at least one file attachment or a URL to scan.", ephemeral=True)
+        return await ctx.followup.send("Provide at least one file attachment or a URL to scan.", ephemeral=True)
     if all_files and url:
-        return await ctx.respond("Provide file(s) **or** a URL, not both.", ephemeral=True)
+        return await ctx.followup.send("Provide file(s) **or** a URL, not both.", ephemeral=True)
 
     # cooldown (atomic check-and-set)
     remaining = check_and_set_cooldown(ctx.author.id)
     if remaining:
-        return await ctx.respond(
+        return await ctx.followup.send(
             f"Cooldown \u2014 try again in **{remaining}s**.",
             ephemeral=True,
         )
@@ -5253,7 +5359,7 @@ async def giverat_command(
     max_bytes = CFG["scanner"]["max_file_size_mb"] * 1024 * 1024
     for af in all_files:
         if af.size > max_bytes:
-            return await ctx.respond(
+            return await ctx.followup.send(
                 f"File `{af.filename}` too large ({af.size / 1024 / 1024:.1f} MB). Max is {CFG['scanner']['max_file_size_mb']} MB.",
                 ephemeral=True,
             )
@@ -5277,7 +5383,7 @@ async def giverat_command(
         for _, _, sid, dname in scan_targets:
             lines.append(f"  \u2022 `{dname}` (ID: `{sid}`)")
         ack_text = "\n".join(lines)
-    await ctx.respond(ack_text, ephemeral=True)
+    await ctx.followup.send(ack_text, ephemeral=True)
 
     # ── Queue each scan ──
     send_channel = ctx.channel
@@ -5362,6 +5468,7 @@ async def giverat_command(
 
 @bot.slash_command(name="stats", description="Show scanner statistics", **_install_params)
 async def stats_command(ctx: discord.ApplicationContext):
+    await ctx.defer(ephemeral=True)
     async with _stats_lock:
         stats = dict(scan_stats)
     total = stats.get("total_scans", 0)
@@ -5432,7 +5539,7 @@ async def stats_command(ctx: discord.ApplicationContext):
         e.add_field(name=f"Servers ({len(guilds)})", value=server_list, inline=False)
     else:
         e.add_field(name="Servers", value="None", inline=True)
-    await ctx.respond(embed=e, ephemeral=True)
+    await ctx.followup.send(embed=e, ephemeral=True)
 
 
 # ─── /reload command ─────────────────────────────────────────────────────────
@@ -6101,17 +6208,42 @@ async def run_scan(
         jars_to_scan = []
         is_zip = False
 
+        is_tar = False
         try:
             with open(dl_path, "rb") as f:
                 magic = f.read(4)
             is_zip = magic[:2] == b"PK"
+            if not is_zip:
+                is_tar = _is_tar_archive(dl_path)
         except Exception:
             pass
 
-        # Collect all files to scan (extracted from zip or just the original)
-        extracted_files = []  # non-JAR files extracted from zip (EXE, PDF, etc.)
+        # Collect all files to scan (extracted from zip/tar or just the original)
+        extracted_files = []  # non-JAR files extracted from archive (EXE, PDF, Java, etc.)
 
-        if is_zip:
+        if is_tar:
+            # ── TAR/TAR.GZ/TAR.BZ2 archive — extract contents for scanning ──
+            stage_details["Local Analysis"] = "Extracting tar archive..."
+            await update_progress(stages, filename, file_size, hashes)
+            tar_extracted = await run_in_scan_thread(extract_files_from_tar, dl_path, work_dir)
+            log.info(f"[{scan_id}] Extracted {len(tar_extracted)} files from tar archive {filename}")
+
+            for nf in tar_extracted:
+                try:
+                    with open(nf, "rb") as _f:
+                        _magic = _f.read(4)
+                    if _magic[:2] == b"PK" and is_valid_jar(nf):
+                        jars_to_scan.append(nf)
+                    else:
+                        extracted_files.append(nf)
+                except Exception:
+                    extracted_files.append(nf)
+
+            # If no scannable files found, treat the tar itself as the scan target
+            if not jars_to_scan and not extracted_files:
+                jars_to_scan.append(dl_path)
+
+        elif is_zip:
             jar_path = dl_path
             if not dl_path.lower().endswith((".jar", ".zip")):
                 jar_path = dl_path + ".jar"
@@ -6350,167 +6482,6 @@ async def run_scan(
         stage_details.pop("Local Analysis", None)
         await update_progress(stages, filename, file_size, hashes, force=True)
 
-        # ── External API lookups — ALL run concurrently with pending embeds ──
-        vt_result = None
-        mb_result = None
-        ha_result = None
-        vt_sandbox = None
-
-        # Track per-service messages so we can edit them when results arrive
-        vt_msg = None
-        vt_sb_msg = None
-        mb_msg = None
-        ha_msg = None
-
-        # ── Send ALL pending embeds up front ──
-        if http_session and vt_enabled:
-            vt_msg = await safe_send(
-                embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "~30s", scan_id)
-            )
-            vt_sb_msg = await safe_send(
-                embed=_build_service_pending_embed("VT Sandbox Analysis", "\U0001F9EC", "~2s", scan_id)
-            )
-        if http_session and mb_enabled:
-            mb_msg = await safe_send(
-                embed=_build_service_pending_embed("MalwareBazaar", "\U0001F9A0", "~2s", scan_id)
-            )
-        if http_session and ha_enabled:
-            ha_msg = await safe_send(
-                embed=_build_service_pending_embed("Hybrid Analysis", "\U0001F50D", "~5s", scan_id)
-            )
-
-        # ── VT helper: lookup then upload if needed (runs as concurrent task) ──
-        async def _vt_lookup_or_upload():
-            result = await vt_lookup(primary_sha256, http_session)
-            if result is None:
-                if vt_msg:
-                    try:
-                        await vt_msg.edit(embed=_build_service_pending_embed(
-                            "VirusTotal", "\U0001F9EA", "uploading ~2-3min", scan_id))
-                    except discord.HTTPException:
-                        pass
-                result = await vt_upload(primary_path, primary_sha256, http_session)
-            return result
-
-        # ── Launch ALL services concurrently ──
-        api_tasks = {}
-        log.info(f"[{scan_id}] API launch: http_session={'OK' if http_session else 'NONE'} "
-                 f"vt={vt_enabled} mb={mb_enabled} ha={ha_enabled}")
-        if http_session and vt_enabled:
-            stages["VirusTotal"] = "running"
-            stage_start_times["VirusTotal"] = time.time()
-            api_tasks["vt"] = asyncio.create_task(_vt_lookup_or_upload())
-        if http_session and mb_enabled:
-            stages["MalwareBazaar"] = "running"
-            stage_start_times["MalwareBazaar"] = time.time()
-            api_tasks["mb"] = asyncio.create_task(mb_lookup(primary_sha256, http_session))
-        if http_session and ha_enabled:
-            stages["Hybrid Analysis"] = "running"
-            stage_start_times["Hybrid Analysis"] = time.time()
-            api_tasks["ha"] = asyncio.create_task(ha_search_or_submit(primary_sha256, primary_path, http_session))
-        log.info(f"[{scan_id}] API tasks created: {list(api_tasks.keys())}")
-        if api_tasks:
-            await update_progress(stages, filename, file_size, hashes)
-
-        # ── Collect results and update each message as it completes ──
-
-        # VT result
-        if "vt" in api_tasks:
-            try:
-                vt_result = await api_tasks["vt"]
-                log.info(f"[{scan_id}] VT result: status={vt_result.get('status') if vt_result else 'None'}")
-            except Exception as exc:
-                log.warning(f"[{scan_id}] VirusTotal task failed: {exc}")
-                vt_result = {"detected": 0, "total": 0, "detections": {},
-                             "permalink": f"https://www.virustotal.com/gui/file/{primary_sha256}",
-                             "meaningful_name": "", "tags": [], "first_seen": None, "status": "error"}
-            stages["VirusTotal"] = "complete"
-            stage_start_times["VirusTotal_done"] = time.time()
-            if vt_result and vt_msg:
-                try:
-                    await vt_msg.edit(embed=build_vt_embed(vt_result, primary_sha256, scan_id))
-                except discord.HTTPException:
-                    pass
-                # If VT analysis is still queued, start a background poller to update the message
-                if vt_result.get("status") == "queued" and vt_msg:
-                    _track_poll_task(_poll_vt_completion(primary_sha256, vt_msg, scan_id))
-
-            # Now that VT is done, launch VT Sandbox lookup
-            if vt_result and vt_result.get("status") in ("found", "completed"):
-                stages["VT Sandbox"] = "running"
-                stage_start_times["VT Sandbox"] = time.time()
-                api_tasks["vt_sb"] = asyncio.create_task(vt_get_sandbox_links(primary_sha256, http_session))
-            await update_progress(stages, filename, file_size, hashes)
-
-        # MB result
-        if "mb" in api_tasks:
-            try:
-                mb_result = await api_tasks["mb"]
-                log.info(f"[{scan_id}] MB result: status={mb_result.get('status') if mb_result else 'None'}")
-            except Exception as exc:
-                log.warning(f"[{scan_id}] MalwareBazaar task failed: {exc}")
-                mb_result = {"status": "error", "permalink": f"https://bazaar.abuse.ch/sample/{primary_sha256}/"}
-            stages["MalwareBazaar"] = "complete"
-            stage_start_times["MalwareBazaar_done"] = time.time()
-            if mb_result and mb_result.get("status") == "found":
-                await update_stats(mb_hits=1)
-            if mb_msg:
-                try:
-                    await mb_msg.edit(embed=build_mb_embed(mb_result, primary_sha256, scan_id))
-                except discord.HTTPException:
-                    pass
-        elif mb_msg:
-            try:
-                await mb_msg.edit(embed=build_mb_embed(None, primary_sha256, scan_id))
-            except discord.HTTPException:
-                pass
-
-        # HA result
-        if "ha" in api_tasks:
-            try:
-                ha_result = await api_tasks["ha"]
-                log.info(f"[{scan_id}] HA result: status={ha_result.get('status') if ha_result else 'None'}")
-            except Exception as exc:
-                log.warning(f"[{scan_id}] Hybrid Analysis task failed: {exc}")
-                ha_result = None
-            stages["Hybrid Analysis"] = "complete"
-            stage_start_times["Hybrid Analysis_done"] = time.time()
-            if ha_msg:
-                try:
-                    await ha_msg.edit(embed=build_ha_embed(ha_result, primary_sha256, scan_id))
-                except discord.HTTPException:
-                    pass
-                # If HA file was submitted for sandbox, start background poller to update message
-                if ha_result and ha_result.get("status") == "submitted" and ha_msg:
-                    _track_poll_task(_poll_ha_completion(primary_sha256, ha_msg, scan_id))
-
-        # VT Sandbox result
-        if "vt_sb" in api_tasks:
-            try:
-                vt_sandbox = await api_tasks["vt_sb"]
-            except Exception as exc:
-                log.debug(f"VT Sandbox task failed: {exc}")
-                vt_sandbox = None
-            stages["VT Sandbox"] = "complete"
-            stage_start_times["VT Sandbox_done"] = time.time()
-            if vt_sb_msg:
-                try:
-                    await vt_sb_msg.edit(embed=build_vt_sandbox_embed(vt_sandbox, primary_sha256, scan_id))
-                except discord.HTTPException:
-                    pass
-        elif vt_sb_msg:
-            try:
-                await vt_sb_msg.edit(embed=build_vt_sandbox_embed(None, primary_sha256, scan_id))
-            except discord.HTTPException:
-                pass
-
-        await update_progress(stages, filename, file_size, hashes)
-
-        # Mark skipped stages
-        for k in stages:
-            if stages[k] == "pending":
-                stages[k] = "skipped"
-
         # ── Webhook killing ──
         webhook_kills = {}
         all_webhooks = set()
@@ -6525,33 +6496,12 @@ async def run_scan(
             for wh_url in all_webhooks:
                 webhook_kills[wh_url] = await kill_webhook(wh_url, http_session)
 
-        # ── Risk score ──
+        # ── LOCAL-ONLY risk score (no VT/MB/HA yet) ──
         score, level, color = compute_risk_score(
-            all_iocs, vt_result, yara_matches, obfuscators,
+            all_iocs, None, yara_matches, obfuscators,
             entropy, extracted_strings, manifest, format_analysis,
-            mb_result=mb_result, ha_result=ha_result,
+            mb_result=None, ha_result=None,
         )
-
-        # ── Upload to MalwareBazaar if not already in database ──
-        # Only upload files that actually scored above detection threshold
-        mb_upload_enabled = CFG.get("malwarebazaar", {}).get("upload_flagged", False)
-        if (score > DETECTION_THRESHOLD
-                and mb_result and mb_result.get("status") == "not_found"
-                and http_session and mb_enabled and mb_upload_enabled):
-            mb_tags = []
-            if all_iocs and all_iocs.get("variant", "").lower() != "unknown":
-                mb_tags.append(all_iocs["variant"])
-            if yara_matches:
-                mb_tags.extend(m["rule"] for m in yara_matches[:5])
-            comment = f"Auto-submitted by RATScanner (score {score}/100, {level})"
-            upload_result = await mb_upload(primary_path, primary_sha256, http_session, tags=mb_tags, comment=comment)
-            if upload_result:
-                mb_result = upload_result
-                if mb_msg:
-                    try:
-                        await mb_msg.edit(embed=build_mb_embed(mb_result, primary_sha256, scan_id))
-                    except discord.HTTPException:
-                        pass
 
         # ── Update stats ──
         if score > DETECTION_THRESHOLD:
@@ -6610,8 +6560,8 @@ async def run_scan(
                 "submitters": prev_submitters[-50:],
                 "guilds": prev_guilds[-50:],
                 "yara_hits": len(yara_matches),
-                "vt_detected": vt_result.get("detected", 0) if vt_result else 0,
-                "vt_total": vt_result.get("total", 0) if vt_result else 0,
+                "vt_detected": 0,
+                "vt_total": 0,
                 "scanned_path": final_scanned_path,
             })
 
@@ -6629,7 +6579,7 @@ async def run_scan(
                 except Exception as e:
                     log.debug(f"Auto-research failed: {e}")
 
-        # ── Build main results embed (local analysis + YARA + strings etc.) ──
+        # ── Build & send main results embed IMMEDIATELY (local analysis only) ──
         # Fast mode: skip embeds, reports, and log packaging entirely
         if fast:
             log.info(f"[{scan_id}] Fast scan complete: {filename} — score={score} level={level} in {time.time() - start:.1f}s")
@@ -6640,7 +6590,7 @@ async def run_scan(
             file_size=file_size,
             hashes=hashes,
             iocs=all_iocs,
-            vt=vt_result,
+            vt=None,
             yara_matches=yara_matches,
             obfuscators=obfuscators,
             score=score,
@@ -6656,7 +6606,7 @@ async def run_scan(
             zip_bomb_warning=zip_bomb_warning,
             format_analysis=format_analysis,
             deobfuscation=deobfuscation,
-            mb_result=mb_result,
+            mb_result=None,
         )
 
         if not is_zip and not format_analysis:
@@ -6681,7 +6631,7 @@ async def run_scan(
                     file_size=file_size,
                     hashes=hashes,
                     iocs=all_iocs,
-                    vt=vt_result,
+                    vt=None,
                     yara_matches=yara_matches,
                     obfuscators=obfuscators,
                     score=score,
@@ -6694,9 +6644,9 @@ async def run_scan(
                     webhook_kills=webhook_kills,
                     format_analysis=format_analysis,
                     deobfuscation=deobfuscation,
-                    mb_result=mb_result,
-                    ha_result=ha_result,
-                    vt_sandbox=vt_sandbox,
+                    mb_result=None,
+                    ha_result=None,
+                    vt_sandbox=None,
                 )
             except Exception as e:
                 log.debug(f"write_full_report failed for {ld}: {e}")
@@ -6781,7 +6731,219 @@ async def run_scan(
                 except Exception:
                     pass
 
-        log.info(f"[{scan_id}] Scan complete: {filename} — score={score} level={level}")
+        log.info(f"[{scan_id}] Local scan complete: {filename} — score={score} level={level}")
+
+        # ── External API lookups — ALL run concurrently in background ──
+        # Main results are already visible; API results edit their own messages as they arrive.
+        vt_msg = None
+        vt_sb_msg = None
+        mb_msg = None
+        ha_msg = None
+
+        # Send pending embeds for each enabled service
+        if http_session and vt_enabled:
+            vt_msg = await safe_send(
+                embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "~30s", scan_id)
+            )
+            vt_sb_msg = await safe_send(
+                embed=_build_service_pending_embed("VT Sandbox Analysis", "\U0001F9EC", "~2s", scan_id)
+            )
+        if http_session and mb_enabled:
+            mb_msg = await safe_send(
+                embed=_build_service_pending_embed("MalwareBazaar", "\U0001F9A0", "~2s", scan_id)
+            )
+        if http_session and ha_enabled:
+            ha_msg = await safe_send(
+                embed=_build_service_pending_embed("Hybrid Analysis", "\U0001F50D", "~5s", scan_id)
+            )
+
+        # Background task: run all API lookups, edit messages, recompute score if needed
+        async def _api_background():
+            nonlocal score, level, color
+            vt_result = None
+            mb_result = None
+            ha_result = None
+            vt_sandbox = None
+
+            try:
+                # VT helper: lookup then upload if needed
+                async def _vt_lookup_or_upload():
+                    result = await vt_lookup(primary_sha256, http_session)
+                    if result is None:
+                        if vt_msg:
+                            try:
+                                await vt_msg.edit(embed=_build_service_pending_embed(
+                                    "VirusTotal", "\U0001F9EA", "uploading ~2-3min", scan_id))
+                            except discord.HTTPException:
+                                pass
+                        result = await vt_upload(primary_path, primary_sha256, http_session)
+                    return result
+
+                # Launch ALL services concurrently
+                api_tasks = {}
+                log.info(f"[{scan_id}] API launch: vt={vt_enabled} mb={mb_enabled} ha={ha_enabled}")
+                if http_session and vt_enabled:
+                    api_tasks["vt"] = asyncio.create_task(_vt_lookup_or_upload())
+                if http_session and mb_enabled:
+                    api_tasks["mb"] = asyncio.create_task(mb_lookup(primary_sha256, http_session))
+                if http_session and ha_enabled:
+                    api_tasks["ha"] = asyncio.create_task(ha_search_or_submit(primary_sha256, primary_path, http_session))
+
+                # Collect results independently — each edits its own message as it completes
+                async def _collect_vt():
+                    nonlocal vt_result
+                    if "vt" not in api_tasks:
+                        return
+                    try:
+                        vt_result = await api_tasks["vt"]
+                        log.info(f"[{scan_id}] VT result: status={vt_result.get('status') if vt_result else 'None'}")
+                    except Exception as exc:
+                        log.warning(f"[{scan_id}] VirusTotal task failed: {exc}")
+                        vt_result = {"detected": 0, "total": 0, "detections": {},
+                                     "permalink": f"https://www.virustotal.com/gui/file/{primary_sha256}",
+                                     "meaningful_name": "", "tags": [], "first_seen": None, "status": "error"}
+                    if vt_result and vt_msg:
+                        try:
+                            await vt_msg.edit(embed=build_vt_embed(vt_result, primary_sha256, scan_id))
+                        except discord.HTTPException:
+                            pass
+                        if vt_result.get("status") == "queued" and vt_msg:
+                            _track_poll_task(_poll_vt_completion(primary_sha256, vt_msg, scan_id))
+                    # VT Sandbox (depends on VT completing)
+                    if vt_result and vt_result.get("status") in ("found", "completed"):
+                        try:
+                            vt_sb = await vt_get_sandbox_links(primary_sha256, http_session)
+                        except Exception as exc:
+                            log.debug(f"VT Sandbox task failed: {exc}")
+                            vt_sb = None
+                        if vt_sb_msg:
+                            try:
+                                await vt_sb_msg.edit(embed=build_vt_sandbox_embed(vt_sb, primary_sha256, scan_id))
+                            except discord.HTTPException:
+                                pass
+                    elif vt_sb_msg:
+                        try:
+                            await vt_sb_msg.edit(embed=build_vt_sandbox_embed(None, primary_sha256, scan_id))
+                        except discord.HTTPException:
+                            pass
+
+                async def _collect_mb():
+                    nonlocal mb_result
+                    if "mb" not in api_tasks:
+                        if mb_msg:
+                            try:
+                                await mb_msg.edit(embed=build_mb_embed(None, primary_sha256, scan_id))
+                            except discord.HTTPException:
+                                pass
+                        return
+                    try:
+                        mb_result = await api_tasks["mb"]
+                        log.info(f"[{scan_id}] MB result: status={mb_result.get('status') if mb_result else 'None'}")
+                    except Exception as exc:
+                        log.warning(f"[{scan_id}] MalwareBazaar task failed: {exc}")
+                        mb_result = {"status": "error", "permalink": f"https://bazaar.abuse.ch/sample/{primary_sha256}/"}
+                    if mb_result and mb_result.get("status") == "found":
+                        await update_stats(mb_hits=1)
+                    if mb_msg:
+                        try:
+                            await mb_msg.edit(embed=build_mb_embed(mb_result, primary_sha256, scan_id))
+                        except discord.HTTPException:
+                            pass
+
+                async def _collect_ha():
+                    nonlocal ha_result
+                    if "ha" not in api_tasks:
+                        return
+                    try:
+                        ha_result = await api_tasks["ha"]
+                        log.info(f"[{scan_id}] HA result: status={ha_result.get('status') if ha_result else 'None'}")
+                    except Exception as exc:
+                        log.warning(f"[{scan_id}] Hybrid Analysis task failed: {exc}")
+                        ha_result = None
+                    if ha_msg:
+                        try:
+                            await ha_msg.edit(embed=build_ha_embed(ha_result, primary_sha256, scan_id))
+                        except discord.HTTPException:
+                            pass
+                        if ha_result and ha_result.get("status") == "submitted" and ha_msg:
+                            _track_poll_task(_poll_ha_completion(primary_sha256, ha_msg, scan_id))
+
+                # Run all collectors concurrently — each edits its message independently
+                await asyncio.gather(_collect_vt(), _collect_mb(), _collect_ha())
+
+                # MB upload if flagged and not yet in DB
+                mb_upload_enabled = CFG.get("malwarebazaar", {}).get("upload_flagged", False)
+                if (score > DETECTION_THRESHOLD
+                        and mb_result and mb_result.get("status") == "not_found"
+                        and http_session and mb_enabled and mb_upload_enabled):
+                    mb_tags = []
+                    if all_iocs and all_iocs.get("variant", "").lower() != "unknown":
+                        mb_tags.append(all_iocs["variant"])
+                    if yara_matches:
+                        mb_tags.extend(m["rule"] for m in yara_matches[:5])
+                    comment = f"Auto-submitted by RATScanner (score {score}/100, {level})"
+                    upload_result = await mb_upload(primary_path, primary_sha256, http_session, tags=mb_tags, comment=comment)
+                    if upload_result:
+                        mb_result = upload_result
+                        if mb_msg:
+                            try:
+                                await mb_msg.edit(embed=build_mb_embed(mb_result, primary_sha256, scan_id))
+                            except discord.HTTPException:
+                                pass
+
+                # Recompute score with API data and update main embed if score changed
+                new_score, new_level, new_color = compute_risk_score(
+                    all_iocs, vt_result, yara_matches, obfuscators,
+                    entropy, extracted_strings, manifest, format_analysis,
+                    mb_result=mb_result, ha_result=ha_result,
+                )
+                if new_score != score:
+                    log.info(f"[{scan_id}] Score updated: {score} -> {new_score} ({level} -> {new_level}) after API results")
+                    score, level, color = new_score, new_level, new_color
+                    # Update stats if detection status changed
+                    if new_score > DETECTION_THRESHOLD and score <= DETECTION_THRESHOLD:
+                        await update_stats(detections=1, clean=-1)
+                    # Rebuild and re-send the main embed with updated score
+                    updated_embeds = build_embeds(
+                        filename=filename, file_size=file_size, hashes=hashes,
+                        iocs=all_iocs, vt=vt_result, yara_matches=yara_matches,
+                        obfuscators=obfuscators, score=new_score, level=new_level,
+                        color=new_color, scan_time=time.time() - start, scan_id=scan_id,
+                        entropy=entropy, extracted_strings=extracted_strings,
+                        manifest=manifest, webhook_kills=webhook_kills,
+                        nested_count=max(0, len(jars_to_scan) - 1),
+                        zip_bomb_warning=zip_bomb_warning, format_analysis=format_analysis,
+                        deobfuscation=deobfuscation, mb_result=mb_result,
+                    )
+                    if scan_msg:
+                        try:
+                            await scan_msg.edit(embeds=updated_embeds)
+                        except discord.HTTPException:
+                            pass
+                    # Update catalog with final API-enriched data
+                    sha_lock2 = await _get_sha256_lock(sha256)
+                    async with sha_lock2:
+                        await catalog_update(sha256, {
+                            "score": new_score,
+                            "level": new_level,
+                            "vt_detected": vt_result.get("detected", 0) if vt_result else 0,
+                            "vt_total": vt_result.get("total", 0) if vt_result else 0,
+                        })
+
+            except Exception as e:
+                log.warning(f"[{scan_id}] Background API task error: {e}")
+            finally:
+                # Clean up work_dir now that uploads are done
+                if not _spawned_sub_scans:
+                    try:
+                        shutil.rmtree(work_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+
+        # Fire-and-forget the API background task (it handles its own cleanup)
+        _has_bg_api = http_session and (vt_enabled or mb_enabled or ha_enabled)
+        if _has_bg_api:
+            _track_poll_task(_api_background())
 
     except asyncio.CancelledError:
         log.info(f"[{scan_id}] Scan cancelled by user")
@@ -6813,7 +6975,8 @@ async def run_scan(
             await safe_send(embed=error_embed)
     finally:
         _cancelled_scans.discard(scan_id)
-        if not _spawned_sub_scans:
+        # Only clean up work_dir here if no background API task is handling it
+        if not _spawned_sub_scans and not locals().get("_has_bg_api", False):
             try:
                 shutil.rmtree(work_dir, ignore_errors=True)
             except Exception:
@@ -7050,19 +7213,40 @@ if __name__ == "__main__":
     # Auto-launch Tor before starting the bot
     start_tor()
 
-    # Handle Ctrl+C on Windows (where SIGINT doesn't interrupt the event loop)
+    # Handle Ctrl+C on Windows — use OS-level console control handler
+    # Python's signal.signal(SIGINT) doesn't fire reliably when asyncio
+    # event loop is blocking, so we use the Win32 SetConsoleCtrlHandler API.
     import signal
 
     _shutdown_flag = [False]
 
-    def _sigint_handler(sig, frame):
+    def _force_exit():
         _shutdown_flag[0] = True
         log.info("Ctrl+C received — shutting down")
         print("\nShutting down...")
         stop_tor()
         os._exit(0)
 
-    signal.signal(signal.SIGINT, _sigint_handler)
+    # Python signal handler (works sometimes)
+    signal.signal(signal.SIGINT, lambda s, f: _force_exit())
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, lambda s, f: _force_exit())
+
+    # Win32 console control handler (works always on Windows)
+    if sys.platform == "win32":
+        import ctypes
+        _CTRL_C_EVENT = 0
+        _CTRL_BREAK_EVENT = 1
+        _CTRL_CLOSE_EVENT = 2
+
+        @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+        def _console_ctrl_handler(event):
+            if event in (_CTRL_C_EVENT, _CTRL_BREAK_EVENT, _CTRL_CLOSE_EVENT):
+                _force_exit()
+                return 1  # handled
+            return 0
+
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(_console_ctrl_handler, 1)
 
     # Auto-restart loop: if Discord disconnects, wait and reconnect
     while not _shutdown_flag[0]:
