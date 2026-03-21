@@ -25,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import uuid
 import zipfile
 from collections import Counter
@@ -69,6 +70,17 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("scanner")
+
+# Dedicated thread pool for scan work — separate from asyncio's default pool
+# so CPU-heavy scan threads don't starve Discord's heartbeat/gateway threads.
+_scan_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="scan")
+
+
+async def run_in_scan_thread(fn, *args):
+    """Run a function in the dedicated scan thread pool."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_scan_executor, fn, *args)
+
 
 # ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -2439,12 +2451,33 @@ def derive_log_dir_name(jar_path: str) -> str:
     return name
 
 
-async def run_jar_analyzer(jar_path: str, progress_cb=None) -> dict:
-    """Run JarAnalyzer as subprocess, return parsed results."""
+def _kill_proc_tree(proc):
+    """Kill a subprocess and all its children (important on Windows where Java spawns child processes)."""
+    try:
+        pid = proc.pid
+        if pid is None:
+            return
+        if sys.platform == "win32":
+            # taskkill /T kills the entire process tree
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _run_jar_sync(jar_path: str, master_dir: str, timeout: int) -> dict:
+    """Run JarAnalyzer synchronously in a thread — keeps the event loop free for Discord heartbeats."""
     java = shutil.which(CFG["scanner"]["java_path"]) or CFG["scanner"]["java_path"]
-    timeout = CFG["scanner"]["scan_timeout_seconds"]
     log_name = derive_log_dir_name(jar_path)
-    log_dir = MASTER_DIR / "logs" / log_name
+    log_dir = Path(master_dir) / "logs" / log_name
 
     if log_dir.exists():
         shutil.rmtree(log_dir, ignore_errors=True)
@@ -2452,61 +2485,50 @@ async def run_jar_analyzer(jar_path: str, progress_cb=None) -> dict:
     cmd = [java, "-cp", "tools", "JarAnalyzer", str(jar_path)]
     log.info(f"Running JarAnalyzer on {os.path.basename(jar_path)}")
 
-    if progress_cb:
-        await progress_cb("Decompiling and analyzing...")
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=str(MASTER_DIR),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    proc = subprocess.Popen(
+        cmd,
+        cwd=master_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
 
-    # Stream stdout line-by-line for live progress updates
-    stdout_lines: list[str] = []
-    stderr_buf = b""
-    last_cb = 0.0
-
-    async def _read_stdout():
-        nonlocal last_cb
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            decoded = line.decode("utf-8", errors="replace").rstrip()
-            stdout_lines.append(decoded)
-            log.info(f"[JarAnalyzer] {decoded}")
-            # Forward key status lines to progress callback (throttled to 2s)
-            if progress_cb and time.time() - last_cb >= 2.0:
-                # Extract a short status from the line
-                short = decoded[:80]
-                if any(kw in decoded.lower() for kw in
-                       ("step", "decompil", "analyz", "extract", "scan", "detect",
-                        "variant", "decrypt", "marker", "ioc", "score", "xor",
-                        "class", "writing", "done", "found", "warn")):
-                    await progress_cb(short)
-                    last_cb = time.time()
-
-    async def _read_stderr():
-        nonlocal stderr_buf
-        stderr_buf = await proc.stderr.read()
-
     try:
-        await asyncio.wait_for(
-            asyncio.gather(_read_stdout(), _read_stderr()),
-            timeout=timeout,
-        )
-        await proc.wait()
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.communicate()
+        stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_proc_tree(proc)
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
         return {"error": "Scan timed out", "exit_code": -1, "log_dir": str(log_dir)}
+    except Exception:
+        _kill_proc_tree(proc)
+        raise
+    finally:
+        if proc.poll() is None:
+            _kill_proc_tree(proc)
 
-    stdout_text = "\n".join(stdout_lines)
+    stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+    stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+
+    # Log key lines only (steps, detections, scores) — skip the thousands of class extraction lines
+    for line in stdout_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        low = stripped.lower()
+        # Only log summary/milestone lines at INFO — skip class extraction and CPREF details
+        is_key = (stripped.startswith(("[STEP", "[SCORE", "[DETECT", "[IOC", "[DONE", "[WARN", "[ERROR", "[FOUND"))
+                  or any(kw in low for kw in ("step ", "score:", "detection", "iocs written", "analysis complete", "done.", "writing ")))
+        if is_key:
+            log.info(f"[JarAnalyzer] {stripped[:200]}")
+        else:
+            log.debug(f"[JarAnalyzer] {stripped[:200]}")
+
     result = {
         "exit_code": proc.returncode,
         "stdout": sanitize_path(stdout_text),
-        "stderr": sanitize_path(stderr_buf.decode("utf-8", errors="replace")),
+        "stderr": sanitize_path(stderr_text),
         "log_dir": str(log_dir),
     }
 
@@ -2521,6 +2543,18 @@ async def run_jar_analyzer(jar_path: str, progress_cb=None) -> dict:
     analysis_txt = log_dir / "analysis.txt"
     if analysis_txt.exists():
         result["analysis_text"] = analysis_txt.read_text(encoding="utf-8", errors="replace")
+
+    return result
+
+
+async def run_jar_analyzer(jar_path: str, progress_cb=None, timeout_override: int = 0) -> dict:
+    """Run JarAnalyzer as subprocess, return parsed results."""
+    timeout = timeout_override or CFG["scanner"]["scan_timeout_seconds"]
+
+    if progress_cb:
+        await progress_cb("Decompiling and analyzing...")
+
+    result = await run_in_scan_thread(_run_jar_sync, jar_path, str(MASTER_DIR), timeout)
 
     return result
 
@@ -4412,8 +4446,15 @@ def archive_scan(log_dir: str, original_file: str, sha256: str = ""):
         dest.mkdir(parents=True, exist_ok=True)
 
     # Move logs — if dest already has logs, merge into it
+    # Skip decompiled source dirs (source/, main/) to save disk space
+    _skip_decomp = {"source", "main"}
     log_path = Path(log_dir)
     if log_path.exists():
+        # Delete decompiled dirs before archiving so they never get copied
+        for subdir in _skip_decomp:
+            p = log_path / subdir
+            if p.is_dir():
+                shutil.rmtree(str(p), ignore_errors=True)
         dest_logs = dest / "logs"
         if dest_logs.exists():
             # Merge: copy new log files into existing logs dir
@@ -4959,6 +5000,7 @@ def check_and_set_cooldown(user_id: int) -> Optional[int]:
 # ─── Bot ─────────────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
+## intents.message_content = True  # Enable for !command text commands (see testing/text_commands.py)
 if CFG["discord"].get("allow_dms", False):
     intents.dm_messages = True
 bot = discord.Bot(intents=intents)
@@ -5036,6 +5078,7 @@ async def on_ready():
     log.info(f"VT enabled: {CFG['virustotal']['enabled'] and bool(CFG['virustotal']['api_key'])}")
     log.info(f"YARA enabled: {YARA_AVAILABLE and CFG['yara']['enabled']}")
     log.info(f"Webhook killing: {CFG['scanner'].get('auto_delete_webhooks', True)}")
+
 
 
 @tasks.loop(seconds=30)
@@ -5460,172 +5503,8 @@ async def die_command(ctx: discord.ApplicationContext):
     sys.exit(0)
 
 
-# ─── /scrapemods command ─────────────────────────────────────────────────────
-
-try:
-    from mod_scraper import ModScrapeRunner
-    SCRAPER_AVAILABLE = True
-except ImportError:
-    SCRAPER_AVAILABLE = False
-
-_scrape_runner: Optional["ModScrapeRunner"] = None
-_scrape_task: Optional[asyncio.Task] = None
-
-
-@bot.slash_command(name="scrapemods", description="Scrape & scan mods from Modrinth/CurseForge/etc (alert IDs only)", **_install_params)
-async def scrapemods_command(
-    ctx: discord.ApplicationContext,
-    action: discord.Option(
-        str,
-        description="start or stop",
-        choices=["start", "stop", "status"],
-        required=True,
-    ),
-):
-    global _scrape_runner, _scrape_task
-
-    alert_ids = _get_alert_user_ids()
-    if ctx.author.id not in alert_ids:
-        return await ctx.respond("You are not authorized to use this command.", ephemeral=True)
-
-    if not SCRAPER_AVAILABLE:
-        return await ctx.respond("Scraper module not available (`mod_scraper.py` missing).", ephemeral=True)
-
-    if action == "stop":
-        if _scrape_runner:
-            _scrape_runner.stop()
-            await ctx.respond("Scraper stopping after current batch finishes...", ephemeral=True)
-        else:
-            await ctx.respond("Scraper is not running.", ephemeral=True)
-        return
-
-    if action == "status":
-        if _scrape_runner and _scrape_task and not _scrape_task.done():
-            s = _scrape_runner.stats
-            total_db = _scrape_runner.progress.total_downloaded
-            await ctx.respond(
-                f"**Scraper running**\n"
-                f"This session: {s['downloaded']} downloaded, {s['scanned']} scanned, "
-                f"{s['skipped']} skipped, {s['oversize']} oversize, {s['errors']} errors\n"
-                f"Total in database: {total_db}",
-                ephemeral=True,
-            )
-        else:
-            await ctx.respond("Scraper is not running.", ephemeral=True)
-        return
-
-    # action == "start"
-    if _scrape_task and not _scrape_task.done():
-        return await ctx.respond("Scraper is already running. Use `/scrapemods stop` first.", ephemeral=True)
-
-    # Wait for previous task to fully finish if it was recently stopped
-    if _scrape_task and _scrape_task.done():
-        _scrape_task = None
-
-    await ctx.respond("Starting mod scraper... will download and scan in batches of 20.", ephemeral=True)
-
-    scraper_cfg = CFG.get("scraper", {})
-    cf_key = scraper_cfg.get("curseforge_api_key", "")
-    nx_key = scraper_cfg.get("nexusmods_api_key", "")
-    batch_size = scraper_cfg.get("batch_size", 20)
-
-    mods_dir = MASTER_DIR / "scraped_mods"
-    mods_dir.mkdir(exist_ok=True)
-    progress_file = BOT_DIR / "scrape_progress.json"
-
-    _scrape_runner = ModScrapeRunner(
-        mods_dir=mods_dir,
-        progress_file=progress_file,
-        cf_api_key=cf_key,
-        nx_api_key=nx_key,
-        batch_size=batch_size,
-    )
-
-    async def _scrape_loop():
-        global _scrape_runner
-        runner = _scrape_runner
-        batch_num = 0
-        # Capture the channel reference now — ctx.followup expires after 15 min
-        channel = ctx.channel
-
-        try:
-            conn = aiohttp.TCPConnector(limit=20, limit_per_host=5)
-            async with aiohttp.ClientSession(connector=conn) as session:
-                while not runner.stopped:
-                    batch_num += 1
-                    log.info(f"[scraper] Batch {batch_num}: collecting {runner.batch_size} mods...")
-
-                    try:
-                        batch = await runner.collect_batch(session)
-                    except Exception as e:
-                        log.exception(f"[scraper] Batch collect error: {e}")
-                        await asyncio.sleep(10)
-                        continue
-
-                    if not batch:
-                        log.info("[scraper] No more mods to download. Stopping.")
-                        break
-
-                    log.info(f"[scraper] Batch {batch_num}: downloaded {len(batch)} JARs, scanning...")
-
-                    # Send status update via channel (not ctx.followup which expires)
-                    try:
-                        await channel.send(
-                            f"**[Scraper] Batch {batch_num}:** Downloaded {len(batch)} mods, scanning...\n"
-                            f"Session totals: {runner.stats['downloaded']} downloaded, "
-                            f"{runner.stats['scanned']} scanned",
-                        )
-                    except discord.Forbidden:
-                        log.warning("[scraper] Lost channel access — status updates will only appear in logs")
-                    except discord.NotFound:
-                        log.warning("[scraper] Channel no longer exists — status updates will only appear in logs")
-                    except Exception as e:
-                        log.debug(f"[scraper] Channel send failed: {e}")
-
-                    # Scan each JAR in the batch
-                    for jar_path, mod_name, source in batch:
-                        if runner.stopped:
-                            break
-                        try:
-                            scan_id = f"scrape_{uuid.uuid4().hex[:8]}"
-                            log.info(f"[scraper] Scanning: {mod_name} ({jar_path.name})")
-                            await run_scan(
-                                ctx=None,
-                                attachment=None,
-                                url=None,
-                                scan_id=scan_id,
-                                local_file=str(jar_path),
-                                private=True,
-                                silent=True,  # no Discord output for background scrape scans
-                            )
-                            runner.stats["scanned"] += 1
-                        except Exception as e:
-                            log.warning(f"[scraper] Scan error {mod_name}: {e}")
-
-                    # Flush scrape progress to disk after each batch
-                    runner.progress.flush()
-
-                    log.info(f"[scraper] Batch {batch_num} complete. "
-                             f"Stats: {runner.stats}")
-
-            log.info(f"[scraper] Finished. Final stats: {runner.stats}")
-            runner.progress.flush()
-            try:
-                await channel.send(
-                    f"**[Scraper] Finished.**\n"
-                    f"Downloaded: {runner.stats['downloaded']} | Scanned: {runner.stats['scanned']} | "
-                    f"Skipped: {runner.stats['skipped']} | Errors: {runner.stats['errors']}",
-                )
-            except Exception:
-                pass
-        except Exception as e:
-            log.exception(f"[scraper] Fatal error in scrape loop: {e}")
-            try:
-                await channel.send(f"**[Scraper] Crashed:** {e}")
-            except Exception:
-                pass
-
-    _scrape_task = asyncio.create_task(_scrape_loop())
+## Scraper integration removed — see testing/scraper_bot_integration.py for reference
+## Text command listener removed — see testing/text_commands.py for reference
 
 
 # ─── Scan Runner ─────────────────────────────────────────────────────────────
@@ -5638,6 +5517,8 @@ async def run_scan(
     local_file: Optional[str] = None,  # for multi-JAR ZIP: path to an already-extracted JAR
     private: bool = False,  # private scan: local analysis only, no uploads to VT/MB/HA
     silent: bool = False,  # silent mode: skip all Discord messaging (for background scrape scans)
+    skip_nested: bool = False,  # skip nested JAR sub-scans (JarAnalyzer handles them internally)
+    fast: bool = False,  # fast mode: skip deobfuscation, entropy, format analysis, string extraction, reports (scraper)
 ):
     start = time.time()
     work_dir = tempfile.mkdtemp(prefix="scan_")
@@ -5740,7 +5621,7 @@ async def run_scan(
                 return
 
         file_size = os.path.getsize(dl_path)
-        hashes = await asyncio.to_thread(compute_hashes, dl_path)
+        hashes = await run_in_scan_thread(compute_hashes, dl_path)
         sha256 = hashes["sha256"]
         mod_name = re.sub(r"\.(jar|zip|exe|dll|bin|dat)$", "", filename, flags=re.IGNORECASE)
         mod_name = re.sub(r"[^\w\-]", "_", mod_name)
@@ -5775,6 +5656,10 @@ async def run_scan(
             if n_submitters > 1 or n_guilds > 1:
                 rep_info += f" by {n_submitters} user(s) across {n_guilds} server(s)"
             await progress(f"{rep_info}. Refreshing analysis...")
+            # Fast mode: skip already-scanned files entirely
+            if fast:
+                log.info(f"[{scan_id}] Fast mode: skipping already-cataloged file {filename} (SHA256={sha256[:16]}...)")
+                return
 
         # ── Ensure HTTP session exists (on_ready may not have fired yet) ──
         await ensure_http_session()
@@ -5799,7 +5684,7 @@ async def run_scan(
         await update_progress(stages, filename, file_size, hashes)
 
         # ── Zip bomb check — ABORT if detected ──
-        zip_bomb_warning = await asyncio.to_thread(check_zip_bomb, dl_path)
+        zip_bomb_warning = await run_in_scan_thread(check_zip_bomb, dl_path)
         if zip_bomb_warning:
             log.warning(f"[{scan_id}] ZIP BOMB DETECTED: {zip_bomb_warning}")
             stages["Local Analysis"] = "complete"
@@ -5929,7 +5814,7 @@ async def run_scan(
                 except discord.HTTPException:
                     pass
 
-            yara_matches = await asyncio.to_thread(run_yara, dl_path)
+            yara_matches = await run_in_scan_thread(run_yara, dl_path)
             seen_rules = set()
             unique_yara = []
             for m in yara_matches:
@@ -5989,26 +5874,27 @@ async def run_scan(
             if is_valid_jar(jar_path):
                 jars_to_scan.append(jar_path)
 
-            nested = await asyncio.to_thread(extract_files_from_zip, jar_path, work_dir)
-            for nf in nested:
-                if nf in jars_to_scan:
-                    continue
-                # Check if it's a JAR/ZIP (PK magic) or another file type
-                try:
-                    with open(nf, "rb") as _f:
-                        _magic = _f.read(4)
-                    if _magic[:2] == b"PK" and is_valid_jar(nf):
-                        jars_to_scan.append(nf)
-                    else:
+            if not skip_nested:
+                nested = await run_in_scan_thread(extract_files_from_zip, jar_path, work_dir)
+                for nf in nested:
+                    if nf in jars_to_scan:
+                        continue
+                    # Check if it's a JAR/ZIP (PK magic) or another file type
+                    try:
+                        with open(nf, "rb") as _f:
+                            _magic = _f.read(4)
+                        if _magic[:2] == b"PK" and is_valid_jar(nf):
+                            jars_to_scan.append(nf)
+                        else:
+                            extracted_files.append(nf)
+                    except Exception:
                         extracted_files.append(nf)
-                except Exception:
-                    extracted_files.append(nf)
 
             if not jars_to_scan and not extracted_files:
                 jars_to_scan.append(jar_path)
 
             # ── Multi-JAR ZIP: if a .zip contains multiple inner JARs, scan each separately ──
-            if dl_path.lower().endswith(".zip") and not local_file:
+            if dl_path.lower().endswith(".zip") and not local_file and not skip_nested:
                 # Count inner JARs only (not the zip itself acting as a jar)
                 inner_jars = [j for j in jars_to_scan if j != jar_path and j != dl_path]
                 if len(inner_jars) > 1:
@@ -6069,7 +5955,7 @@ async def run_scan(
             if inner_files:
                 # Use the first extracted file as the primary for API lookups
                 primary_path = inner_files[0]
-                primary_hashes = await asyncio.to_thread(compute_hashes, primary_path)
+                primary_hashes = await run_in_scan_thread(compute_hashes, primary_path)
                 primary_sha256 = primary_hashes["sha256"]
                 is_wrapper_zip = True
                 inner_name = os.path.basename(primary_path)
@@ -6091,7 +5977,8 @@ async def run_scan(
         for jar in jars_to_scan:
             if scan_id in _cancelled_scans:
                 raise asyncio.CancelledError("Scan cancelled by user")
-            result = await run_jar_analyzer(jar, progress_cb=_jar_progress)
+            result = await run_jar_analyzer(jar, progress_cb=_jar_progress,
+                                                  timeout_override=60 if fast else 0)
             if result.get("log_dir"):
                 all_log_dirs.append(result["log_dir"])
             if result.get("iocs"):
@@ -6100,101 +5987,110 @@ async def run_scan(
                     all_analysis = result.get("analysis_text")
 
         # ── Obfuscator detection ──
-        stage_details["Local Analysis"] = "Detecting obfuscators..."
-        await update_progress(stages, filename, file_size, hashes)
-        obfuscators = await asyncio.to_thread(detect_obfuscators, dl_path)
-
-        # ── DashO string deobfuscation ──
         deobfuscation = None
-        if DEOBFUSCATOR_AVAILABLE and is_zip:
-            try:
-                deobfuscation = await asyncio.to_thread(_deobfuscate_jar, str(dl_path))
-                if deobfuscation and deobfuscation.get("detected"):
-                    log.info(f"DashO deobfuscation: {deobfuscation['total_decrypted']} strings from "
-                             f"{deobfuscation['classes_with_strings']} classes")
-                    if "DashO" not in obfuscators:
-                        obfuscators.append("DashO (string encryption cracked)")
-                else:
-                    deobfuscation = None
-            except Exception as exc:
-                log.warning(f"Deobfuscation failed: {exc}")
+        if fast:
+            # Fast mode: skip deobfuscation, entropy, strings, format analysis
+            obfuscators = []
+            entropy = None
+            manifest = await run_in_scan_thread(inspect_manifest, dl_path)
+            extracted_strings = None
+            format_analysis = None
+        else:
+            stage_details["Local Analysis"] = "Detecting obfuscators..."
+            await update_progress(stages, filename, file_size, hashes)
+            obfuscators = await run_in_scan_thread(detect_obfuscators, dl_path)
 
-        # ── Generic string deobfuscation (XOR, base64, ROT, hex, etc.) ──
-        if GENERIC_DEOBFUSCATOR_AVAILABLE and is_zip:
-            try:
-                generic_result = await asyncio.to_thread(_deobfuscate_generic, str(dl_path))
-                if generic_result and generic_result.get("detected"):
-                    log.info(f"Generic deobfuscation: {generic_result['total_decrypted']} strings from "
-                             f"{generic_result['classes_with_strings']} classes "
-                             f"(algorithms: {', '.join(generic_result.get('algorithms', []))})")
+            # ── DashO string deobfuscation ──
+            if DEOBFUSCATOR_AVAILABLE and is_zip:
+                try:
+                    deobfuscation = await run_in_scan_thread(_deobfuscate_jar, str(dl_path))
                     if deobfuscation and deobfuscation.get("detected"):
-                        # Merge generic results into existing DashO results
-                        existing_keys = {(s["class"], s["decrypted"]) for s in deobfuscation.get("strings", [])}
-                        new_strings = [s for s in generic_result.get("strings", [])
-                                       if (s["class"], s["decrypted"]) not in existing_keys]
-                        if new_strings:
-                            deobfuscation["strings"].extend(new_strings)
-                            deobfuscation["total_decrypted"] += len(new_strings)
-                            deobfuscation["classes_with_strings"] = len(
-                                {s["class"] for s in deobfuscation["strings"]})
-                            existing_algos = set(deobfuscation.get("algorithms", []))
-                            for a in generic_result.get("algorithms", []):
-                                if a not in existing_algos:
-                                    deobfuscation["algorithms"].append(a)
+                        log.info(f"DashO deobfuscation: {deobfuscation['total_decrypted']} strings from "
+                                 f"{deobfuscation['classes_with_strings']} classes")
+                        if "DashO" not in obfuscators:
+                            obfuscators.append("DashO (string encryption cracked)")
                     else:
-                        deobfuscation = generic_result
-            except Exception as exc:
-                log.warning(f"Generic deobfuscation failed: {exc}")
+                        deobfuscation = None
+                except Exception as exc:
+                    log.warning(f"Deobfuscation failed: {exc}")
 
-        # ── Entropy analysis ──
-        stage_details["Local Analysis"] = "Analyzing entropy..."
-        await update_progress(stages, filename, file_size, hashes)
-        entropy = await asyncio.to_thread(analyze_entropy, dl_path)
+            # ── Generic string deobfuscation (XOR, base64, ROT, hex, etc.) ──
+            if GENERIC_DEOBFUSCATOR_AVAILABLE and is_zip:
+                try:
+                    generic_result = await run_in_scan_thread(_deobfuscate_generic, str(dl_path))
+                    if generic_result and generic_result.get("detected"):
+                        log.info(f"Generic deobfuscation: {generic_result['total_decrypted']} strings from "
+                                 f"{generic_result['classes_with_strings']} classes "
+                                 f"(algorithms: {', '.join(generic_result.get('algorithms', []))})")
+                        if deobfuscation and deobfuscation.get("detected"):
+                            # Merge generic results into existing DashO results
+                            existing_keys = {(s["class"], s["decrypted"]) for s in deobfuscation.get("strings", [])}
+                            new_strings = [s for s in generic_result.get("strings", [])
+                                           if (s["class"], s["decrypted"]) not in existing_keys]
+                            if new_strings:
+                                deobfuscation["strings"].extend(new_strings)
+                                deobfuscation["total_decrypted"] += len(new_strings)
+                                deobfuscation["classes_with_strings"] = len(
+                                    {s["class"] for s in deobfuscation["strings"]})
+                                existing_algos = set(deobfuscation.get("algorithms", []))
+                                for a in generic_result.get("algorithms", []):
+                                    if a not in existing_algos:
+                                        deobfuscation["algorithms"].append(a)
+                        else:
+                            deobfuscation = generic_result
+                except Exception as exc:
+                    log.warning(f"Generic deobfuscation failed: {exc}")
 
-        # ── Manifest inspection ──
-        stage_details["Local Analysis"] = "Inspecting manifest..."
-        manifest = await asyncio.to_thread(inspect_manifest, dl_path)
+            # ── Entropy analysis ──
+            stage_details["Local Analysis"] = "Analyzing entropy..."
+            await update_progress(stages, filename, file_size, hashes)
+            entropy = await run_in_scan_thread(analyze_entropy, dl_path)
 
-        # ── Raw string extraction (original file + extracted files) ──
-        stage_details["Local Analysis"] = "Extracting strings..."
-        await update_progress(stages, filename, file_size, hashes)
-        extracted_strings = await asyncio.to_thread(extract_strings, dl_path)
-        for ef in extracted_files:
-            ef_strings = await asyncio.to_thread(extract_strings, ef)
-            if ef_strings:
-                for key in ("discord_webhooks", "discord_tokens", "urls", "ipv4", "eth_addresses"):
-                    if ef_strings.get(key):
-                        extracted_strings.setdefault(key, []).extend(ef_strings[key])
+            # ── Manifest inspection ──
+            stage_details["Local Analysis"] = "Inspecting manifest..."
+            manifest = await run_in_scan_thread(inspect_manifest, dl_path)
 
-        # ── Multi-format analysis (PE, PDF, Office, LNK, Script, MSI, ISO) ──
-        stage_details["Local Analysis"] = "Analyzing file format..."
-        await update_progress(stages, filename, file_size, hashes)
-        # Analyze original file + all extracted files, merge results
-        format_analysis = await asyncio.to_thread(analyze_file_format, dl_path)
-        for ef in extracted_files:
-            ef_name = os.path.basename(ef)
-            ef_fmt = await asyncio.to_thread(analyze_file_format, ef)
-            if ef_fmt and ef_fmt.get("findings"):
-                # Prefix findings with the extracted filename
-                if format_analysis is None:
-                    format_analysis = {"type": "ZIP archive", "findings": []}
-                if not format_analysis.get("findings"):
-                    format_analysis["findings"] = []
-                format_analysis["findings"].append(f"--- Extracted: `{ef_name}` ({ef_fmt.get('type', 'unknown')}) ---")
-                format_analysis["findings"].extend(ef_fmt["findings"])
-                # Merge sub-fields
-                for subkey in ("suspicious_imports", "suspicious_sections", "suspicious_files"):
-                    if ef_fmt.get(subkey):
-                        format_analysis.setdefault(subkey, []).extend(ef_fmt[subkey])
+            # ── Raw string extraction (original file + extracted files) ──
+            stage_details["Local Analysis"] = "Extracting strings..."
+            await update_progress(stages, filename, file_size, hashes)
+            extracted_strings = await run_in_scan_thread(extract_strings, dl_path)
+            for ef in extracted_files:
+                ef_strings = await run_in_scan_thread(extract_strings, ef)
+                if ef_strings:
+                    for key in ("discord_webhooks", "discord_tokens", "urls", "ipv4", "eth_addresses"):
+                        if ef_strings.get(key):
+                            extracted_strings.setdefault(key, []).extend(ef_strings[key])
 
-        # ── YARA (original + all extracted files) ──
+            # ── Multi-format analysis (PE, PDF, Office, LNK, Script, MSI, ISO) ──
+            stage_details["Local Analysis"] = "Analyzing file format..."
+            await update_progress(stages, filename, file_size, hashes)
+            # Analyze original file + all extracted files, merge results
+            format_analysis = await run_in_scan_thread(analyze_file_format, dl_path)
+            for ef in extracted_files:
+                ef_name = os.path.basename(ef)
+                ef_fmt = await run_in_scan_thread(analyze_file_format, ef)
+                if ef_fmt and ef_fmt.get("findings"):
+                    # Prefix findings with the extracted filename
+                    if format_analysis is None:
+                        format_analysis = {"type": "ZIP archive", "findings": []}
+                    if not format_analysis.get("findings"):
+                        format_analysis["findings"] = []
+                    format_analysis["findings"].append(f"--- Extracted: `{ef_name}` ({ef_fmt.get('type', 'unknown')}) ---")
+                    format_analysis["findings"].extend(ef_fmt["findings"])
+                    # Merge sub-fields
+                    for subkey in ("suspicious_imports", "suspicious_sections", "suspicious_files"):
+                        if ef_fmt.get(subkey):
+                            format_analysis.setdefault(subkey, []).extend(ef_fmt[subkey])
+
+        # ── YARA (original + all extracted files; fast mode: main file only) ──
         stage_details["Local Analysis"] = "Running YARA rules..."
         await update_progress(stages, filename, file_size, hashes)
-        yara_matches = await asyncio.to_thread(run_yara, dl_path)
-        all_scan_files = jars_to_scan + extracted_files
-        for sf in all_scan_files:
-            if sf != dl_path:
-                yara_matches.extend(await asyncio.to_thread(run_yara, sf))
+        yara_matches = await run_in_scan_thread(run_yara, dl_path)
+        if not fast:
+            all_scan_files = jars_to_scan + extracted_files
+            for sf in all_scan_files:
+                if sf != dl_path:
+                    yara_matches.extend(await run_in_scan_thread(run_yara, sf))
         seen_rules = set()
         unique_yara = []
         for m in yara_matches:
@@ -6473,8 +6369,8 @@ async def run_scan(
                 "scanned_path": final_scanned_path,
             })
 
-        # ── Auto-research for exception candidates ──
-        if score <= DETECTION_THRESHOLD and extracted_strings and http_session:
+        # ── Auto-research for exception candidates (skip in fast mode) ──
+        if not fast and score <= DETECTION_THRESHOLD and extracted_strings and http_session:
             all_urls = extracted_strings.get("urls", [])
             if all_urls:
                 try:
@@ -6488,6 +6384,11 @@ async def run_scan(
                     log.debug(f"Auto-research failed: {e}")
 
         # ── Build main results embed (local analysis + YARA + strings etc.) ──
+        # Fast mode: skip embeds, reports, and log packaging entirely
+        if fast:
+            log.info(f"[{scan_id}] Fast scan complete: {filename} — score={score} level={level} in {time.time() - start:.1f}s")
+            return
+
         embeds = build_embeds(
             filename=filename,
             file_size=file_size,
@@ -6903,9 +6804,38 @@ if __name__ == "__main__":
     # Auto-launch Tor before starting the bot
     start_tor()
 
-    try:
-        bot.run(token)
-    except KeyboardInterrupt:
+    # Handle Ctrl+C on Windows (where SIGINT doesn't interrupt the event loop)
+    import signal
+
+    _shutdown_flag = [False]
+
+    def _sigint_handler(sig, frame):
+        _shutdown_flag[0] = True
         log.info("Ctrl+C received — shutting down")
-    finally:
+        print("\nShutting down...")
         stop_tor()
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    # Auto-restart loop: if Discord disconnects, wait and reconnect
+    while not _shutdown_flag[0]:
+        try:
+            log.info("Starting bot...")
+            bot.run(token)
+        except KeyboardInterrupt:
+            log.info("Ctrl+C received — shutting down")
+            break
+        except SystemExit:
+            break
+        except Exception as e:
+            log.exception(f"Bot crashed: {e}")
+
+        if _shutdown_flag[0]:
+            break
+
+        log.warning("Bot disconnected — restarting in 10 seconds...")
+        print("Bot disconnected — restarting in 10s...")
+        time.sleep(10)
+
+    stop_tor()
