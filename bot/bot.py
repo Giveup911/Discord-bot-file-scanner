@@ -2844,14 +2844,50 @@ STAGE_ICONS = {
     "error": "\u274C",       # X
 }
 
-STAGE_ETAS = {
-    "Local Analysis": "~10s",
-    "VirusTotal": "~30s",
-    "VT Upload": "~2-3min",
-    "VT Sandbox": "~2s",
-    "MalwareBazaar": "~2s",
-    "Hybrid Analysis": "~5s",
+STAGE_ETAS_DEFAULT = {
+    "Local Analysis": 10,
+    "VirusTotal": 30,
+    "VT Upload": 150,
+    "VT Sandbox": 5,
+    "MalwareBazaar": 2,
+    "Hybrid Analysis": 5,
 }
+
+
+class APITimingTracker:
+    """Track rolling average API response times for ETA estimates."""
+
+    def __init__(self, window: int = 20):
+        self._times: dict[str, list[float]] = {}
+        self._window = window
+
+    def record(self, service: str, duration: float):
+        if service not in self._times:
+            self._times[service] = []
+        self._times[service].append(duration)
+        if len(self._times[service]) > self._window:
+            self._times[service] = self._times[service][-self._window:]
+
+    def avg(self, service: str) -> float:
+        """Return average duration in seconds, or default if no data."""
+        if service in self._times and self._times[service]:
+            return sum(self._times[service]) / len(self._times[service])
+        return STAGE_ETAS_DEFAULT.get(service, 5)
+
+    def eta_str(self, service: str) -> str:
+        secs = self.avg(service)
+        if secs >= 120:
+            return f"~{secs / 60:.1f}min"
+        elif secs >= 10:
+            return f"~{int(secs)}s"
+        else:
+            return f"~{secs:.1f}s"
+
+
+api_timing = APITimingTracker()
+
+# Keep STAGE_ETAS as a property-like lookup for build_progress_embed
+STAGE_ETAS = {}
 
 
 def build_progress_embed(
@@ -2882,7 +2918,7 @@ def build_progress_embed(
         icon = STAGE_ICONS.get(status, STAGE_ICONS.get(status.split()[0], "\u2753"))
         eta = ""
         if status == "pending":
-            eta = f" (ETA {STAGE_ETAS.get(stage_name, '~5s')})"
+            eta = f" (ETA {api_timing.eta_str(stage_name)})"
         elif status.startswith("running"):
             # Show live elapsed time
             if stage_start_times and stage_name in stage_start_times:
@@ -5019,10 +5055,15 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
 class ScanQueue:
     def __init__(self, max_concurrent: int = 3):
         self._sem = asyncio.Semaphore(max_concurrent)
+        self._max_concurrent = max_concurrent
         self._pending = 0
         self._active = 0
         self._lock = asyncio.Lock()
         self._waiters: list[asyncio.Event] = []
+
+    @property
+    def max_concurrent(self):
+        return self._max_concurrent
 
     @property
     def pending(self):
@@ -5181,6 +5222,17 @@ async def on_ready():
     log.info(f"VT enabled: {CFG['virustotal']['enabled'] and bool(CFG['virustotal']['api_key'])}")
     log.info(f"YARA enabled: {YARA_AVAILABLE and CFG['yara']['enabled']}")
     log.info(f"Webhook killing: {CFG['scanner'].get('auto_delete_webhooks', True)}")
+
+    # Auto-start scraper if configured and not already running
+    if (SCRAPER_AVAILABLE
+            and CFG.get("scraper", {}).get("auto_start", False)
+            and (_scrape_task is None or _scrape_task.done())):
+        free_gb = _get_free_space_gb()
+        if free_gb >= SCRAPER_MIN_FREE_SPACE_GB:
+            log.info(f"[scraper] Auto-starting scraper ({free_gb:.1f} GB free)")
+            _start_scraper(channel=None)
+        else:
+            log.warning(f"[scraper] Auto-start skipped: low disk space ({free_gb:.1f} GB free)")
 
 
 
@@ -5374,15 +5426,40 @@ async def giverat_command(
         sid = uuid.uuid4().hex[:8]
         scan_targets.append((None, url, sid, url[:60]))
 
+    # Check if scraper is active — if so, pause it for user scan
+    _scraper_was_active = (
+        _scrape_task is not None
+        and not _scrape_task.done()
+        and _scrape_runner is not None
+        and not _scrape_runner.stopped
+        and _scrape_pause is not None
+    )
+
+    if _scraper_was_active:
+        # Pause scraper for each scan file
+        for _ in scan_targets:
+            await _scrape_pause.pause_for_user_scan()
+
     # ephemeral ack
     private_tag = " (private — local only)" if private else ""
+    scraper_info = ""
+    if _scraper_was_active:
+        active_scrape_scans = scan_queue.active
+        pending_pos = scan_queue.pending + 1
+        scraper_info = (
+            f"\n\n\U0001F50D **Mod scraper is running** — pausing scraper for your scan."
+            f"\nActive scrape scans finishing: **{active_scrape_scans}**"
+            f"\nQueue position: **{pending_pos}**"
+            f"\nScraper will resume **5 minutes** after your scan completes."
+        )
+
     if len(scan_targets) == 1:
-        ack_text = f"Scanning `{scan_targets[0][3]}`{private_tag} \u2014 results will be posted publicly.\nScan ID: `{scan_targets[0][2]}`"
+        ack_text = f"Scanning `{scan_targets[0][3]}`{private_tag} \u2014 results will be posted publicly.\nScan ID: `{scan_targets[0][2]}`{scraper_info}"
     else:
         lines = [f"Queuing **{len(scan_targets)}** file(s) for scanning:"]
         for _, _, sid, dname in scan_targets:
             lines.append(f"  \u2022 `{dname}` (ID: `{sid}`)")
-        ack_text = "\n".join(lines)
+        ack_text = "\n".join(lines) + scraper_info
     await ctx.followup.send(ack_text, ephemeral=True)
 
     # ── Queue each scan ──
@@ -5391,7 +5468,7 @@ async def giverat_command(
     for attach, scan_url, scan_id, display_name in scan_targets:
         queue_msg = None
 
-        if scan_queue.active >= scan_queue._sem._value:
+        if scan_queue.active >= scan_queue.max_concurrent:
             queue_text = (
                 f"Scan `{display_name}` by {ctx.author.mention} is queued — "
                 f"position **{scan_queue.pending + 1}**, {scan_queue.active} active scan(s)."
@@ -5442,9 +5519,24 @@ async def giverat_command(
                     pass
 
         try:
+            # Wrap scan to notify scraper pause controller when done
+            # Capture reference once — check identity before calling to avoid stale controller
+            _pause_ctrl = _scrape_pause if _scraper_was_active else None
+
+            async def _tracked_user_scan(_a, _u, _sid, _priv, _pc=_pause_ctrl):
+                try:
+                    return await run_scan(ctx, _a, _u, _sid, private=_priv)
+                finally:
+                    if _pc is not None and _pc is _scrape_pause:
+                        try:
+                            await _pc.user_scan_done()
+                        except Exception:
+                            pass
+
             # Use create_task so multiple files scan concurrently (up to semaphore limit)
-            asyncio.create_task(
-                scan_queue.submit(run_scan(ctx, attach, scan_url, scan_id, private=private), on_dequeue=_on_dequeue)
+            # Store task ref to prevent GC (uses same pattern as _track_poll_task)
+            _track_poll_task(
+                scan_queue.submit(_tracked_user_scan(attach, scan_url, scan_id, private), on_dequeue=_on_dequeue)
             )
         except Exception as e:
             log.exception(f"Scan submit failed for {display_name}")
@@ -5618,16 +5710,102 @@ try:
 except ImportError:
     SCRAPER_AVAILABLE = False
 
+
+class ScraperPauseController:
+    """Controls pausing/resuming the scraper when user scans come in."""
+
+    def __init__(self):
+        self._paused = asyncio.Event()
+        self._paused.set()  # Start unpaused
+        self._user_scans_active = 0
+        self._lock = asyncio.Lock()
+        self._resume_task: Optional[asyncio.Task] = None
+        self._force_stopped = False
+
+    @property
+    def is_paused(self) -> bool:
+        return not self._paused.is_set()
+
+    async def pause_for_user_scan(self):
+        """Called once per user scan file to pause scraper."""
+        async with self._lock:
+            self._user_scans_active += 1
+            if self._resume_task and not self._resume_task.done():
+                self._resume_task.cancel()
+                self._resume_task = None
+            self._paused.clear()
+            log.info(f"[scraper] Paused for user scan ({self._user_scans_active} active)")
+
+    async def user_scan_done(self):
+        """Called when a user scan completes. Starts 5-min resume timer when all done."""
+        async with self._lock:
+            self._user_scans_active = max(0, self._user_scans_active - 1)
+            if self._user_scans_active == 0 and not self._force_stopped:
+                if self._resume_task and not self._resume_task.done():
+                    self._resume_task.cancel()
+                self._resume_task = asyncio.create_task(self._delayed_resume())
+                log.info("[scraper] All user scans done, resuming in 5 min")
+
+    async def _delayed_resume(self):
+        try:
+            await asyncio.sleep(300)  # 5 minutes
+            async with self._lock:
+                if not self._force_stopped:
+                    self._paused.set()
+                    log.info("[scraper] Resumed after 5-min cooldown")
+        except asyncio.CancelledError:
+            pass
+
+    async def wait_if_paused(self):
+        """Block until unpaused. Returns immediately if not paused."""
+        await self._paused.wait()
+
+    async def force_stop(self):
+        """Called when /scrapemods stop is used during a pause."""
+        async with self._lock:
+            self._force_stopped = True
+            if self._resume_task and not self._resume_task.done():
+                self._resume_task.cancel()
+                self._resume_task = None
+            # Unblock wait_if_paused so the loop can see runner.stopped and exit
+            self._paused.set()
+
+    async def reset(self):
+        """Reset for a fresh scraper start."""
+        async with self._lock:
+            self._paused.set()
+            self._user_scans_active = 0
+            self._force_stopped = False
+            if self._resume_task and not self._resume_task.done():
+                self._resume_task.cancel()
+            self._resume_task = None
+
+
+def _get_free_space_gb() -> float:
+    """Get free disk space in GB for the drive containing the bot."""
+    try:
+        st = shutil.disk_usage(str(MASTER_DIR))
+        return st.free / (1024 ** 3)
+    except Exception:
+        return 999.0  # Assume plenty if we can't check
+
+
+# Minimum free space before scraper auto-stops (GB)
+SCRAPER_MIN_FREE_SPACE_GB = 30.0
+
 _scrape_runner: Optional["ModScrapeRunner"] = None
 _scrape_task: Optional[asyncio.Task] = None
+_scrape_pause: Optional[ScraperPauseController] = None
 
 
 def _start_scraper(channel=None):
     """Start the scraper loop. channel is optional — if None, status updates are log-only."""
-    global _scrape_runner, _scrape_task
+    global _scrape_runner, _scrape_task, _scrape_pause
 
     if _scrape_task and not _scrape_task.done():
         return  # Already running
+
+    _scrape_pause = ScraperPauseController()
 
     scraper_cfg = CFG.get("scraper", {})
     cf_key = scraper_cfg.get("curseforge_api_key", "")
@@ -5708,8 +5886,23 @@ def _start_scraper(channel=None):
             conn = aiohttp.TCPConnector(limit=20, limit_per_host=5)
             async with aiohttp.ClientSession(connector=conn) as session:
                 while not runner.stopped:
+                    # Wait if paused for user scans
+                    if _scrape_pause and _scrape_pause.is_paused:
+                        await _update_status(_build_status(phase="**paused** (user scan in progress)"))
+                        await _scrape_pause.wait_if_paused()
+                        if runner.stopped:
+                            break
+                        continue  # Re-check pause state and loop condition
+
+                    # Check disk space
+                    free_gb = _get_free_space_gb()
+                    if free_gb < SCRAPER_MIN_FREE_SPACE_GB:
+                        log.warning(f"[scraper] Low disk space ({free_gb:.1f} GB free < {SCRAPER_MIN_FREE_SPACE_GB} GB). Stopping.")
+                        await _update_status(f"**Scraper stopped:** Low disk space ({free_gb:.1f} GB free)")
+                        break
+
                     batch_num += 1
-                    log.info(f"[scraper] Batch {batch_num}: collecting {runner.batch_size} mods...")
+                    log.info(f"[scraper] Batch {batch_num}: collecting {runner.batch_size} mods... ({free_gb:.1f} GB free)")
                     await _update_status(_build_status(phase="collecting mods..."))
 
                     try:
@@ -5735,6 +5928,9 @@ def _start_scraper(channel=None):
                     async def _scan_one(jar_path, mod_name, source):
                         nonlocal batch_scanned, last_status_update
                         async with sem:
+                            # Wait if paused for user scans (inside sem so we recheck after unpause)
+                            if _scrape_pause:
+                                await _scrape_pause.wait_if_paused()
                             if runner.stopped:
                                 return
                             try:
@@ -5826,6 +6022,8 @@ async def scrapemods_command(
     if action == "stop":
         if _scrape_runner:
             _scrape_runner.stop()
+            if _scrape_pause:
+                await _scrape_pause.force_stop()
             await ctx.respond("Scraper stopping after current batch finishes...", ephemeral=True)
         else:
             await ctx.respond("Scraper is not running.", ephemeral=True)
@@ -5835,11 +6033,16 @@ async def scrapemods_command(
         if _scrape_runner and _scrape_task and not _scrape_task.done():
             s = _scrape_runner.stats
             total_db = _scrape_runner.progress.total_downloaded
+            free_gb = _get_free_space_gb()
+            pause_info = ""
+            if _scrape_pause and _scrape_pause.is_paused:
+                pause_info = f"\n**Paused** for {_scrape_pause._user_scans_active} user scan(s)"
             await ctx.respond(
-                f"**Scraper running**\n"
+                f"**Scraper running**{pause_info}\n"
                 f"This session: {s['downloaded']} downloaded, {s['scanned']} scanned, "
                 f"{s['skipped']} skipped, {s['oversize']} oversize, {s['errors']} errors\n"
-                f"Total in database: {total_db}",
+                f"Total in database: {total_db}\n"
+                f"Disk space: {free_gb:.1f} GB free (auto-stop at {SCRAPER_MIN_FREE_SPACE_GB:.0f} GB)",
                 ephemeral=True,
             )
         else:
@@ -6055,12 +6258,12 @@ async def run_scan(
             mb_msg = None
             ha_msg = None
             if http_session and vt_enabled:
-                vt_msg = await safe_send(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "~30s", scan_id))
-                vt_sb_msg = await safe_send(embed=_build_service_pending_embed("VT Sandbox Analysis", "\U0001F9EC", "~2s", scan_id))
+                vt_msg = await safe_send(embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", api_timing.eta_str("VirusTotal"), scan_id))
+                vt_sb_msg = await safe_send(embed=_build_service_pending_embed("VT Sandbox Analysis", "\U0001F9EC", api_timing.eta_str("VT Sandbox"), scan_id))
             if http_session and mb_enabled:
-                mb_msg = await safe_send(embed=_build_service_pending_embed("MalwareBazaar", "\U0001F9A0", "~2s", scan_id))
+                mb_msg = await safe_send(embed=_build_service_pending_embed("MalwareBazaar", "\U0001F9A0", api_timing.eta_str("MalwareBazaar"), scan_id))
             if http_session and ha_enabled:
-                ha_msg = await safe_send(embed=_build_service_pending_embed("Hybrid Analysis", "\U0001F50D", "~5s", scan_id))
+                ha_msg = await safe_send(embed=_build_service_pending_embed("Hybrid Analysis", "\U0001F50D", api_timing.eta_str("Hybrid Analysis"), scan_id))
 
             # VT helper for zip bomb path
             async def _zb_vt_lookup_or_upload():
@@ -6069,7 +6272,7 @@ async def run_scan(
                     if vt_msg:
                         try:
                             await vt_msg.edit(embed=_build_service_pending_embed(
-                                "VirusTotal", "\U0001F9EA", "uploading ~2-3min", scan_id))
+                                "VirusTotal", "\U0001F9EA", f"uploading {api_timing.eta_str('VT Upload')}", scan_id))
                         except discord.HTTPException:
                             pass
                     result = await vt_upload(dl_path, sha256, http_session)
@@ -6743,18 +6946,18 @@ async def run_scan(
         # Send pending embeds for each enabled service
         if http_session and vt_enabled:
             vt_msg = await safe_send(
-                embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", "~30s", scan_id)
+                embed=_build_service_pending_embed("VirusTotal", "\U0001F9EA", api_timing.eta_str("VirusTotal"), scan_id)
             )
             vt_sb_msg = await safe_send(
-                embed=_build_service_pending_embed("VT Sandbox Analysis", "\U0001F9EC", "~2s", scan_id)
+                embed=_build_service_pending_embed("VT Sandbox Analysis", "\U0001F9EC", api_timing.eta_str("VT Sandbox"), scan_id)
             )
         if http_session and mb_enabled:
             mb_msg = await safe_send(
-                embed=_build_service_pending_embed("MalwareBazaar", "\U0001F9A0", "~2s", scan_id)
+                embed=_build_service_pending_embed("MalwareBazaar", "\U0001F9A0", api_timing.eta_str("MalwareBazaar"), scan_id)
             )
         if http_session and ha_enabled:
             ha_msg = await safe_send(
-                embed=_build_service_pending_embed("Hybrid Analysis", "\U0001F50D", "~5s", scan_id)
+                embed=_build_service_pending_embed("Hybrid Analysis", "\U0001F50D", api_timing.eta_str("Hybrid Analysis"), scan_id)
             )
 
         # Background task: run all API lookups, edit messages, recompute score if needed
@@ -6773,7 +6976,7 @@ async def run_scan(
                         if vt_msg:
                             try:
                                 await vt_msg.edit(embed=_build_service_pending_embed(
-                                    "VirusTotal", "\U0001F9EA", "uploading ~2-3min", scan_id))
+                                    "VirusTotal", "\U0001F9EA", f"uploading {api_timing.eta_str('VT Upload')}", scan_id))
                             except discord.HTTPException:
                                 pass
                         result = await vt_upload(primary_path, primary_sha256, http_session)
@@ -6794,9 +6997,11 @@ async def run_scan(
                     nonlocal vt_result
                     if "vt" not in api_tasks:
                         return
+                    t0 = time.time()
                     try:
                         vt_result = await api_tasks["vt"]
-                        log.info(f"[{scan_id}] VT result: status={vt_result.get('status') if vt_result else 'None'}")
+                        api_timing.record("VirusTotal", time.time() - t0)
+                        log.info(f"[{scan_id}] VT result: status={vt_result.get('status') if vt_result else 'None'} ({time.time() - t0:.1f}s)")
                     except Exception as exc:
                         log.warning(f"[{scan_id}] VirusTotal task failed: {exc}")
                         vt_result = {"detected": 0, "total": 0, "detections": {},
@@ -6811,8 +7016,10 @@ async def run_scan(
                             _track_poll_task(_poll_vt_completion(primary_sha256, vt_msg, scan_id))
                     # VT Sandbox (depends on VT completing)
                     if vt_result and vt_result.get("status") in ("found", "completed"):
+                        t1 = time.time()
                         try:
                             vt_sb = await vt_get_sandbox_links(primary_sha256, http_session)
+                            api_timing.record("VT Sandbox", time.time() - t1)
                         except Exception as exc:
                             log.debug(f"VT Sandbox task failed: {exc}")
                             vt_sb = None
@@ -6836,9 +7043,11 @@ async def run_scan(
                             except discord.HTTPException:
                                 pass
                         return
+                    t0 = time.time()
                     try:
                         mb_result = await api_tasks["mb"]
-                        log.info(f"[{scan_id}] MB result: status={mb_result.get('status') if mb_result else 'None'}")
+                        api_timing.record("MalwareBazaar", time.time() - t0)
+                        log.info(f"[{scan_id}] MB result: status={mb_result.get('status') if mb_result else 'None'} ({time.time() - t0:.1f}s)")
                     except Exception as exc:
                         log.warning(f"[{scan_id}] MalwareBazaar task failed: {exc}")
                         mb_result = {"status": "error", "permalink": f"https://bazaar.abuse.ch/sample/{primary_sha256}/"}
@@ -6854,9 +7063,11 @@ async def run_scan(
                     nonlocal ha_result
                     if "ha" not in api_tasks:
                         return
+                    t0 = time.time()
                     try:
                         ha_result = await api_tasks["ha"]
-                        log.info(f"[{scan_id}] HA result: status={ha_result.get('status') if ha_result else 'None'}")
+                        api_timing.record("Hybrid Analysis", time.time() - t0)
+                        log.info(f"[{scan_id}] HA result: status={ha_result.get('status') if ha_result else 'None'} ({time.time() - t0:.1f}s)")
                     except Exception as exc:
                         log.warning(f"[{scan_id}] Hybrid Analysis task failed: {exc}")
                         ha_result = None
@@ -6899,10 +7110,12 @@ async def run_scan(
                 )
                 if new_score != score:
                     log.info(f"[{scan_id}] Score updated: {score} -> {new_score} ({level} -> {new_level}) after API results")
-                    score, level, color = new_score, new_level, new_color
-                    # Update stats if detection status changed
+                    # Update stats if detection status changed (check BEFORE reassigning)
                     if new_score > DETECTION_THRESHOLD and score <= DETECTION_THRESHOLD:
                         await update_stats(detections=1, clean=-1)
+                    elif new_score <= DETECTION_THRESHOLD and score > DETECTION_THRESHOLD:
+                        await update_stats(detections=-1, clean=1)
+                    score, level, color = new_score, new_level, new_color
                     # Rebuild and re-send the main embed with updated score
                     updated_embeds = build_embeds(
                         filename=filename, file_size=file_size, hashes=hashes,
