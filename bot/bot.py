@@ -227,12 +227,6 @@ def run_setup():
 
     # ── Build config ──
     # Start from example if it exists, otherwise build from scratch
-    if example_path.exists():
-        with open(example_path, encoding="utf-8") as f:
-            config_text = f.read()
-    else:
-        config_text = ""
-
     # Build the config dict
     cfg = {
         "discord": {
@@ -956,13 +950,23 @@ async def analyze_urls(urls: list[str], session: aiohttp.ClientSession,
                             final_lower == cdn or final_lower.endswith("." + cdn)
                             for cdn in _CDN_DOMAINS
                         )
-                        if not is_cdn_redirect:
+                        # Also skip same-org redirects (e.g. xboxlive.com -> xbox.com,
+                        # microsoft.com -> live.com) where one domain contains the other's base
+                        _orig_base = orig_domain.lower().split(".")[-2] if orig_domain.count(".") >= 1 else orig_domain.lower()
+                        _final_base = final_domain.lower().split(".")[-2] if final_domain.count(".") >= 1 else final_domain.lower()
+                        is_same_org = (_orig_base in _final_base or _final_base in _orig_base
+                                       or _orig_base == _final_base)
+                        # Also check if final is just www. version of orig
+                        if not is_same_org:
+                            is_same_org = (final_domain.lower() == "www." + orig_domain.lower()
+                                           or orig_domain.lower() == "www." + final_domain.lower())
+                        if not is_cdn_redirect and not is_same_org:
                             result["flags"].append(f"cross_domain_redirect:{orig_domain}->{final_domain}")
-                            result["score"] += 5
+                            result["score"] += 4
 
                 ct = resp.content_type or ""
                 result["content_type"] = ct
-                content_length = resp.content_length or 0
+                content_length = resp.content_length
 
                 # Content-Disposition: attachment = file download
                 cd = resp.headers.get("Content-Disposition", "")
@@ -972,14 +976,14 @@ async def analyze_urls(urls: list[str], session: aiohttp.ClientSession,
                 is_binary = ct in _DOWNLOAD_CONTENT_TYPES
                 if is_binary:
                     result["flags"].append(f"serves_download:{ct}")
-                    result["score"] += 10
+                    result["score"] += 6
                 if is_download:
                     result["flags"].append("download_attachment")
                     result["score"] += 8
 
                 # If this URL serves a downloadable file, save it
                 # Require content_length > 0 to avoid streaming unknown-size responses into memory
-                if (is_binary or is_download) and drop_dir and (content_length is None or content_length == 0 or content_length < MAX_DOWNLOAD_SIZE):
+                if (is_binary or is_download) and drop_dir and content_length is not None and 0 < content_length < MAX_DOWNLOAD_SIZE:
                     # Extract filename from Content-Disposition or URL
                     dl_name = None
                     if cd:
@@ -1126,12 +1130,12 @@ async def analyze_urls(urls: list[str], session: aiohttp.ClientSession,
                             if re.search(r'\.(css|js|png|jpg|jpeg|gif|svg|woff|ttf|ico)(\?|$)', bu_lower):
                                 continue
                             # Only follow URLs that look like downloads or payloads
-                            if any(x in bu_lower for x in [
-                                ".exe", ".dll", ".bat", ".ps1",
-                                ".bin", ".scr", ".vbs",
-                                "payload", "drop", "webhook",
-                                "paste",
-                            ]):
+                            # Use regex for file extensions to avoid substring false positives
+                            # (e.g. ".bin" matching "binoclard.net")
+                            if (re.search(r'\.(exe|dll|bat|ps1|bin|scr|vbs|cmd|msi|jar)\b', bu_lower)
+                                or any(x in bu_lower for x in [
+                                    "payload", "drop", "webhook", "paste",
+                                ])):
                                 result["discovered_urls"].append(bu)
                                 result["flags"].append(f"suspicious_link:{bu[:60]}")
                                 result["score"] += 5
@@ -1162,7 +1166,10 @@ async def analyze_urls(urls: list[str], session: aiohttp.ClientSession,
             continue
         details.append(r)
         if r.get("flags"):
-            for flag in r["flags"]:
+            # Skip noise flags that are informational, not threats
+            _NOISE_FLAGS = {"private_ip_skipped"}
+            real_flags = [f for f in r["flags"] if f not in _NOISE_FLAGS]
+            for flag in real_flags:
                 findings.append(f"URL `{r['url'][:60]}`: {flag}")
             total_score += r.get("score", 0)
         if r.get("downloaded_path"):
@@ -2057,10 +2064,31 @@ MAGIC_SIGS = {
 
 SCRIPT_EXTS = {".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".hta", ".wsf"}
 
+# File types that are inherently benign — YARA/URL scores should be zeroed
+# because any pattern matches are coincidental in binary/media data.
+BENIGN_MEDIA_TYPES = {
+    "png", "jpeg", "gif", "bmp", "tiff", "webp", "ico", "svg", "psd",
+    "mp3", "mp4", "avi", "mkv", "flv", "ogg", "wav", "flac", "wmv",
+    "wma", "aac", "m4a", "mov", "webm",
+    "ttf", "otf", "woff", "woff2",
+}
+
+# Document/data types that are mostly benign — YARA/URL scores heavily reduced
+BENIGN_DOC_TYPES = {
+    "mht", "html", "rtf", "xml", "epub", "csv", "json", "yaml", "toml",
+    "sqlite", "pcap", "reg", "text",
+}
+
 
 def detect_file_type(filepath: str) -> str:
-    """Detect file type from magic bytes. Returns type string."""
+    """Detect file type from magic bytes and extension. Returns type string.
+
+    Recognizes 50+ file formats including executables, documents, archives,
+    media, fonts, and data files. This prevents false positives by correctly
+    identifying benign file types like images, audio, and web archives.
+    """
     iso_sig = b""
+    tar_sig = b""
     try:
         with open(filepath, "rb") as f:
             header = f.read(32)
@@ -2070,21 +2098,47 @@ def detect_file_type(filepath: str) -> str:
                 iso_sig = f.read(5)
             except Exception:
                 pass
+            # TAR has "ustar" at offset 257
+            try:
+                f.seek(257)
+                tar_sig = f.read(5)
+            except Exception:
+                pass
     except Exception:
         return "unknown"
 
+    if len(header) < 4:
+        return "unknown"
+
+    # ── Executables / dangerous formats ──
     if header[:2] == MAGIC_SIGS["pe"]:
         return "pe"
-    if header[:4] == MAGIC_SIGS["pdf"]:
-        return "pdf"
-    if header[:2] == MAGIC_SIGS["zip"]:
-        return "zip"
-    if header[:4] == MAGIC_SIGS["ole"]:
-        return "ole"
     if header[:4] == MAGIC_SIGS["lnk"]:
-        # verify LNK CLSID
         if len(header) >= 20 and header[4:20] == b'\x01\x14\x02\x00\x00\x00\x00\x00\xc0\x00\x00\x00\x00\x00\x00\x46':
             return "lnk"
+    if header[:4] == b"\x7fELF":
+        return "elf"
+    if header[:4] in (b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf",
+                       b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe"):
+        return "macho"
+    if header[:4] == b"\x00asm":
+        return "wasm"
+    if header[:3] in (b"FWS", b"CWS", b"ZWS"):
+        return "swf"
+    if header[:4] == b"dex\n":
+        return "dex"
+
+    # ── Documents ──
+    if header[:4] == MAGIC_SIGS["pdf"]:
+        return "pdf"
+    if header[:4] == MAGIC_SIGS["ole"]:
+        return "ole"
+    if header[:5] == b"{\\rtf":
+        return "rtf"
+
+    # ── Archives ──
+    if header[:2] == MAGIC_SIGS["zip"]:
+        return "zip"
     if header[:4] == MAGIC_SIGS["rar"]:
         return "rar"
     if header[:4] == MAGIC_SIGS["sevenzip"]:
@@ -2093,11 +2147,234 @@ def detect_file_type(filepath: str) -> str:
         return "cab"
     if iso_sig == b"CD001":
         return "iso"
+    if tar_sig == b"ustar":
+        return "tar"
+    if header[:2] == b"\x1f\x8b":
+        return "gzip"
+    if header[:3] == b"BZh":
+        return "bz2"
+    if header[:6] == b"\xfd7zXZ\x00":
+        return "xz"
+    if header[:4] == b"\x28\xb5\x2f\xfd":
+        return "zstd"
 
-    # check by extension for scripts (text files have no magic)
+    # ── Images ──
+    if header[:4] == b"\x89PNG":
+        return "png"
+    if header[:2] == b"\xff\xd8":
+        return "jpeg"
+    if header[:4] in (b"GIF8",):  # GIF87a, GIF89a
+        return "gif"
+    if header[:2] == b"BM":
+        return "bmp"
+    if header[:4] in (b"II\x2a\x00", b"MM\x00\x2a"):
+        return "tiff"
+    if header[:4] == b"RIFF" and len(header) >= 12 and header[8:12] == b"WEBP":
+        return "webp"
+    if header[:4] == b"\x00\x00\x01\x00":
+        return "ico"
+    if header[:4] == b"\x00\x00\x02\x00":
+        return "cur"
+    if header[:4] == b"8BPS":
+        return "psd"
+
+    # ── Audio / Video ──
+    if header[:4] == b"RIFF" and len(header) >= 12:
+        if header[8:12] == b"AVI ":
+            return "avi"
+        if header[8:12] == b"WAVE":
+            return "wav"
+    if header[:3] == b"ID3" or header[:2] == b"\xff\xfb" or header[:2] == b"\xff\xf3":
+        return "mp3"
+    if header[:4] == b"fLaC":
+        return "flac"
+    if header[:4] == b"OggS":
+        return "ogg"
+    if header[:4] == b"\x1a\x45\xdf\xa3":
+        return "mkv"  # Matroska/WebM
+    if header[:3] == b"FLV":
+        if len(header) >= 4 and header[3:4] == b"\x01":
+            return "flv"
+    if header[:4] == b"\x30\x26\xb2\x75":
+        return "wmv"  # ASF container (WMV/WMA)
+    # MP4/MOV — "ftyp" at offset 4
+    if len(header) >= 8 and header[4:8] == b"ftyp":
+        return "mp4"
+
+    # ── Fonts ──
+    if header[:4] == b"OTTO":
+        return "otf"
+    if header[:4] == b"\x00\x01\x00\x00" and len(header) >= 12:
+        # TrueType — magic is ambiguous, check extension or table count heuristic
+        ext_check = os.path.splitext(filepath)[1].lower()
+        if ext_check in (".ttf", ".tte", ""):
+            # Bytes 4-5 = number of tables (usually 9-25 for fonts)
+            num_tables = int.from_bytes(header[4:6], "big")
+            if 4 <= num_tables <= 40:
+                return "ttf"
+    if header[:4] == b"wOFF":
+        return "woff"
+    if header[:4] == b"wOF2":
+        return "woff2"
+
+    # ── Data formats ──
+    if header[:15] == b"SQLite format 3":
+        return "sqlite"
+    if header[:4] in (b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4",
+                       b"\x0a\x0d\x0d\x0a"):
+        return "pcap"
+
+    # ── Text-based formats (check by content patterns + extension) ──
+    # MHT/MHTML web archives
+    if header[:13] in (b"MIME-Version:", b"From: <Saved"):
+        return "mht"
     ext = os.path.splitext(filepath)[1].lower()
+    if ext in (".mht", ".mhtml") and header[:5] in (b"MIME-", b"From:", b"Date:"):
+        return "mht"
+
+    # HTML
+    if header[:5] == b"<!DOC" or header[:5] == b"<html" or header[:5] == b"<HTML":
+        return "html"
+    if ext in (".htm", ".html", ".xhtml"):
+        # Check for text content that looks like HTML
+        try:
+            hdr_text = header[:20].decode("utf-8", errors="ignore").strip().lower()
+            if hdr_text.startswith(("<!", "<html", "<head", "<?xml")):
+                return "html"
+        except Exception:
+            pass
+
+    # XML
+    if header[:5] == b"<?xml":
+        # Could be SVG, EPUB, or generic XML
+        if ext == ".svg":
+            return "svg"
+        if ext == ".epub":
+            return "epub"
+        return "xml"
+
+    # SVG (may not start with <?xml)
+    if ext == ".svg":
+        try:
+            hdr_text = header.decode("utf-8", errors="ignore").strip().lower()
+            if "<svg" in hdr_text or "xmlns" in hdr_text:
+                return "svg"
+        except Exception:
+            pass
+
+    # EPUB (ZIP-based but with specific mimetype)
+    # Already caught by "zip" detection above if it starts with PK
+
+    # Registry files
+    if ext == ".reg":
+        try:
+            hdr_text = header.decode("utf-8", errors="ignore")
+            if "Windows Registry Editor" in hdr_text or "REGEDIT" in hdr_text:
+                return "reg"
+        except Exception:
+            pass
+
+    # JSON
+    if ext == ".json":
+        try:
+            hdr_text = header.decode("utf-8", errors="ignore").strip()
+            if hdr_text and hdr_text[0] in "{[":
+                return "json"
+        except Exception:
+            pass
+
+    # YAML
+    if ext in (".yml", ".yaml"):
+        return "yaml"
+
+    # CSV / TSV
+    if ext in (".csv", ".tsv"):
+        return "csv"
+
+    # TOML
+    if ext == ".toml":
+        return "toml"
+
+    # Scripts (text files, no magic)
     if ext in SCRIPT_EXTS:
         return "script"
+
+    # Extension-only fallbacks for less common types
+    _ext_map = {
+        ".aac": "aac", ".m4a": "m4a", ".m4v": "mp4", ".mov": "mp4",
+        ".webm": "mkv", ".wma": "wmv", ".asf": "wmv",
+        ".dmg": "dmg", ".apk": "dex", ".appx": "zip", ".msix": "zip",
+        ".deb": "deb", ".rpm": "rpm",
+        ".class": "class", ".pyc": "pyc",
+        ".eml": "mht", ".msg": "ole",
+    }
+    if ext in _ext_map:
+        return _ext_map[ext]
+
+    # ── No-extension / unrecognized-extension content heuristics ──
+    # For files with no extension or unknown extension, attempt text-based
+    # detection by reading more content and looking for structural patterns.
+    try:
+        # Check if it's plausibly text (no null bytes in first 512 bytes)
+        with open(filepath, "rb") as f:
+            sample = f.read(512)
+        if b"\x00" not in sample:
+            try:
+                text = sample.decode("utf-8", errors="ignore").strip()
+                text_lower = text.lower()
+            except Exception:
+                text = ""
+                text_lower = ""
+
+            if text:
+                # HTML
+                if text_lower.startswith(("<!doctype html", "<html", "<head", "<!doctype ")):
+                    return "html"
+                # XML / SVG
+                if text_lower.startswith("<?xml"):
+                    if "<svg" in text_lower[:200]:
+                        return "svg"
+                    return "xml"
+                if text_lower.startswith("<svg"):
+                    return "svg"
+                # JSON
+                if text[0] in "{[":
+                    # Quick JSON validation — check for key patterns
+                    if ('"' in text[:50]) or text[0] == "[":
+                        return "json"
+                # YAML — starts with "---" or has "key: value" patterns
+                if text.startswith("---") or (": " in text[:100] and not text.startswith("{")):
+                    # Avoid misidentifying scripts as YAML
+                    if not any(text_lower.startswith(x) for x in ("#!/", "@echo", "rem ", "set ")):
+                        return "yaml"
+                # CSV — check for consistent delimiters
+                lines = text.split("\n", 5)[:5]
+                if len(lines) >= 2:
+                    # Count commas per line — if consistent, probably CSV
+                    comma_counts = [l.count(",") for l in lines if l.strip()]
+                    if (len(comma_counts) >= 2 and comma_counts[0] >= 2
+                            and all(c == comma_counts[0] for c in comma_counts)):
+                        return "csv"
+                # INI / config files
+                if text.startswith("[") and "]\n" in text[:100]:
+                    return "toml"  # close enough — INI/TOML are benign config
+                # MHT/email
+                if text_lower.startswith(("mime-version:", "from:", "date:", "return-path:")):
+                    return "mht"
+                # Shell scripts (no extension)
+                if text.startswith("#!/"):
+                    shebang = text.split("\n", 1)[0].lower()
+                    if any(x in shebang for x in ("bash", "sh", "zsh", "fish", "python", "perl", "ruby", "node")):
+                        return "script"
+                # Registry
+                if "windows registry editor" in text_lower[:50] or text.startswith("REGEDIT"):
+                    return "reg"
+                # Plain text fallback — if it's all printable text, treat as benign
+                printable_ratio = sum(1 for c in text[:200] if c.isprintable() or c in "\n\r\t") / max(len(text[:200]), 1)
+                if printable_ratio > 0.95 and len(text) > 10:
+                    return "text"
+    except Exception:
+        pass
 
     return "unknown"
 
@@ -2854,6 +3131,12 @@ def analyze_file_format(filepath: str) -> Optional[dict]:
         if office:
             return office
         return None  # regular zip/jar handled elsewhere
+    elif ftype in BENIGN_MEDIA_TYPES:
+        return {"type": "benign_media", "detected_format": ftype}
+    elif ftype in BENIGN_DOC_TYPES:
+        return {"type": "benign_doc", "detected_format": ftype}
+    elif ftype in ("elf", "macho", "wasm", "swf", "dex"):
+        return {"type": "executable", "detected_format": ftype}
     else:
         return None
 
@@ -3174,15 +3457,29 @@ HIGH_RISK_VARIANTS = {
 
 def _apply_url_eth_adj(score: int, url_analysis: Optional[dict],
                        eth_analysis: Optional[dict],
-                       all_iocs: Optional[dict]) -> tuple[int, str, int]:
+                       all_iocs: Optional[dict],
+                       breakdown: dict = None,
+                       format_analysis: Optional[dict] = None) -> tuple[int, str, int]:
     """Apply URL and ETH score adjustments and recalculate level/color.
 
     Returns (adjusted_score, level, color).
+    Updates breakdown dict in-place if provided.
     """
+    if breakdown is None:
+        breakdown = {}
     is_minecraft_mod = bool(all_iocs and all_iocs.get("modLoaders"))
+    _fa_type = (format_analysis or {}).get("type", "")
     if url_analysis:
         url_adj = url_analysis["score_adjust"]
-        if is_minecraft_mod:
+        # Benign media files (images/audio/video/fonts): URLs are embedded
+        # resources, not indicators of compromise — zero out.
+        if _fa_type == "benign_media":
+            url_adj = 0
+        # Benign documents (MHT/HTML/RTF/XML): URLs are web page links,
+        # not C2/exfil — reduce by 80%.
+        elif _fa_type == "benign_doc":
+            url_adj = url_adj // 5
+        elif is_minecraft_mod:
             _has_real_threats = bool(all_iocs and (
                 all_iocs.get("c2Base") or all_iocs.get("ethContract")
                 or all_iocs.get("exfilUrl") or all_iocs.get("stage2Url")
@@ -3190,9 +3487,14 @@ def _apply_url_eth_adj(score: int, url_analysis: Optional[dict],
             ))
             if not _has_real_threats:
                 url_adj = url_adj // 3
-        score += url_adj
+        if url_adj:
+            score += url_adj
+            breakdown["url_analysis"] = url_adj
     if eth_analysis:
-        score += eth_analysis["score_adjust"]
+        _eth_adj = eth_analysis["score_adjust"]
+        if _eth_adj:
+            score += _eth_adj
+            breakdown["eth_analysis"] = _eth_adj
     score = min(score, 100)
     if score <= DETECTION_THRESHOLD:
         level, color = "LOW", 0x2ECC71
@@ -3214,10 +3516,21 @@ def compute_risk_score(
     format_analysis: dict = None,
     mb_result: dict = None,
     ha_result: dict = None,
-) -> tuple[int, str, int]:
-    """Returns (score, level, color_int)."""
+) -> tuple[int, str, int, dict]:
+    """Returns (score, level, color_int, breakdown).
+
+    breakdown is a dict mapping category names to their point contributions,
+    useful for debugging and displaying score details.
+    """
     score = 0
+    breakdown = {}
     is_minecraft_mod = bool(iocs and iocs.get("modLoaders"))
+
+    # Detect benign file types — media/font/doc files should not score from
+    # coincidental YARA pattern matches or embedded URLs in their content.
+    _fa_type = (format_analysis or {}).get("type", "")
+    _is_benign_media = _fa_type == "benign_media"   # images, audio, video, fonts → zero YARA/URL
+    _is_benign_doc = _fa_type == "benign_doc"        # MHT, HTML, RTF, XML, etc. → reduce YARA/URL
 
     if iocs:
         variant = (iocs.get("variant") or "").lower()
@@ -3226,13 +3539,56 @@ def compute_risk_score(
 
         if variant in HIGH_RISK_VARIANTS:
             score += 40
+            breakdown["variant"] = 40
         elif variant and variant != "unknown":
             score += 25
+            breakdown["variant"] = 25
 
         if iocs.get("c2Base") or iocs.get("ethContract") or iocs.get("contracts"):
             score += 15
+            breakdown["c2/crypto"] = 15
         if iocs.get("exfilUrl") or iocs.get("stage2Url"):
-            score += 5
+            score += 4
+            breakdown["exfil/stage2"] = 4
+        # Markers that are expected/normal in Minecraft mods — don't count toward score
+        # These fire on legitimate Fabric/Forge mods that need session data for auth,
+        # JNDI for SRV resolution, ClassLoaders for protocol translation, etc.
+        # Defined early so threat-context check can exclude them for mods.
+        _MOD_EXPECTED_PATTERNS = [
+            "Fabric session accessor",   # Session tokens needed for protocol translation auth
+            "Fabric session get",         # Raw bytecode version of session accessor
+            "JNDI naming API",            # SRV record DNS resolution
+            "JNDI API reference",         # Same
+            "Directory context access",   # javax.naming.directory.DirContext for SRV
+            "DNS lookup API",             # SRV resolution
+            "Custom ClassLoader",         # Protocol translation, Mixin framework
+            "Reflection-based class loading",  # Mixin compat
+            "Reflection method invocation",    # Event bus systems (method.invoke)
+            "Reflection declared method",      # getDeclaredMethods for event scanning
+            "Reflection-based execution chain",  # Class.forName+getMethod+invoke in reflection libs
+            "Thread.sleep in suspicious context",  # Normal for async mod code
+            "Scheduled execution",         # ScheduledExecutorService for periodic tasks
+            "Timer-based delayed execution",   # java.util.Timer for scheduled work
+            "GitHub raw payload hosting",  # Mods hosting resources/configs on GitHub
+            "sun.misc.Unsafe",             # Reflection libs use Unsafe for field/memory access
+            "Unsafe memory access",        # Same — bytecode-level detection
+            "Unsafe class access",         # Same — sun/misc/Unsafe reference
+            "Dynamic class definition",    # Reflection libs define classes at runtime (Mixin, etc.)
+            "URL-based class loading",     # URLClassLoader in reflection/classloading libs
+            "URLClassLoader usage",        # Same — bytecode-level detection
+            "ClassLoader.defineClass",     # Runtime class definition for Mixin/protocol translation
+            "Java agent class",            # Instrumentation agents used by Mixin and reflection libs
+            "Java instrumentation API",    # java.lang.instrument for bytecode modification
+            "File.delete",                 # Mods managing temp/cache files
+            "Reflection method lookup",    # MethodHandle/dynamic dispatch in reflection libs
+            "Char array string construction",  # String building from char arrays — normal Java
+            "META-INF/services/",          # ServiceLoader SPI — standard Java service discovery
+            "ServiceLoader",               # Same — standard Java service loading
+            "Java deserialization",         # Minecraft networking uses Java serialization
+            "Deserialization readObject",   # readObject is standard for Minecraft packet handling
+            "BleedingPipe",                # BleedingPipe risk label — not actual BleedingPipe presence
+        ]
+
         # URL scoring: URLs alone are not suspicious — many legitimate mods/apps embed
         # URLs for APIs, resources, documentation, etc. Only score URLs when combined
         # with other threat signals (C2, exfil, webhooks, dangerous API calls).
@@ -3246,15 +3602,18 @@ def compute_risk_score(
         # For Minecraft mods, bytecode API refs are constant pool hits — they fire
         # when the class merely references Runtime/ProcessBuilder in its constant pool,
         # not necessarily calling them. Only count as threat context if the marker is
-        # NOT a bytecode ref (i.e., from decompiled source pattern matching).
+        # NOT a bytecode ref AND not a mod-expected pattern.
         if not has_threat_context:
             dangerous_api_markers = [m for m in markers if any(x in m for x in [
                 "Runtime.exec", "ProcessBuilder", "defineClass", "URLClassLoader",
             ])]
             if is_minecraft_mod:
-                # Only source-level (non-bytecode-ref) dangerous API calls count
-                source_level_dangerous = [m for m in dangerous_api_markers
-                                          if not m.startswith("Bytecode API ref:")]
+                # Only source-level dangerous API calls that aren't mod-expected count
+                source_level_dangerous = [
+                    m for m in dangerous_api_markers
+                    if not m.startswith("Bytecode API ref:")
+                    and not any(pat in m for pat in _MOD_EXPECTED_PATTERNS)
+                ]
                 if source_level_dangerous:
                     has_threat_context = True
             elif dangerous_api_markers:
@@ -3264,34 +3623,20 @@ def compute_risk_score(
         if extracted_strings:
             _total_url_count += len(extracted_strings.get("urls") or [])
         if _total_url_count > 3 and has_threat_context:
-            score += 10
+            _url_pts = min(3 + _total_url_count, 12)
+            score += _url_pts
+            breakdown["urls+threat"] = _url_pts
 
         webhook_keys = [k for k in iocs if "webhook" in k.lower() and iocs[k]]
         if webhook_keys:
-            score += 10
+            score += 12
+            breakdown["webhooks"] = 12
 
         high_risk_markers = [m for m in markers if "HIGH RISK" in m]
-        score += min(len(high_risk_markers) * 5, 15)
-
-        # Markers that are expected/normal in Minecraft mods — don't count toward score
-        # These fire on legitimate Fabric/Forge mods that need session data for auth,
-        # JNDI for SRV resolution, ClassLoaders for protocol translation, etc.
-        _MOD_EXPECTED_PATTERNS = [
-            "Fabric session accessor",   # Session tokens needed for protocol translation auth
-            "Fabric session get",         # Raw bytecode version of session accessor
-            "JNDI naming API",            # SRV record DNS resolution
-            "JNDI API reference",         # Same
-            "Directory context access",   # javax.naming.directory.DirContext for SRV
-            "DNS lookup API",             # SRV resolution
-            "Custom ClassLoader",         # Protocol translation, Mixin framework
-            "Reflection-based class loading",  # Mixin compat
-            "Reflection method invocation",    # Event bus systems (method.invoke)
-            "Reflection declared method",      # getDeclaredMethods for event scanning
-            "Thread.sleep in suspicious context",  # Normal for async mod code
-            "Scheduled execution",         # ScheduledExecutorService for periodic tasks
-            "Timer-based delayed execution",   # java.util.Timer for scheduled work
-            "GitHub raw payload hosting",  # Mods hosting resources/configs on GitHub
-        ]
+        _hrm_pts = min(len(high_risk_markers) * 4, 16)
+        if _hrm_pts:
+            score += _hrm_pts
+            breakdown["high_risk_markers"] = _hrm_pts
 
         # Filter out non-suspicious markers: skip URL markers and benign bytecode refs
         non_library_markers = [
@@ -3319,10 +3664,16 @@ def compute_risk_score(
                 if not any(pat in m for pat in _MOD_EXPECTED_PATTERNS)
                 and not (m.startswith("Bytecode API ref:") and any(x in m for x in [
                     "Runtime.exec", "ProcessBuilder", "System.load",
+                    "defineClass", "URLClassLoader",
                 ]))
             ]
 
-        score += min(len(non_library_markers), 8)
+        _marker_pts = min(len(non_library_markers), 8)
+        if _marker_pts:
+            score += _marker_pts
+            breakdown["behavioral"] = _marker_pts
+            log.info(f"[SCORE] Surviving markers ({len(non_library_markers)}): "
+                     + "; ".join(m[:80] for m in non_library_markers[:10]))
 
         # Persistence indicators (LOCALAPPDATA paths, scheduled tasks, Python droppers)
         persistence_markers = [m for m in markers if any(x in m for x in [
@@ -3330,43 +3681,82 @@ def compute_risk_score(
             "schtasks", "scheduled task", "RuntimeBroker",
         ])]
         if persistence_markers:
-            score += min(len(persistence_markers) * 5, 10)
+            _pers_pts = min(len(persistence_markers) * 4, 12)
+            score += _pers_pts
+            breakdown["persistence"] = _pers_pts
 
         # Decompilation failure indicates advanced obfuscation
         decompile_fail = [m for m in markers if "Decompilation failure:" in m]
         if decompile_fail:
-            score += 5
+            score += 6
+            breakdown["decompile_fail"] = 6
 
     # VirusTotal — require at least 10 engines to avoid partial result score inflation
     if vt and vt.get("total", 0) >= 10:
         vt_ratio = vt["detected"] / vt["total"]
-        score += min(int(vt_ratio * 40), 40)
+        _vt_pts = min(int(vt_ratio * 40), 40)
+        if _vt_pts:
+            score += _vt_pts
+            breakdown["virustotal"] = _vt_pts
 
     # MalwareBazaar — if found in database, it's known malware
     if mb_result and mb_result.get("status") == "found" and mb_result.get("signature"):
-        score += 20
+        score += 18
+        breakdown["malwarebazaar"] = 18
 
     # Hybrid Analysis
     if ha_result and ha_result.get("threat_score") is not None:
         ts = ha_result["threat_score"]
         if ts >= 80:
-            score += 15
+            score += 14
+            breakdown["hybrid_analysis"] = 14
         elif ts >= 50:
-            score += 8
+            score += 7
+            breakdown["hybrid_analysis"] = 7
 
-    # YARA
-    score += min(len(yara_matches) * 5, 15)
+    # YARA — skip or reduce for benign file types. Generic rules fire on all
+    # kinds of binary data (images, audio, etc.) and are completely meaningless.
+    if yara_matches:
+        if _is_benign_media:
+            # Images/audio/video/fonts: YARA matches are noise — skip entirely
+            _yara_pts = 0
+        elif _is_benign_doc:
+            # Web archives/HTML/RTF/XML: only count high-confidence threat rules
+            _doc_threat_kw = ["exploit", "cve_", "shellcode", "payload", "dropper",
+                              "phishing", "credential", "obfusc"]
+            serious_yara = [m for m in yara_matches if any(
+                x in (m.get("rule", "") + " " + m.get("namespace", "")).lower()
+                for x in _doc_threat_kw
+            )]
+            _yara_pts = min(len(serious_yara) * 4, 16)
+        elif is_minecraft_mod:
+            # For mods: only count rules specifically about Java/JAR threats
+            _java_threat_kw = ["fractureiser", "minecraft", "jar_", "java_rat",
+                               "skyrage", "vape", "weedhack", "adam_rat"]
+            serious_yara = [m for m in yara_matches if any(
+                x in (m.get("rule", "") + " " + m.get("namespace", "")).lower()
+                for x in _java_threat_kw
+            )]
+            _yara_pts = min(len(serious_yara) * 4, 16)
+        else:
+            _yara_pts = min(len(yara_matches) * 4, 16)
+        if _yara_pts:
+            score += _yara_pts
+            breakdown["yara"] = _yara_pts
 
     # obfuscators — low weight for generic, high weight for evasion techniques
     if obfuscators:
-        obf_str = " ".join(obfuscators)
         evasion_obfs = sum(1 for o in obfuscators if any(
             x in o for x in ["Trailing-slash", "qProtect", "HTML injection",
                               "Encrypted config", "META-INF marker"]))
+        _obf_pts = 0
         if evasion_obfs:
-            score += min(evasion_obfs * 10, 25)
+            _obf_pts += min(evasion_obfs * 8, 24)
         generic_obfs = len(obfuscators) - evasion_obfs
-        score += min(generic_obfs * 2, 6)
+        _obf_pts += min(generic_obfs * 2, 6)
+        if _obf_pts:
+            score += _obf_pts
+            breakdown["obfuscation"] = _obf_pts
 
     # entropy — moderate weight; obfuscated but legitimate code often has high entropy
     # Filter out embedded JARs/ZIPs from suspicious entries — compressed archives
@@ -3378,28 +3768,36 @@ def compute_risk_score(
                        for ext in (".jar", ".zip", ".gz", ".xz", ".lzma", ".so", ".dll",
                                    ".png", ".jpg", ".jpeg", ".gif", ".ogg", ".wav"))
         ]
+        _ent_pts = 0
         if real_suspicious:
-            score += min(len(real_suspicious) * 2, 6)
+            _ent_pts += min(len(real_suspicious) * 2, 6)
         if entropy.get("max_class_entropy", 0) > 7.5:
-            score += 3
+            _ent_pts += 3
+        if _ent_pts:
+            score += _ent_pts
+            breakdown["entropy"] = _ent_pts
 
     # raw string extraction
     has_webhooks = False
     if extracted_strings:
         if extracted_strings.get("discord_webhooks"):
-            score += 10
+            score += 12
             has_webhooks = True
+            breakdown["discord_webhooks"] = 12
         if extracted_strings.get("discord_tokens"):
-            score += 15
+            score += 14
+            breakdown["discord_tokens"] = 14
         if extracted_strings.get("eth_addresses"):
-            score += 5
+            score += 4
+            breakdown["eth_addresses"] = 4
 
     # Combo: webhook + launcher_accounts is almost always a stealer
     has_launcher_accounts = iocs and any(
         "launcher_accounts" in m for m in iocs.get("behavioralMarkers", [])
     )
     if has_webhooks and has_launcher_accounts:
-        score += 15
+        score += 14
+        breakdown["stealer_combo"] = 14
 
     # manifest — reduced weight for Mixin-related keys
     # Fabric/Forge mods using Mixin framework require Premain-Class, Can-Redefine-Classes,
@@ -3409,117 +3807,147 @@ def compute_risk_score(
         if is_minecraft_mod:
             non_mixin_keys = [k for k in manifest["suspicious_keys"]
                               if not any(k.startswith(p) for p in _MIXIN_MANIFEST_PREFIXES)]
-            score += min(len(non_mixin_keys) * 2, 8)
+            _man_pts = min(len(non_mixin_keys) * 2, 8)
         else:
-            score += min(len(manifest["suspicious_keys"]) * 2, 8)
+            _man_pts = min(len(manifest["suspicious_keys"]) * 2, 8)
+        if _man_pts:
+            score += _man_pts
+            breakdown["manifest"] = _man_pts
 
     # Multi-format analysis scoring
     if format_analysis:
         fa_type = format_analysis.get("type", "")
 
         if fa_type == "PE":
+            _pe_pts = 0
             si = format_analysis.get("suspicious_imports", {})
             if si.get("injection"):
-                score += 20
+                _pe_pts += 18
             if si.get("keylogging"):
-                score += 15
+                _pe_pts += 14
             if si.get("evasion"):
-                score += 10
+                _pe_pts += 8
             if si.get("network") and si.get("persistence"):
-                score += 10
+                _pe_pts += 9
 
             packers = format_analysis.get("packers", [])
             if packers:
-                # PyInstaller+PyArmor combo is near-certain malware
                 has_pyinstaller = "PyInstaller" in packers
                 has_pyarmor = "PyArmor" in packers
                 has_zipbomb = "Zipbomb-Dropper" in packers
                 if has_pyinstaller and has_pyarmor:
-                    score += 35  # encrypted Python = almost always a RAT/stealer
+                    _pe_pts += 33  # encrypted Python = almost always a RAT/stealer
                 elif has_pyinstaller:
-                    score += 15  # PyInstaller alone is suspicious but not definitive
+                    _pe_pts += 13  # PyInstaller alone is suspicious but not definitive
                 elif has_zipbomb:
-                    score += 40  # zipbomb dropper
+                    _pe_pts += 38  # zipbomb dropper
                 else:
-                    score += 10  # generic packer (UPX, etc)
+                    _pe_pts += 8  # generic packer (UPX, etc)
 
-            # Dangerous bundled module combos
             bundled = format_analysis.get("bundled_modules", [])
             if bundled:
                 mod_str = " ".join(bundled)
                 if "credential theft" in mod_str or "keylogger" in mod_str:
-                    score += 15
+                    _pe_pts += 14
                 if "webcam" in mod_str or "screenshot" in mod_str:
-                    score += 10
+                    _pe_pts += 9
                 if "C2" in mod_str:
-                    score += 10
+                    _pe_pts += 9
 
             warnings = format_analysis.get("warnings", [])
-            # Weight specific warnings higher
             stealer_warns = sum(1 for w in warnings if "Stealer toolkit" in w or "credential theft" in w)
-            score += min(stealer_warns * 10, 20)
+            _pe_pts += min(stealer_warns * 9, 18)
             other_warns = len(warnings) - stealer_warns
-            score += min(other_warns * 3, 15)
+            _pe_pts += min(other_warns * 3, 12)
+
+            if _pe_pts:
+                score += _pe_pts
+                breakdown["pe_analysis"] = _pe_pts
 
         elif fa_type == "PDF":
+            _pdf_pts = 0
             if format_analysis.get("js_found") and format_analysis.get("auto_action"):
-                score += 30
+                _pdf_pts += 28
             elif format_analysis.get("js_found"):
-                score += 15
+                _pdf_pts += 13
             critical = sum(1 for f in format_analysis.get("findings", []) if isinstance(f, dict) and f.get("severity") == "critical")
             high = sum(1 for f in format_analysis.get("findings", []) if isinstance(f, dict) and f.get("severity") == "high")
-            score += min(critical * 10 + high * 5, 25)
+            _pdf_pts += min(critical * 9 + high * 4, 22)
+            if _pdf_pts:
+                score += _pdf_pts
+                breakdown["pdf_analysis"] = _pdf_pts
 
         elif fa_type == "Office":
+            _off_pts = 0
             if format_analysis.get("has_macros"):
-                score += 10
+                _off_pts += 8
             if format_analysis.get("auto_triggers"):
-                score += 15
+                _off_pts += 14
             sk = format_analysis.get("suspicious_keywords", {})
             if sk.get("execution"):
-                score += 10
+                _off_pts += 9
             if sk.get("powershell"):
-                score += 15
+                _off_pts += 14
             if sk.get("download"):
-                score += 10
+                _off_pts += 9
             if format_analysis.get("dde_found"):
-                score += 15
-            score += min(len(format_analysis.get("warnings", [])) * 3, 10)
+                _off_pts += 14
+            _off_pts += min(len(format_analysis.get("warnings", [])) * 3, 9)
+            if _off_pts:
+                score += _off_pts
+                breakdown["office_analysis"] = _off_pts
 
         elif fa_type == "LNK":
+            _lnk_pts = 0
             if format_analysis.get("target_hints"):
-                score += 20
+                _lnk_pts += 18
             if format_analysis.get("arguments_found"):
-                score += 15
-            score += min(len(format_analysis.get("warnings", [])) * 5, 15)
+                _lnk_pts += 13
+            _lnk_pts += min(len(format_analysis.get("warnings", [])) * 4, 12)
+            if _lnk_pts:
+                score += _lnk_pts
+                breakdown["lnk_analysis"] = _lnk_pts
 
         elif fa_type == "Script":
+            _scr_pts = 0
             lolbins = format_analysis.get("lolbins", [])
-            score += min(len(lolbins) * 8, 25)
+            _scr_pts += min(len(lolbins) * 7, 21)
             sk = format_analysis.get("suspicious_keywords", {})
             if sk.get("download_exec"):
-                score += 10
+                _scr_pts += 9
             if sk.get("evasion"):
-                score += 10
+                _scr_pts += 9
             obf = format_analysis.get("obfuscation_score", 0)
-            score += min(obf, 20)
+            _scr_pts += min(obf, 18)
+            if _scr_pts:
+                score += _scr_pts
+                breakdown["script_analysis"] = _scr_pts
 
         elif fa_type == "MSI":
+            _msi_pts = 0
             if format_analysis.get("embedded_executables"):
-                score += 20
+                _msi_pts += 18
             if format_analysis.get("has_custom_actions"):
-                score += 5
-            score += min(len(format_analysis.get("warnings", [])) * 5, 15)
+                _msi_pts += 4
+            _msi_pts += min(len(format_analysis.get("warnings", [])) * 4, 12)
+            if _msi_pts:
+                score += _msi_pts
+                breakdown["msi_analysis"] = _msi_pts
 
         elif fa_type == "ISO":
+            _iso_pts = 0
             if format_analysis.get("suspicious_files"):
-                score += 15
-            score += min(len(format_analysis.get("warnings", [])) * 5, 15)
+                _iso_pts += 13
+            _iso_pts += min(len(format_analysis.get("warnings", [])) * 4, 12)
+            if _iso_pts:
+                score += _iso_pts
+                breakdown["iso_analysis"] = _iso_pts
 
     # Minimum score floor for known high-risk variants
     if iocs:
         variant = (iocs.get("variant") or "").lower()
         if variant in HIGH_RISK_VARIANTS and score < 61:
+            breakdown["variant_floor"] = 61 - score
             score = 61
 
     score = min(score, 100)
@@ -3557,14 +3985,15 @@ def compute_risk_score(
             _parts.append(f"manifest={len(manifest['suspicious_keys'])}keys")
         if format_analysis:
             _parts.append(f"format={format_analysis.get('type','?')}")
+        _parts.append(f"breakdown={breakdown}")
         log.info(f"[SCORE] base={score}: {', '.join(_parts)}")
 
     if score <= DETECTION_THRESHOLD:
-        return score, "LOW", 0x2ECC71
+        return score, "LOW", 0x2ECC71, breakdown
     elif score <= 60:
-        return score, "MEDIUM", 0xF39C12
+        return score, "MEDIUM", 0xF39C12, breakdown
     else:
-        return score, "HIGH", 0xE74C3C
+        return score, "HIGH", 0xE74C3C, breakdown
 
 
 # ─── Embed Builder ───────────────────────────────────────────────────────────
@@ -3809,6 +4238,7 @@ def build_embeds(
     approved_exception: bool = False,
     url_analysis: dict = None,
     eth_analysis: dict = None,
+    score_breakdown: dict = None,
 ) -> list[discord.Embed]:
     embeds = []
     emoji = LEVEL_EMOJI.get(level, "")
@@ -3866,9 +4296,18 @@ def build_embeds(
         risk_hint = "Multiple suspicious indicators found \u2014 exercise caution and review the flagged behaviors before running"
     else:
         risk_hint = "Strong malware indicators \u2014 do not run this file"
+    # Build breakdown string for score transparency
+    _bd_str = ""
+    if score_breakdown:
+        _bd_parts = [f"{k}: +{v}" for k, v in sorted(score_breakdown.items(), key=lambda x: -x[1]) if v > 0]
+        if _bd_parts:
+            _bd_str = "\n" + ", ".join(_bd_parts[:6])
+            if len(_bd_parts) > 6:
+                _bd_str += f" (+{len(_bd_parts) - 6} more)"
+
     e.add_field(
         name="Risk Score",
-        value=f"**{score}/100** ({level})\n`{bar}`\n{risk_hint}",
+        value=f"**{score}/100** ({level})\n`{bar}`\n{risk_hint}{_bd_str}",
         inline=True,
     )
 
@@ -4086,14 +4525,27 @@ def build_embeds(
 
     # URL content analysis results
     if url_analysis and url_analysis.get("findings"):
-        url_a_lines = []
-        for f in url_analysis["findings"][:10]:
-            url_a_lines.append(f"\u2022 {f}")
-        e.add_field(
-            name="\U0001F50D URL Analysis",
-            value=_trunc("\n".join(url_a_lines)),
-            inline=False,
-        )
+        # Filter out low-value noise findings that confuse users
+        _NOISE_FINDING_PATTERNS = [
+            "private_ip_skipped",       # localhost is informational, not a threat
+            "serves_download:application/octet-stream",  # generic binary CT, very common for APIs
+        ]
+        _is_mod_ctx = bool(iocs and iocs.get("modLoaders"))
+        display_findings = []
+        for f in url_analysis["findings"]:
+            if any(noise in f for noise in _NOISE_FINDING_PATTERNS):
+                continue
+            # For mods, also skip cross_domain_redirect and serves_download — expected
+            if _is_mod_ctx and any(x in f for x in ["cross_domain_redirect:", "serves_download:"]):
+                continue
+            display_findings.append(f)
+        if display_findings:
+            url_a_lines = [f"\u2022 {f}" for f in display_findings[:10]]
+            e.add_field(
+                name="\U0001F50D URL Analysis",
+                value=_trunc("\n".join(url_a_lines)),
+                inline=False,
+            )
     elif url_analysis and not url_analysis.get("findings"):
         # All URLs checked out clean — show that
         checked = len(url_analysis.get("details", []))
@@ -4106,11 +4558,49 @@ def build_embeds(
 
     # behavioral markers — split into threats vs informational
     marker_details = {}
+    _is_mod = bool(iocs and iocs.get("modLoaders"))
     if iocs:
         marker_details = iocs.get("markerDetails", {})
         markers = iocs.get("behavioralMarkers", [])
         important = [m for m in markers if not m.startswith("Bytecode API ref:")]
         high_risk = [m for m in important if "HIGH RISK" in m]
+
+        # For mods, rewrite scary labels to be accurate and not alarming
+        # These are legitimate operations that the JarAnalyzer flags with worst-case descriptions
+        _MOD_LABEL_REWRITES = {
+            "DNS lookup API (potential DNS tunneling C2)": "DNS lookup API (SRV record resolution)",
+            "JNDI naming API (potential JNDI injection)": "JNDI naming API (directory/DNS lookups)",
+            "Directory context access (potential DNS/LDAP exploitation)": "Directory context access (SRV resolution)",
+            "Custom ClassLoader subclass detected (potential code injection)": "Custom ClassLoader (mod/protocol loading)",
+            "Reflection-based class loading (potential dynamic payload execution)": "Reflection-based class loading (mod compatibility)",
+            "Reflection method invocation (potential dynamic payload execution)": "Reflection method invocation (event system)",
+            "Reflection declared method access (bypasses access checks)": "Reflection declared method access (event scanning)",
+            "Dynamic class definition (potential runtime code injection)": "Dynamic class definition (Mixin framework)",
+            "URL-based class loading (potential remote code execution)": "URL-based class loading (classloader utility)",
+            "sun.misc.Unsafe access (potential memory manipulation or class injection)": "sun.misc.Unsafe access (reflection utility)",
+            "Java agent class (runtime instrumentation capability)": "Java agent class (Mixin/instrumentation)",
+            "Java instrumentation API (bytecode modification capability)": "Java instrumentation API (Mixin framework)",
+            "Scheduled execution (potential delayed payload activation)": "Scheduled execution (periodic tasks)",
+            "Thread.sleep in suspicious context (delayed execution with": None,  # prefix match handled below
+            "META-INF/services/ entries found (potential ServiceLoader exploitation)": "META-INF/services/ entries (Java service discovery)",
+            "Java deserialization (BleedingPipe risk)": "Java deserialization (Minecraft networking)",
+            "Deserialization readObject (RCE risk when networked)": "Deserialization readObject (packet handling)",
+            "Reflection method lookup (potential dynamic dispatch)": "Reflection method lookup (mod internals)",
+        }
+        if _is_mod:
+            rewritten = []
+            for m in important:
+                rewrite = _MOD_LABEL_REWRITES.get(m)
+                if rewrite is not None:
+                    rewritten.append(rewrite)
+                elif m.startswith("Thread.sleep in suspicious context"):
+                    rewritten.append("Thread.sleep (async timing)")
+                elif m.startswith("Fabric session accessor") and "(token theft)" in m:
+                    rewritten.append(m.replace("(token theft)", "(auth/session management)"))
+                else:
+                    rewritten.append(m)
+            important = rewritten
+
         # Markers with " — " contain our detailed descriptions
         threats = high_risk[:]
         info_markers = []
@@ -6307,6 +6797,8 @@ async def giverat_command(
                         break
 
             update_task = asyncio.create_task(_update_queue_msg())
+            _background_poll_tasks.add(update_task)
+            update_task.add_done_callback(_background_poll_tasks.discard)
         else:
             update_task = None
             _qm = None
@@ -6678,7 +7170,10 @@ def _start_scraper(channel=None):
             ]
             if overall_rate > 0:
                 lines.append(f"Rate: **{overall_rate:.0f} mods/hr** avg")
-            q_size = _scrape_queue.qsize() if _scrape_queue else 0
+            try:
+                q_size = _scrape_queue.qsize()
+            except NameError:
+                q_size = 0
             lines.append(f"Queued: {q_size} | Downloaded: {s['downloaded']} | Scanned: {s['scanned']} | Errors: {s['errors']}")
             return "\n".join(lines)
 
@@ -7183,7 +7678,7 @@ async def run_scan(
                     unique_yara.append(m)
             yara_matches = unique_yara
 
-            score, level, color = compute_risk_score(
+            score, level, color, _bd = compute_risk_score(
                 None, vt_result, yara_matches, [], None, None, None,
                 mb_result=mb_result, ha_result=ha_result,
             )
@@ -7512,9 +8007,14 @@ async def run_scan(
                     format_analysis["findings"].append(f"--- Extracted: `{ef_name}` ({ef_fmt.get('type', 'unknown')}) ---")
                     format_analysis["findings"].extend(ef_fmt["findings"])
                     # Merge sub-fields
-                    for subkey in ("suspicious_imports", "suspicious_sections", "suspicious_files"):
+                    for subkey in ("suspicious_sections", "suspicious_files"):
                         if ef_fmt.get(subkey):
                             format_analysis.setdefault(subkey, []).extend(ef_fmt[subkey])
+                    # suspicious_imports is a dict {category: [names]}, merge differently
+                    if ef_fmt.get("suspicious_imports"):
+                        existing = format_analysis.setdefault("suspicious_imports", {})
+                        for cat, names in ef_fmt["suspicious_imports"].items():
+                            existing.setdefault(cat, []).extend(names)
 
         # ── YARA (original + all extracted files; fast mode: main file only) ──
         stage_details["Local Analysis"] = "Running YARA rules..."
@@ -7650,14 +8150,14 @@ async def run_scan(
         await update_progress(stages, filename, file_size, hashes, force=True)
 
         # ── LOCAL-ONLY risk score (no VT/MB/HA yet) ──
-        score, level, color = compute_risk_score(
+        score, level, color, score_breakdown = compute_risk_score(
             all_iocs, None, yara_matches, obfuscators,
             entropy, extracted_strings, manifest, format_analysis,
             mb_result=None, ha_result=None,
         )
         # Apply URL and ETH analysis score adjustments
         _base_score = score
-        score, level, color = _apply_url_eth_adj(score, url_analysis, eth_analysis, all_iocs)
+        score, level, color = _apply_url_eth_adj(score, url_analysis, eth_analysis, all_iocs, score_breakdown, format_analysis)
         log.debug(f"[{scan_id}] SCORE TRACE: base={_base_score}, "
                   f"url_adj={url_analysis['score_adjust'] if url_analysis else 0}, "
                   f"eth_adj={eth_analysis['score_adjust'] if eth_analysis else 0}, "
@@ -7770,12 +8270,20 @@ async def run_scan(
             approved_exception=is_approved_exception,
             url_analysis=url_analysis,
             eth_analysis=eth_analysis,
+            score_breakdown=score_breakdown,
         )
 
         if not is_zip and not format_analysis:
             embeds[0].add_field(
                 name="\u2139\uFE0F Note",
-                value="Unknown file type. VT, YARA, and string extraction results only.",
+                value="Unrecognized file format — analysis limited to VT, YARA, and string extraction.",
+                inline=False,
+            )
+        elif format_analysis and format_analysis.get("type") in ("benign_media", "benign_doc"):
+            _det_fmt = format_analysis.get("detected_format", "unknown").upper()
+            embeds[0].add_field(
+                name="\u2139\uFE0F Detected Format",
+                value=f"`{_det_fmt}` — recognized as a standard {format_analysis['type'].replace('benign_', '')} file.",
                 inline=False,
             )
 
@@ -8073,14 +8581,14 @@ async def run_scan(
                                 pass
 
                 # Recompute score with API data and update main embed if score changed
-                new_score, new_level, new_color = compute_risk_score(
+                new_score, new_level, new_color, score_breakdown = compute_risk_score(
                     all_iocs, vt_result, yara_matches, obfuscators,
                     entropy, extracted_strings, manifest, format_analysis,
                     mb_result=mb_result, ha_result=ha_result,
                 )
                 # Re-apply URL and ETH adjustments (shared helper)
                 new_score, new_level, new_color = _apply_url_eth_adj(
-                    new_score, url_analysis, eth_analysis, all_iocs)
+                    new_score, url_analysis, eth_analysis, all_iocs, score_breakdown, format_analysis)
                 if new_score != score:
                     log.info(f"[{scan_id}] Score updated: {score} -> {new_score} ({level} -> {new_level}) after API results")
                     # Update stats if detection status changed (check BEFORE reassigning)
@@ -8102,6 +8610,7 @@ async def run_scan(
                         deobfuscation=deobfuscation, mb_result=mb_result,
                         approved_exception=is_approved_exception,
                         url_analysis=url_analysis, eth_analysis=eth_analysis,
+                        score_breakdown=score_breakdown,
                     )
                     if scan_msg:
                         try:
@@ -8460,8 +8969,11 @@ if __name__ == "__main__":
 
         log.warning("Bot disconnected — restarting in 10 seconds...")
         print("Bot disconnected — restarting in 10s...")
+        # Cancel orphaned background poll tasks from previous loop iteration
+        for task in list(_background_poll_tasks):
+            task.cancel()
+        _background_poll_tasks.clear()
         # Reset lazy-initialized asyncio locks — they're bound to the old event loop
-        global _stats_lock, _catalog_lock, _sha256_locks_guard, _exceptions_md_lock, _vt_rate_lock, scan_queue, _ready_fired
         _stats_lock = None
         _catalog_lock = None
         _sha256_locks_guard = None
