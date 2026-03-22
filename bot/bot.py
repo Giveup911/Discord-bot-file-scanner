@@ -16,6 +16,7 @@ import ipaddress
 import json
 import logging
 import logging.handlers
+from logging.handlers import RotatingFileHandler
 import math
 import os
 import re
@@ -29,10 +30,13 @@ from concurrent.futures import ThreadPoolExecutor
 import uuid
 import tarfile
 import zipfile
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+import contextlib
+import io
+import socket
 from urllib.parse import urlparse
 
 import yaml
@@ -52,8 +56,6 @@ except ImportError:
     GENERIC_DEOBFUSCATOR_AVAILABLE = False
 
 # ─── Logging ────────────────────────────────────────────────────────────────
-
-from logging.handlers import RotatingFileHandler
 
 _log_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 _log_dir = Path(__file__).resolve().parent / "logs"
@@ -340,8 +342,6 @@ def sanitize_path(text: str) -> str:
         result = re.sub(re.escape(p), "[redacted]", result, flags=re.IGNORECASE)
     # catch any remaining Windows-style user paths: C:\Users\<name>\...
     result = re.sub(r'[A-Za-z]:\\Users\\[^\\"\s]+', "[redacted]", result, flags=re.IGNORECASE)
-    # catch AppData temp paths
-    result = re.sub(r'[A-Za-z]:\\Users\\[^\\]+\\AppData\\[^\\]*\\Temp\\[^\s"]*', "[redacted]", result, flags=re.IGNORECASE)
     # catch Unix home paths
     result = re.sub(r'/home/[^/"\s]+', "[redacted]", result)
     # catch temp paths with scan prefixes
@@ -396,20 +396,28 @@ def save_stats(stats: dict):
 
 
 scan_stats = load_stats()
-_stats_lock = asyncio.Lock()
+_stats_lock = None
+
+
+def _get_stats_lock():
+    global _stats_lock
+    if _stats_lock is None:
+        _stats_lock = asyncio.Lock()
+    return _stats_lock
 
 
 async def update_stats(**increments):
     """Thread-safe stat update. Usage: await update_stats(total_scans=1, detections=1)"""
-    async with _stats_lock:
+    async with _get_stats_lock():
         for key, delta in increments.items():
             scan_stats[key] = scan_stats.get(key, 0) + delta
-        save_stats(scan_stats)
+        _stats_snapshot = dict(scan_stats)
+    await run_in_scan_thread(save_stats, _stats_snapshot)
 
 
 # ─── Alert System ──────────────────────────────────────────────────────────
 
-_hourly_requests: list[float] = []  # timestamps of scan requests in last hour
+_hourly_requests: deque[float] = deque()  # timestamps of scan requests in last hour
 _alert_cooldowns: dict[str, float] = {}  # alert_type -> last_sent_time (prevent spam)
 ALERT_COOLDOWN_SECONDS = 600  # don't repeat same alert within 10 minutes
 
@@ -458,10 +466,10 @@ def _get_storage_usage_bytes() -> int:
 
         for sub in scanned_dir.iterdir():
             if sub.is_dir() and str(sub.resolve()) in discord_paths:
-                for entry in sub.rglob("*"):
+                for file_entry in sub.rglob("*"):
                     try:
-                        if entry.is_file():
-                            total += entry.stat().st_size
+                        if file_entry.is_file():
+                            total += file_entry.stat().st_size
                     except OSError:
                         pass
     return total
@@ -473,7 +481,7 @@ def _track_hourly_request():
     _hourly_requests.append(now)
     cutoff = now - 3600
     while _hourly_requests and _hourly_requests[0] < cutoff:
-        _hourly_requests.pop(0)
+        _hourly_requests.popleft()
 
 
 def _hourly_request_count() -> int:
@@ -481,7 +489,7 @@ def _hourly_request_count() -> int:
     now = time.time()
     cutoff = now - 3600
     while _hourly_requests and _hourly_requests[0] < cutoff:
-        _hourly_requests.pop(0)
+        _hourly_requests.popleft()
     return len(_hourly_requests)
 
 
@@ -537,14 +545,28 @@ def save_catalog(catalog: dict):
 
 
 file_catalog = load_catalog()
-_catalog_lock = asyncio.Lock()
+_catalog_lock = None
 _sha256_locks: dict[str, asyncio.Lock] = {}
-_sha256_locks_guard = asyncio.Lock()
+_sha256_locks_guard = None
+
+
+def _get_catalog_lock():
+    global _catalog_lock
+    if _catalog_lock is None:
+        _catalog_lock = asyncio.Lock()
+    return _catalog_lock
+
+
+def _get_sha256_locks_guard():
+    global _sha256_locks_guard
+    if _sha256_locks_guard is None:
+        _sha256_locks_guard = asyncio.Lock()
+    return _sha256_locks_guard
 
 
 async def _get_sha256_lock(sha256: str) -> asyncio.Lock:
     """Get or create a per-SHA256 lock for archive+catalog atomicity."""
-    async with _sha256_locks_guard:
+    async with _get_sha256_locks_guard():
         if sha256 not in _sha256_locks:
             _sha256_locks[sha256] = asyncio.Lock()
         lock = _sha256_locks[sha256]
@@ -559,13 +581,14 @@ async def _get_sha256_lock(sha256: str) -> asyncio.Lock:
 
 
 async def catalog_update(sha256: str, entry: dict):
-    async with _catalog_lock:
+    async with _get_catalog_lock():
         file_catalog[sha256] = entry
-        save_catalog(file_catalog)
+        _catalog_snapshot = copy.deepcopy(file_catalog)
+    await run_in_scan_thread(save_catalog, _catalog_snapshot)
 
 
 async def catalog_lookup(sha256: str) -> Optional[dict]:
-    async with _catalog_lock:
+    async with _get_catalog_lock():
         return file_catalog.get(sha256)
 
 # ─── Exception List ──────────────────────────────────────────────────────────
@@ -585,6 +608,14 @@ def load_exceptions() -> set:
     return hashes
 
 approved_exceptions = load_exceptions()
+_exceptions_md_lock = None
+
+
+def _get_exceptions_md_lock():
+    global _exceptions_md_lock
+    if _exceptions_md_lock is None:
+        _exceptions_md_lock = asyncio.Lock()
+    return _exceptions_md_lock
 
 async def check_exception(sha256: str) -> bool:
     """Check if a file hash is in the approved exceptions list."""
@@ -624,22 +655,23 @@ async def write_exception_candidate(filename: str, sha256: str, file_size: int,
     entry += f"- **Recommendation:** {recommendation}\n"
     entry += f"\nTo approve, add this line to `exceptions.var`:\n```\n{sha256}  # {filename}\n```\n---\n"
 
-    # Append to exceptions.md
-    try:
-        header = "# Exception Candidates\n\nFiles listed here were auto-researched by the scanner. Review and add approved hashes to `exceptions.var`.\n\n---\n"
-        if EXCEPTIONS_MD.exists():
-            existing = EXCEPTIONS_MD.read_text(encoding="utf-8")
-        else:
-            existing = header
+    # Append to exceptions.md (locked to prevent TOCTOU race)
+    async with _get_exceptions_md_lock():
+        try:
+            header = "# Exception Candidates\n\nFiles listed here were auto-researched by the scanner. Review and add approved hashes to `exceptions.var`.\n\n---\n"
+            if EXCEPTIONS_MD.exists():
+                existing = EXCEPTIONS_MD.read_text(encoding="utf-8")
+            else:
+                existing = header
 
-        # Don't duplicate entries for the same hash
-        if sha256 in existing:
-            return
+            # Don't duplicate entries for the same hash
+            if sha256 in existing:
+                return
 
-        EXCEPTIONS_MD.write_text(existing + entry, encoding="utf-8")
-        log.info(f"Exception candidate written for {filename} ({sha256[:16]}...)")
-    except Exception as e:
-        log.warning(f"Failed to write exception candidate: {e}")
+            EXCEPTIONS_MD.write_text(existing + entry, encoding="utf-8")
+            log.info(f"Exception candidate written for {filename} ({sha256[:16]}...)")
+        except Exception as e:
+            log.warning(f"Failed to write exception candidate: {e}")
 
 
 async def auto_research_urls(urls: list, sha256: str, session: aiohttp.ClientSession) -> list:
@@ -654,14 +686,28 @@ async def auto_research_urls(urls: list, sha256: str, session: aiohttp.ClientSes
 
     candidate_urls = []
     for u in urls:
-        if any(d in u for d in research_domains):
-            candidate_urls.append(u)
+        try:
+            _parsed_u = urlparse(u)
+            _host = (_parsed_u.hostname or "").lower()
+            if any(_host == d or _host.endswith("." + d) for d in research_domains):
+                candidate_urls.append(u)
+        except Exception:
+            pass
 
     if not candidate_urls:
         return results
 
     for url in candidate_urls[:3]:  # Max 3 URLs to check
         try:
+            # SSRF protection: resolve hostname and check against private/reserved IPs
+            _res_parsed = urlparse(url)
+            _res_host = (_res_parsed.hostname or "").lower()
+            if _is_private_ip(_res_host):
+                continue
+            dns_block = await _resolve_and_check(_res_host)
+            if dns_block:
+                log.debug(f"Auto-research DNS blocked for {url}: {dns_block}")
+                continue
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10),
                                    allow_redirects=True) as resp:
                 if resp.status != 200:
@@ -755,7 +801,6 @@ def run_yara(filepath: str, timeout: int = 120, max_size_mb: float = 0) -> list[
             pass
     try:
         # Suppress stdout from YARA console module (some rules use console.log/console.hex)
-        import io, contextlib
         with contextlib.redirect_stdout(io.StringIO()):
             matches = YARA_RULES.match(filepath, timeout=timeout)
         return [{"rule": m.rule, "tags": m.tags, "meta": m.meta} for m in matches]
@@ -765,9 +810,6 @@ def run_yara(filepath: str, timeout: int = 120, max_size_mb: float = 0) -> list[
 
 
 # ─── URL Content Analyzer ────────────────────────────────────────────────────
-
-import ipaddress
-import urllib.parse as _urlparse
 
 # Patterns in response body that indicate suspicious content
 # NOTE: These are checked against page text. Avoid patterns that match normal websites
@@ -852,7 +894,7 @@ async def analyze_urls(urls: list[str], session: aiohttp.ClientSession,
             "downloaded_path": None, "discovered_urls": [],
         }
         try:
-            parsed = _urlparse.urlparse(url)
+            parsed = urlparse(url)
             hostname = parsed.hostname or ""
 
             # SSRF protection: skip private/internal/localhost IPs — score 0, not suspicious
@@ -862,6 +904,13 @@ async def analyze_urls(urls: list[str], session: aiohttp.ClientSession,
 
             # Skip non-HTTP URLs
             if parsed.scheme not in ("http", "https"):
+                return result
+
+            # Resolve hostname and check all IPs against private/reserved ranges
+            # Prevents SSRF via hostnames that resolve to internal IPs
+            dns_block = await _resolve_and_check(hostname)
+            if dns_block:
+                result["flags"].append("private_ip_skipped")
                 return result
 
             # URL points to raw IP (not a domain) — mildly suspicious
@@ -878,6 +927,13 @@ async def analyze_urls(urls: list[str], session: aiohttp.ClientSession,
                                    headers={"User-Agent": "Mozilla/5.0"}) as resp:
                 result["status"] = resp.status
 
+                # SSRF protection: check final URL after redirects against private IPs
+                _final_host = resp.url.host or ""
+                if _is_private_ip(_final_host):
+                    result["flags"].append("redirect_to_private_ip")
+                    result["score"] = 0
+                    return result
+
                 # Track redirect chain
                 if resp.history:
                     result["redirects"] = [str(r.url) for r in resp.history]
@@ -890,7 +946,11 @@ async def analyze_urls(urls: list[str], session: aiohttp.ClientSession,
                                         "akamaiedge.net", "akamaized.net",
                                         "fastly.net", "cdn.cloudflare.com",
                                         "azureedge.net", "cloudflare-dns.com",
-                                        "awsglobalaccelerator.com"}
+                                        "awsglobalaccelerator.com",
+                                        "stackpathdns.com", "b-cdn.net",
+                                        "azurefd.net", "edgesuite.net",
+                                        "edgekey.net", "googleusercontent.com",
+                                        "r2.cloudflarestorage.com"}
                         final_lower = final_domain.lower()
                         is_cdn_redirect = any(
                             final_lower == cdn or final_lower.endswith("." + cdn)
@@ -918,7 +978,8 @@ async def analyze_urls(urls: list[str], session: aiohttp.ClientSession,
                     result["score"] += 8
 
                 # If this URL serves a downloadable file, save it
-                if (is_binary or is_download) and drop_dir and content_length < MAX_DOWNLOAD_SIZE:
+                # Require content_length > 0 to avoid streaming unknown-size responses into memory
+                if (is_binary or is_download) and drop_dir and (content_length is None or content_length == 0 or content_length < MAX_DOWNLOAD_SIZE):
                     # Extract filename from Content-Disposition or URL
                     dl_name = None
                     if cd:
@@ -926,8 +987,11 @@ async def analyze_urls(urls: list[str], session: aiohttp.ClientSession,
                         if fn_match:
                             dl_name = fn_match.group(1).strip()
                     if not dl_name:
-                        dl_name = Path(_urlparse.urlparse(str(resp.url)).path).name or "downloaded_file"
+                        dl_name = Path(urlparse(str(resp.url)).path).name or "downloaded_file"
                     dl_name = re.sub(r'[^\w.\-]', '_', dl_name)[:80]
+                    dl_name = dl_name.lstrip('.')
+                    if not dl_name:
+                        dl_name = "downloaded_file"
                     dl_path_url = drop_dir / dl_name
 
                     body_bytes = b""
@@ -988,8 +1052,10 @@ async def analyze_urls(urls: list[str], session: aiohttp.ClientSession,
                                          or resp.headers.get("server", "").lower() == "cloudflare")
                         # Non-HTML with < 200 chars OR HTML with < 100 chars visible = raw content
                         # But skip Cloudflare protection pages
+                        is_json_ct = ct and ("json" in ct)
                         is_raw = (
                             not is_cloudflare
+                            and not is_json_ct  # JSON APIs are intentionally small
                             and ((not is_html and len(visible_text) < 200)
                                  or (is_html and len(visible_text) < 100))
                         )
@@ -1014,10 +1080,10 @@ async def analyze_urls(urls: list[str], session: aiohttp.ClientSession,
 
                         # Check if body is a redirect page pointing to another URL
                         meta_refresh = re.search(
-                            r'<meta[^>]*http-equiv=["\']?refresh[^>]*url=(["\']?)(https?://\S+)',
+                            r'<meta[^>]*http-equiv=["\']?refresh[^>]*url=["\']?(https?://[^"\'>\s]+)',
                             body, re.I)
                         if meta_refresh:
-                            redirect_url = meta_refresh.group(2).rstrip('"\'>')
+                            redirect_url = meta_refresh.group(1)
                             result["flags"].append(f"meta_redirect:{redirect_url[:80]}")
                             result["score"] += 5
                             result["discovered_urls"].append(redirect_url)
@@ -1025,6 +1091,10 @@ async def analyze_urls(urls: list[str], session: aiohttp.ClientSession,
                         # Extract URLs from response body — only follow suspicious ones
                         # Skip ad/tracking/analytics domains that appear in page content
                         _NOISE_URL_PATTERNS = {
+                            # Paste sites (flag, don't follow recursively)
+                            "pastebin.com", "rentry.co", "paste.ee", "dpaste.org",
+                            "hastebin.com", "pastie.org", "paste.centos.org",
+                            "bpa.st", "del.dog", "paste.gg",
                             # Ad networks and tracking
                             "googleads", "googlesyndication", "doubleclick", "google-analytics",
                             "googletagmanager", "facebook.com/tr", "facebook.net",
@@ -1142,10 +1212,17 @@ _ETH_RPC_ENDPOINTS = [
 
 def _decode_eth_string(hex_data: str) -> str:
     """Decode an ABI-encoded string from eth_call result."""
-    raw = bytes.fromhex(hex_data[2:])
-    offset = int.from_bytes(raw[0:32], "big")
-    length = int.from_bytes(raw[offset:offset + 32], "big")
-    return raw[offset + 32:offset + 32 + length].decode("utf-8", errors="replace")
+    try:
+        raw = bytes.fromhex(hex_data[2:])
+        if len(raw) < 64:
+            return ""
+        offset = int.from_bytes(raw[0:32], "big")
+        if offset + 32 > len(raw):
+            return ""
+        length = int.from_bytes(raw[offset:offset + 32], "big")
+        return raw[offset + 32:offset + 32 + length].decode("utf-8", errors="replace")
+    except (ValueError, IndexError):
+        return ""
 
 
 async def resolve_eth_contracts(eth_addresses: list[str], session: aiohttp.ClientSession,
@@ -1790,9 +1867,9 @@ def analyze_entropy(filepath: str) -> dict:
                     data = zf.read(entry)
                     if not data:
                         continue
-                    # Accumulate byte counts for overall entropy
-                    for b in data:
-                        all_counts[b] += 1
+                    # Accumulate byte counts for overall entropy (Counter is C-implemented, much faster)
+                    for byte_val, cnt in Counter(data).items():
+                        all_counts[byte_val] += cnt
                     total_bytes += len(data)
                     if len(data) < 64:
                         continue
@@ -2292,7 +2369,7 @@ def analyze_pdf(filepath: str) -> Optional[dict]:
     except Exception:
         return None
 
-    if not data[:5].startswith(b"%PDF"):
+    if data[:4] != b"%PDF":
         return None
 
     result = {
@@ -2739,7 +2816,7 @@ def analyze_iso(filepath: str) -> Optional[dict]:
         result["warnings"].append(f"{len(found_files)} potentially dangerous file(s) inside ISO")
 
     # Check for autorun.inf
-    if b"autorun.inf" in data.lower() or b"AUTORUN.INF" in data:
+    if b"autorun.inf" in data or b"AUTORUN.INF" in data or b"Autorun.inf" in data or b"AutoRun.inf" in data:
         result["warnings"].append("Contains autorun.inf")
 
     file_size = os.path.getsize(filepath)
@@ -3095,6 +3172,37 @@ HIGH_RISK_VARIANTS = {
 }
 
 
+def _apply_url_eth_adj(score: int, url_analysis: Optional[dict],
+                       eth_analysis: Optional[dict],
+                       all_iocs: Optional[dict]) -> tuple[int, str, int]:
+    """Apply URL and ETH score adjustments and recalculate level/color.
+
+    Returns (adjusted_score, level, color).
+    """
+    is_minecraft_mod = bool(all_iocs and all_iocs.get("modLoaders"))
+    if url_analysis:
+        url_adj = url_analysis["score_adjust"]
+        if is_minecraft_mod:
+            _has_real_threats = bool(all_iocs and (
+                all_iocs.get("c2Base") or all_iocs.get("ethContract")
+                or all_iocs.get("exfilUrl") or all_iocs.get("stage2Url")
+                or any("webhook" in k.lower() and all_iocs[k] for k in all_iocs)
+            ))
+            if not _has_real_threats:
+                url_adj = url_adj // 3
+        score += url_adj
+    if eth_analysis:
+        score += eth_analysis["score_adjust"]
+    score = min(score, 100)
+    if score <= DETECTION_THRESHOLD:
+        level, color = "LOW", 0x2ECC71
+    elif score <= 60:
+        level, color = "MEDIUM", 0xF39C12
+    else:
+        level, color = "HIGH", 0xE74C3C
+    return score, level, color
+
+
 def compute_risk_score(
     iocs: Optional[dict],
     vt: Optional[dict],
@@ -3152,7 +3260,10 @@ def compute_risk_score(
             elif dangerous_api_markers:
                 has_threat_context = True
 
-        if iocs.get("urls") and len(iocs["urls"]) > 3 and has_threat_context:
+        _total_url_count = len(iocs.get("urls") or [])
+        if extracted_strings:
+            _total_url_count += len(extracted_strings.get("urls") or [])
+        if _total_url_count > 3 and has_threat_context:
             score += 10
 
         webhook_keys = [k for k in iocs if "webhook" in k.lower() and iocs[k]]
@@ -3226,8 +3337,8 @@ def compute_risk_score(
         if decompile_fail:
             score += 5
 
-    # VirusTotal
-    if vt and vt.get("total", 0) > 0:
+    # VirusTotal — require at least 10 engines to avoid partial result score inflation
+    if vt and vt.get("total", 0) >= 10:
         vt_ratio = vt["detected"] / vt["total"]
         score += min(int(vt_ratio * 40), 40)
 
@@ -3510,10 +3621,6 @@ class APITimingTracker:
 
 api_timing = APITimingTracker()
 
-# Keep STAGE_ETAS as a property-like lookup for build_progress_embed
-STAGE_ETAS = {}
-
-
 def build_progress_embed(
     filename: str,
     file_size: int,
@@ -3551,7 +3658,7 @@ def build_progress_embed(
             elif "(" in status:
                 eta = f" {status[status.index('('):]}"
             else:
-                eta = f" (ETA {STAGE_ETAS.get(stage_name, '~5s')})"
+                eta = " (ETA ~5s)"
             status = "running"
             icon = STAGE_ICONS["running"]
         elif status == "complete":
@@ -4583,7 +4690,7 @@ def extract_files_from_zip(zip_path: str, extract_to: str, depth: int = 0, max_e
                             safe_name = f"nested_{depth}_{len(extracted)}"
                         dest = os.path.join(extract_to, f"depth{depth}_{safe_name}")
                         # Zip slip protection: ensure dest stays within extract_to
-                        if not os.path.abspath(dest).startswith(os.path.abspath(extract_to)):
+                        if not os.path.abspath(dest).startswith(os.path.abspath(extract_to) + os.sep):
                             log.warning(f"Zip slip blocked: {entry} -> {dest}")
                             continue
                         with open(dest, "wb") as dst:
@@ -4633,6 +4740,9 @@ def extract_files_from_tar(tar_path: str, extract_to: str, max_extract_bytes: in
         with tarfile.open(tar_path, "r:*") as tf:
             for member in tf.getmembers():
                 try:
+                    # Skip symlinks and hardlinks to prevent symlink-based attacks
+                    if member.issym() or member.islnk():
+                        continue
                     if not member.isfile():
                         continue
                     if member.size > max_extract_bytes or member.size > MAX_ENTRY_SIZE:
@@ -4648,7 +4758,7 @@ def extract_files_from_tar(tar_path: str, extract_to: str, max_extract_bytes: in
                     if not safe_name:
                         safe_name = f"tar_entry_{len(extracted)}"
                     dest = os.path.join(extract_to, f"tar_{safe_name}")
-                    if not os.path.abspath(dest).startswith(os.path.abspath(extract_to)):
+                    if not os.path.abspath(dest).startswith(os.path.abspath(extract_to) + os.sep):
                         log.warning(f"Tar path traversal blocked: {member.name} -> {dest}")
                         continue
 
@@ -5238,6 +5348,9 @@ def archive_scan(log_dir: str, original_file: str, sha256: str = ""):
     scanned_dir.mkdir(exist_ok=True)
 
     # ── Dupe detection: check catalog for existing scanned_path ──
+    # Note: direct dict access is safe here because this runs on the event loop
+    # thread (via run_in_scan_thread wrapping the caller) and dict.get() is
+    # atomic in CPython.  The async catalog_lookup() cannot be used from sync code.
     dest = None
     if sha256:
         cat_entry = file_catalog.get(sha256)
@@ -5356,8 +5469,7 @@ NON_DOWNLOAD_DOMAINS = {
     # Gaming (non-download)
     "store.steampowered.com", "steamcommunity.com",
     "namemc.com", "minecraft.net", "www.minecraft.net",
-    # Paste / code viewing (not raw file downloads)
-    "pastebin.com", "hastebin.com", "gist.github.com",
+    # Paste / code viewing (not raw file downloads) — paste sites allowed with warning
     "codepen.io", "jsfiddle.net", "replit.com",
     # URL shorteners (suspicious for file downloads)
     "bit.ly", "tinyurl.com", "t.co", "is.gd", "v.gd",
@@ -5423,7 +5535,6 @@ def _is_blocked_host(hostname: str) -> Optional[str]:
 
 async def _resolve_and_check(hostname: str) -> Optional[str]:
     """Resolve hostname to IPs and validate none are private/reserved."""
-    import socket
     try:
         infos = await asyncio.get_running_loop().run_in_executor(
             None, lambda: socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
@@ -5510,6 +5621,12 @@ async def _do_download(session, url: str, work_dir: str, dl_path: str, display_n
                 if stem in _WIN_RESERVED:
                     cd_name = f"_{cd_name}"
                 if cd_name:
+                    # Guard against directory traversal via "." or ".." filenames
+                    if cd_name in (".", "..", "") or cd_name.startswith(".."):
+                        cd_name = "downloaded_file"
+                    cd_name = cd_name.lstrip(".")
+                    if not cd_name:
+                        cd_name = "downloaded_file"
                     display_name = cd_name
                     dl_path = os.path.join(work_dir, display_name)
 
@@ -5555,6 +5672,14 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
                 "(e.g. a `.jar`, `.zip`, or `.exe` link)."
             )
 
+    # Warn (but allow) paste site URLs — attackers commonly host payloads there
+    _PASTE_WARN_DOMAINS = {"pastebin.com", "hastebin.com", "gist.github.com",
+                           "paste.ee", "rentry.co", "dpaste.org"}
+    for pw_domain in _PASTE_WARN_DOMAINS:
+        if hn_lower == pw_domain or hn_lower.endswith("." + pw_domain):
+            log.warning(f"Paste site download attempted: {url[:80]}")
+            break
+
     # Resolve DNS and check resolved IPs against private ranges (anti-SSRF)
     dns_block = await _resolve_and_check(hostname)
     if dns_block:
@@ -5580,6 +5705,12 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
     display_name = re.sub(r"[^\w.\-]", "_", raw_name)[:100]
     if not display_name:
         display_name = "download"
+    # Guard against directory traversal via "." or ".." filenames
+    if display_name in (".", "..") or display_name.startswith(".."):
+        display_name = "downloaded_file"
+    display_name = display_name.lstrip(".")
+    if not display_name:
+        display_name = "downloaded_file"
 
     dl_path = os.path.join(work_dir, display_name)
     total = 0
@@ -5763,7 +5894,6 @@ class ScanQueue:
                     # Notify remaining waiters so they can update position
                     for w in self._waiters:
                         w.set()
-                        w.clear()
                 if on_dequeue:
                     try:
                         await on_dequeue()
@@ -5869,7 +5999,10 @@ async def ensure_http_session() -> aiohttp.ClientSession:
     """Lazily create or return the global aiohttp session."""
     global http_session
     if http_session is None or http_session.closed:
-        http_session = aiohttp.ClientSession()
+        http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30),
+            connector=aiohttp.TCPConnector(resolver=_SafeResolver()),
+        )
     return http_session
 
 
@@ -6069,7 +6202,7 @@ async def giverat_command(
     threshold_hr = CFG.get("alerts", {}).get("hourly_request_threshold", 20)
     req_count = _hourly_request_count()
     if req_count >= threshold_hr and req_count % 5 == 0:  # alert every 5th request over threshold
-        asyncio.create_task(send_alert(
+        _track_poll_task(send_alert(
             "high_request_rate",
             "High Request Rate",
             f"**{req_count}** scan requests in the last hour (threshold: {threshold_hr}).\n"
@@ -6114,7 +6247,7 @@ async def giverat_command(
     scraper_info = ""
     if _scraper_was_active:
         active_scrape_scans = scan_queue.active
-        pending_pos = scan_queue.pending + 1
+        pending_pos = scan_queue.pending + 1  # approximate; scan hasn't entered queue yet
         scraper_info = (
             f"\n\n\U0001F50D **Mod scraper is running** — pausing scraper for your scan."
             f"\nActive scrape scans finishing: **{active_scrape_scans}**"
@@ -6230,7 +6363,7 @@ async def giverat_command(
 @bot.slash_command(name="stats", description="Show scanner statistics", **_install_params)
 async def stats_command(ctx: discord.ApplicationContext):
     await ctx.defer(ephemeral=True)
-    async with _stats_lock:
+    async with _get_stats_lock():
         stats = dict(scan_stats)
     total = stats.get("total_scans", 0)
     detections = stats.get("detections", 0)
@@ -6309,7 +6442,7 @@ async def stats_command(ctx: discord.ApplicationContext):
 async def reload_command(ctx: discord.ApplicationContext):
     if not ctx.guild or not hasattr(ctx.author, "guild_permissions") or not ctx.author.guild_permissions.administrator:
         return await ctx.respond("Admin only.", ephemeral=True)
-    load_yara_rules()
+    await asyncio.to_thread(load_yara_rules)
     await ctx.respond(f"YARA rules reloaded. {YARA_RULES is not None}", ephemeral=True)
 
 
@@ -6545,22 +6678,22 @@ def _start_scraper(channel=None):
             ]
             if overall_rate > 0:
                 lines.append(f"Rate: **{overall_rate:.0f} mods/hr** avg")
-            q_size = scan_queue.qsize() if scan_queue else 0
+            q_size = _scrape_queue.qsize() if _scrape_queue else 0
             lines.append(f"Queued: {q_size} | Downloaded: {s['downloaded']} | Scanned: {s['scanned']} | Errors: {s['errors']}")
             return "\n".join(lines)
 
         # Pipeline: producer downloads into queue, consumers scan from queue
         SCAN_QUEUE_MAX = 20
-        scan_queue: asyncio.Queue = asyncio.Queue(maxsize=SCAN_QUEUE_MAX)
+        _scrape_queue: asyncio.Queue = asyncio.Queue(maxsize=SCAN_QUEUE_MAX)
         max_concurrent = CFG["scanner"].get("max_concurrent_scans", 6)
         last_status_update = [0.0]
 
         async def _scan_worker():
             """Consumer: pull mods from queue and scan them."""
             while True:
-                item = await scan_queue.get()
+                item = await _scrape_queue.get()
                 if item is None:  # Poison pill = shutdown
-                    scan_queue.task_done()
+                    _scrape_queue.task_done()
                     break
                 jar_path, mod_name, source = item
                 try:
@@ -6568,7 +6701,7 @@ def _start_scraper(channel=None):
                     if _scrape_pause:
                         await _scrape_pause.wait_if_paused()
                     if runner.stopped:
-                        scan_queue.task_done()
+                        _scrape_queue.task_done()
                         continue
                     scan_id = f"scrape_{uuid.uuid4().hex[:8]}"
                     log.info(f"[scraper] Scanning: {mod_name} ({jar_path.name})")
@@ -6606,7 +6739,7 @@ def _start_scraper(channel=None):
                             p = scan_log_dir / subdir
                             if p.is_dir():
                                 shutil.rmtree(p, ignore_errors=True)
-                    scan_queue.task_done()
+                    _scrape_queue.task_done()
 
         try:
             conn = aiohttp.TCPConnector(limit=20, limit_per_host=5)
@@ -6654,7 +6787,7 @@ def _start_scraper(channel=None):
                     for jar_path, mod_name, source in batch:
                         if runner.stopped:
                             break
-                        await scan_queue.put((jar_path, mod_name, source))
+                        await _scrape_queue.put((jar_path, mod_name, source))
 
                     runner.progress.flush()
                     log.info(f"[scraper] Batch {batch_num} queued. Stats: {runner.stats}")
@@ -6662,7 +6795,7 @@ def _start_scraper(channel=None):
 
                 # Drain the queue: send poison pills to shut down workers
                 for _ in workers:
-                    await scan_queue.put(None)
+                    await _scrape_queue.put(None)
                 await asyncio.gather(*workers, return_exceptions=True)
 
             log.info(f"[scraper] Finished. Final stats: {runner.stats}")
@@ -6819,6 +6952,7 @@ async def run_scan(
             pass
 
     _spawned_sub_scans = False  # Set True when multi-JAR sub-scans are spawned (skip work_dir cleanup)
+    _has_bg_api = False  # Set True when background API task is spawned (handles its own cleanup)
 
     try:
         scanned_path = None
@@ -7053,9 +7187,19 @@ async def run_scan(
                 None, vt_result, yara_matches, [], None, None, None,
                 mb_result=mb_result, ha_result=ha_result,
             )
-            score = max(score, 75)
-            level = "HIGH"
-            color = 0xE74C3C
+            # Ratio-only bombs get MEDIUM floor (60); entry-count/nested get HIGH (75)
+            if zip_bomb_warning and ("Excessive" in zip_bomb_warning or "entries" in zip_bomb_warning.lower()):
+                score = max(score, 75)
+                level = "HIGH"
+                color = 0xE74C3C
+            else:
+                score = max(score, 60)
+                if score > 60:
+                    level = "HIGH"
+                    color = 0xE74C3C
+                else:
+                    level = "MEDIUM"
+                    color = 0xF39C12
 
             await update_stats(total_scans=1, detections=1)
 
@@ -7246,9 +7390,31 @@ async def run_scan(
             if result.get("log_dir"):
                 all_log_dirs.append(result["log_dir"])
             if result.get("iocs"):
-                if all_iocs is None or (result["iocs"].get("variant", "").lower() != "unknown"):
-                    all_iocs = result["iocs"]
+                new_iocs = result["iocs"]
+                if all_iocs is None:
+                    all_iocs = new_iocs
                     all_analysis = result.get("analysis_text")
+                else:
+                    # Merge: accumulate markers and URLs from sub-JARs,
+                    # upgrade variant if sub-JAR has a known one
+                    for m in new_iocs.get("behavioralMarkers", []):
+                        if m not in all_iocs.get("behavioralMarkers", []):
+                            all_iocs.setdefault("behavioralMarkers", []).append(m)
+                    for u in new_iocs.get("urls", []):
+                        if u not in all_iocs.get("urls", []):
+                            all_iocs.setdefault("urls", []).append(u)
+                    # Preserve modLoaders from main JAR, add any new ones
+                    for ml in new_iocs.get("modLoaders", []):
+                        if ml not in all_iocs.get("modLoaders", []):
+                            all_iocs.setdefault("modLoaders", []).append(ml)
+                    # Upgrade variant if sub-JAR identified a known one
+                    if new_iocs.get("variant", "").lower() != "unknown" and all_iocs.get("variant", "").lower() == "unknown":
+                        all_iocs["variant"] = new_iocs["variant"]
+                        all_analysis = result.get("analysis_text")
+                    # Merge C2/exfil fields
+                    for key in ("c2Base", "ethContract", "exfilUrl", "stage2Url"):
+                        if new_iocs.get(key) and not all_iocs.get(key):
+                            all_iocs[key] = new_iocs[key]
 
         # ── Obfuscator detection ──
         deobfuscation = None
@@ -7324,6 +7490,10 @@ async def run_scan(
                     for key in ("discord_webhooks", "discord_tokens", "urls", "ipv4", "eth_addresses"):
                         if ef_strings.get(key):
                             extracted_strings.setdefault(key, []).extend(ef_strings[key])
+            # Deduplicate after merging extracted file strings
+            for _dedup_key in ("discord_webhooks", "discord_tokens", "urls", "ipv4", "eth_addresses"):
+                if extracted_strings.get(_dedup_key):
+                    extracted_strings[_dedup_key] = list(dict.fromkeys(extracted_strings[_dedup_key]))
 
             # ── Multi-format analysis (PE, PDF, Office, LNK, Script, MSI, ISO) ──
             stage_details["Local Analysis"] = "Analyzing file format..."
@@ -7369,10 +7539,9 @@ async def run_scan(
                 unique_yara.append(m)
         yara_matches = unique_yara
 
-        stages["Local Analysis"] = "complete"
-        stage_start_times["Local Analysis_done"] = time.time()
-        stage_details.pop("Local Analysis", None)
-        await update_progress(stages, filename, file_size, hashes, force=True)
+        # Don't mark Local Analysis complete yet — URL analysis is part of it
+        stage_details["Local Analysis"] = "Finalizing..."
+        await update_progress(stages, filename, file_size, hashes)
 
         # ── Webhook killing ──
         webhook_kills = {}
@@ -7403,17 +7572,13 @@ async def run_scan(
 
             if all_urls:
                 stage_details["Local Analysis"] = "Analyzing URLs..."
-                stages["Local Analysis"] = "running"
                 await update_progress(stages, filename, file_size, hashes)
                 url_analysis = await analyze_urls(
                     all_urls, http_session, scan_id, work_dir=work_dir)
-                stages["Local Analysis"] = "complete"
-                stage_details.pop("Local Analysis", None)
 
                 # Static-analyze any files downloaded from URLs (YARA + strings only, no execution)
                 if url_analysis.get("downloaded_files"):
                     stage_details["Local Analysis"] = "Analyzing dropped files..."
-                    stages["Local Analysis"] = "running"
                     await update_progress(stages, filename, file_size, hashes)
                     for drop_path in url_analysis["downloaded_files"]:
                         drop_name = os.path.basename(drop_path)
@@ -7454,8 +7619,6 @@ async def run_scan(
                                 format_analysis.setdefault("findings", []).append(
                                     f"--- URL-dropped: `{drop_name}` ---")
                                 format_analysis["findings"].extend(drop_fmt["findings"])
-                    stages["Local Analysis"] = "complete"
-                    stage_details.pop("Local Analysis", None)
 
             # Resolve ETH contract addresses
             eth_addresses = []
@@ -7470,18 +7633,21 @@ async def run_scan(
 
             if eth_addresses:
                 stage_details["Local Analysis"] = "Resolving ETH contracts..."
-                stages["Local Analysis"] = "running"
                 await update_progress(stages, filename, file_size, hashes)
                 eth_analysis = await resolve_eth_contracts(
                     eth_addresses, http_session, scan_id, work_dir=work_dir)
-                stages["Local Analysis"] = "complete"
-                stage_details.pop("Local Analysis", None)
 
                 # If ETH resolution found new URLs, analyze those too
                 if eth_analysis.get("urls_found"):
                     for u in eth_analysis["urls_found"]:
                         if u not in all_urls:
                             all_urls.append(u)
+
+        # Mark Local Analysis complete now that URL + ETH analysis are done
+        stages["Local Analysis"] = "complete"
+        stage_start_times["Local Analysis_done"] = time.time()
+        stage_details.pop("Local Analysis", None)
+        await update_progress(stages, filename, file_size, hashes, force=True)
 
         # ── LOCAL-ONLY risk score (no VT/MB/HA yet) ──
         score, level, color = compute_risk_score(
@@ -7490,38 +7656,12 @@ async def run_scan(
             mb_result=None, ha_result=None,
         )
         # Apply URL and ETH analysis score adjustments
-        # For recognized Minecraft mods, discount URL analysis score — legitimate mods
-        # commonly reference server lists, APIs, and community sites that may trigger
-        # cross-domain redirect or raw content page flags
-        is_minecraft_mod = bool(all_iocs and all_iocs.get("modLoaders"))
-        if url_analysis:
-            url_adj = url_analysis["score_adjust"]
-            if is_minecraft_mod:
-                # Check for real threat signals before applying full URL score
-                _has_real_threats = bool(all_iocs and (
-                    all_iocs.get("c2Base") or all_iocs.get("ethContract")
-                    or all_iocs.get("exfilUrl") or all_iocs.get("stage2Url")
-                    or any("webhook" in k.lower() and all_iocs[k] for k in all_iocs)
-                ))
-                if not _has_real_threats:
-                    url_adj = url_adj // 3  # Heavy discount for known mods without threat signals
-            score += url_adj
-        if eth_analysis:
-            score += eth_analysis["score_adjust"]
-        score = min(score, 100)
-        # Debug: log full score breakdown including external adjustments
-        _base = score - (url_adj if url_analysis else 0) - (eth_analysis["score_adjust"] if eth_analysis else 0)
-        log.info(f"[{scan_id}] SCORE TRACE: base={_base}, "
-                 f"url_adj={url_adj if url_analysis else 0} (raw={url_analysis['score_adjust'] if url_analysis else 0}), "
-                 f"eth_adj={eth_analysis['score_adjust'] if eth_analysis else 0}, "
-                 f"mod={is_minecraft_mod}, total={score}")
-        # Recalculate level after adjustments
-        if score <= DETECTION_THRESHOLD:
-            level, color = "LOW", 0x2ECC71
-        elif score <= 60:
-            level, color = "MEDIUM", 0xF39C12
-        else:
-            level, color = "HIGH", 0xE74C3C
+        _base_score = score
+        score, level, color = _apply_url_eth_adj(score, url_analysis, eth_analysis, all_iocs)
+        log.debug(f"[{scan_id}] SCORE TRACE: base={_base_score}, "
+                  f"url_adj={url_analysis['score_adjust'] if url_analysis else 0}, "
+                  f"eth_adj={eth_analysis['score_adjust'] if eth_analysis else 0}, "
+                  f"mod={bool(all_iocs and all_iocs.get('modLoaders'))}, total={score}")
 
         # ── Update stats ──
         if score > DETECTION_THRESHOLD:
@@ -7587,14 +7727,14 @@ async def run_scan(
 
         # ── Auto-research for exception candidates (skip in fast mode) ──
         if not fast and score <= DETECTION_THRESHOLD and extracted_strings and http_session:
-            all_urls = extracted_strings.get("urls", [])
-            if all_urls:
+            research_urls = extracted_strings.get("urls", [])
+            if research_urls:
                 try:
-                    url_matches = await auto_research_urls(all_urls, sha256, http_session)
+                    url_matches = await auto_research_urls(research_urls, sha256, http_session)
                     variant_name = all_iocs.get("variant", "") if all_iocs else ""
                     await write_exception_candidate(
                         filename, sha256, file_size, score, level,
-                        variant_name, all_urls[:10], url_matches,
+                        variant_name, research_urls[:10], url_matches,
                     )
                 except Exception as e:
                     log.debug(f"Auto-research failed: {e}")
@@ -7938,28 +8078,9 @@ async def run_scan(
                     entropy, extracted_strings, manifest, format_analysis,
                     mb_result=mb_result, ha_result=ha_result,
                 )
-                # Re-apply URL and ETH adjustments (same logic as initial scoring)
-                _is_mc_mod = bool(all_iocs and all_iocs.get("modLoaders"))
-                if url_analysis:
-                    _url_adj = url_analysis["score_adjust"]
-                    if _is_mc_mod:
-                        _has_threats = bool(all_iocs and (
-                            all_iocs.get("c2Base") or all_iocs.get("ethContract")
-                            or all_iocs.get("exfilUrl") or all_iocs.get("stage2Url")
-                            or any("webhook" in k.lower() and all_iocs[k] for k in all_iocs)
-                        ))
-                        if not _has_threats:
-                            _url_adj = _url_adj // 3
-                    new_score += _url_adj
-                if eth_analysis:
-                    new_score += eth_analysis["score_adjust"]
-                new_score = min(new_score, 100)
-                if new_score <= DETECTION_THRESHOLD:
-                    new_level, new_color = "LOW", 0x2ECC71
-                elif new_score <= 60:
-                    new_level, new_color = "MEDIUM", 0xF39C12
-                else:
-                    new_level, new_color = "HIGH", 0xE74C3C
+                # Re-apply URL and ETH adjustments (shared helper)
+                new_score, new_level, new_color = _apply_url_eth_adj(
+                    new_score, url_analysis, eth_analysis, all_iocs)
                 if new_score != score:
                     log.info(f"[{scan_id}] Score updated: {score} -> {new_score} ({level} -> {new_level}) after API results")
                     # Update stats if detection status changed (check BEFORE reassigning)
@@ -7987,15 +8108,17 @@ async def run_scan(
                             await scan_msg.edit(embeds=updated_embeds)
                         except discord.HTTPException:
                             pass
-                    # Update catalog with final API-enriched data
+                    # Update catalog with final API-enriched data (merge, not overwrite)
                     sha_lock2 = await _get_sha256_lock(sha256)
                     async with sha_lock2:
-                        await catalog_update(sha256, {
+                        _existing = await catalog_lookup(sha256) or {}
+                        _existing.update({
                             "score": new_score,
                             "level": new_level,
                             "vt_detected": vt_result.get("detected", 0) if vt_result else 0,
                             "vt_total": vt_result.get("total", 0) if vt_result else 0,
                         })
+                        await catalog_update(sha256, _existing)
 
             except Exception as e:
                 log.warning(f"[{scan_id}] Background API task error: {e}")
@@ -8008,9 +8131,12 @@ async def run_scan(
                         pass
 
         # Fire-and-forget the API background task (it handles its own cleanup)
-        _has_bg_api = http_session and (vt_enabled or mb_enabled or ha_enabled)
+        _has_bg_api = http_session and not http_session.closed and (vt_enabled or mb_enabled or ha_enabled)
         if _has_bg_api:
-            _track_poll_task(_api_background())
+            try:
+                _track_poll_task(_api_background())
+            except Exception:
+                _has_bg_api = False
 
     except asyncio.CancelledError:
         log.info(f"[{scan_id}] Scan cancelled by user")
@@ -8043,7 +8169,7 @@ async def run_scan(
     finally:
         _cancelled_scans.discard(scan_id)
         # Only clean up work_dir here if no background API task is handling it
-        if not _spawned_sub_scans and not locals().get("_has_bg_api", False):
+        if not _spawned_sub_scans and not _has_bg_api:
             try:
                 shutil.rmtree(work_dir, ignore_errors=True)
             except Exception:
@@ -8067,7 +8193,6 @@ def _find_tor_exe() -> Optional[str]:
 
 def _is_tor_running(proxy: str) -> bool:
     """Quick check if Tor SOCKS proxy is already listening."""
-    import socket
     try:
         parsed = urlparse(proxy)
         host = parsed.hostname or "127.0.0.1"
@@ -8227,6 +8352,8 @@ if __name__ == "__main__":
                         break
                 else:
                     # Token key exists but has some other value — replace the whole line
+                    # Note: count=1 ensures only the first token: line (discord token) is replaced;
+                    # assumes discord token appears before any other token: keys in the YAML
                     raw = re.sub(r'(token:\s*)(".*?"|\'.*?\'|.*)', f'\\1"{new_token}"', raw, count=1)
                 with open(yml_path, "w", encoding="utf-8") as f:
                     f.write(raw)
@@ -8333,6 +8460,16 @@ if __name__ == "__main__":
 
         log.warning("Bot disconnected — restarting in 10 seconds...")
         print("Bot disconnected — restarting in 10s...")
+        # Reset lazy-initialized asyncio locks — they're bound to the old event loop
+        global _stats_lock, _catalog_lock, _sha256_locks_guard, _exceptions_md_lock, _vt_rate_lock, scan_queue, _ready_fired
+        _stats_lock = None
+        _catalog_lock = None
+        _sha256_locks_guard = None
+        _exceptions_md_lock = None
+        _vt_rate_lock = None
+        _sha256_locks.clear()
+        scan_queue = ScanQueue(CFG["scanner"]["max_concurrent_scans"])
+        _ready_fired = False
         time.sleep(10)
 
     stop_tor()
