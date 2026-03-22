@@ -429,10 +429,14 @@ def _get_alert_user_ids() -> list[int]:
 
 
 def _get_storage_usage_bytes() -> int:
-    """Calculate total disk usage of scanned files, logs, and samples."""
+    """Calculate disk usage of Discord-submitted scans only (not scraper data).
+
+    Counts scanned/ directories that have at least one real Discord user submitter,
+    plus bot logs and PUT_JAR_HERE.
+    """
     total = 0
-    for check_dir in [MASTER_DIR / "logs", MASTER_DIR / "scanned",
-                      BOT_DIR / "logs", MASTER_DIR / "PUT_JAR_HERE"]:
+    # Always count bot logs and PUT_JAR_HERE
+    for check_dir in [MASTER_DIR / "logs", BOT_DIR / "logs", MASTER_DIR / "PUT_JAR_HERE"]:
         if check_dir.exists():
             for entry in check_dir.rglob("*"):
                 try:
@@ -440,6 +444,26 @@ def _get_storage_usage_bytes() -> int:
                         total += entry.stat().st_size
                 except OSError:
                     pass
+
+    # For scanned/, only count entries submitted via Discord (not scraper-only)
+    scanned_dir = MASTER_DIR / "scanned"
+    if scanned_dir.exists():
+        # Build set of scanned_paths that have real Discord submitters
+        discord_paths = set()
+        for sha, entry in file_catalog.items():
+            submitters = entry.get("submitters", [])
+            has_discord_user = any(str(s) != "scraper" for s in submitters)
+            if has_discord_user and entry.get("scanned_path"):
+                discord_paths.add(str(Path(entry["scanned_path"]).resolve()))
+
+        for sub in scanned_dir.iterdir():
+            if sub.is_dir() and str(sub.resolve()) in discord_paths:
+                for entry in sub.rglob("*"):
+                    try:
+                        if entry.is_file():
+                            total += entry.stat().st_size
+                    except OSError:
+                        pass
     return total
 
 
@@ -712,18 +736,502 @@ def load_yara_rules():
         log.error(f"Failed to compile YARA rules: {e}")
 
 
-def run_yara(filepath: str) -> list[dict]:
+def run_yara(filepath: str, timeout: int = 120, max_size_mb: float = 0) -> list[dict]:
+    """Run YARA rules against a file.
+
+    Args:
+        timeout: YARA scan timeout in seconds (default 120).
+        max_size_mb: Skip files larger than this (in MB). 0 = no limit.
+    """
     if YARA_RULES is None:
         return []
+    if max_size_mb > 0:
+        try:
+            size_mb = os.path.getsize(filepath) / (1024 * 1024)
+            if size_mb > max_size_mb:
+                log.info(f"YARA skipped: {os.path.basename(filepath)} ({size_mb:.1f}MB > {max_size_mb}MB limit)")
+                return []
+        except OSError:
+            pass
     try:
         # Suppress stdout from YARA console module (some rules use console.log/console.hex)
         import io, contextlib
         with contextlib.redirect_stdout(io.StringIO()):
-            matches = YARA_RULES.match(filepath, timeout=60)
+            matches = YARA_RULES.match(filepath, timeout=timeout)
         return [{"rule": m.rule, "tags": m.tags, "meta": m.meta} for m in matches]
     except Exception as e:
-        log.warning(f"YARA scan error: {e}")
+        log.warning(f"YARA scan error on {os.path.basename(filepath)}: {e}")
         return []
+
+
+# ─── URL Content Analyzer ────────────────────────────────────────────────────
+
+import ipaddress
+import urllib.parse as _urlparse
+
+# Patterns in response body that indicate suspicious content
+# NOTE: These are checked against page text. Avoid patterns that match normal websites
+# (e.g. <script> tags, minified JS eval(), etc.)
+_SUSPICIOUS_BODY_PATTERNS = [
+    # Discord webhook URL in response body — very strong signal
+    (re.compile(r"discord(?:app)?\.com/api/webhooks/\d+/[\w-]+", re.I), "discord_webhook", 15),
+    # Direct executable download link (not just mentioned in text)
+    (re.compile(r"https?://\S+\.(?:exe|dll|bat|cmd|ps1|vbs|scr)\b", re.I), "executable_url", 8),
+    # Windows path references combined with theft-related paths
+    (re.compile(r"(?:LOCALAPPDATA|APPDATA)[/\\].*?(?:launcher_accounts|tokens|\.minecraft|discord|chrome)", re.I), "path_references", 10),
+]
+
+# Content types that indicate a download/binary rather than a webpage
+_DOWNLOAD_CONTENT_TYPES = {
+    "application/octet-stream", "application/x-msdownload", "application/x-executable",
+    "application/java-archive", "application/x-java-archive", "application/zip",
+    "application/x-rar-compressed", "application/x-7z-compressed",
+    "application/x-dosexec", "application/vnd.microsoft.portable-executable",
+}
+
+
+def _is_private_ip(hostname: str) -> bool:
+    """Check if hostname resolves to a private/internal IP (SSRF protection)."""
+    if hostname.lower() in ("localhost", "localhost.localdomain", ""):
+        return True
+    try:
+        addr = ipaddress.ip_address(hostname)
+        return addr.is_private or addr.is_loopback or addr.is_reserved
+    except ValueError:
+        return False
+
+
+
+async def analyze_urls(urls: list[str], session: aiohttp.ClientSession,
+                       scan_id: str, max_urls: int = 15, timeout: float = 8.0,
+                       work_dir: str = None, depth: int = 0) -> dict:
+    """Fetch and analyze URLs found in a scanned file.
+
+    Follows redirect chains, downloads files served by URLs (saved to work_dir/url_drops/),
+    analyzes content for suspicious patterns, and recursively checks discovered URLs.
+
+    Args:
+        work_dir: Directory to save downloaded files into (under url_drops/ subfolder).
+        depth: Recursion depth for following discovered URLs (max 2).
+
+    Returns dict with:
+        findings: list of human-readable findings
+        score_adjust: int score adjustment based on URL content
+        details: list of per-URL analysis dicts
+        downloaded_files: list of paths to files downloaded from URLs
+    """
+    if not urls:
+        return {"findings": [], "score_adjust": 0, "details": [], "downloaded_files": []}
+
+    findings = []
+    details = []
+    total_score = 0
+    downloaded_files = []
+    discovered_urls = []  # URLs found in responses to follow up on
+    MAX_DOWNLOAD_SIZE = 10 * 1024 * 1024  # 10MB max download
+
+    # Prepare download directory
+    drop_dir = None
+    if work_dir:
+        drop_dir = Path(work_dir) / "url_drops"
+        drop_dir.mkdir(parents=True, exist_ok=True)
+
+    # Deduplicate and limit
+    seen = set()
+    unique_urls = []
+    for u in urls:
+        if u not in seen and len(unique_urls) < max_urls:
+            seen.add(u)
+            unique_urls.append(u)
+
+    async def _check_url(url: str) -> dict:
+        """Analyze a single URL: check redirects, content type, download files."""
+        result = {
+            "url": url, "status": None, "content_type": None,
+            "redirects": [], "flags": [], "error": None, "score": 0,
+            "downloaded_path": None, "discovered_urls": [],
+        }
+        try:
+            parsed = _urlparse.urlparse(url)
+            hostname = parsed.hostname or ""
+
+            # SSRF protection: skip private/internal/localhost IPs — score 0, not suspicious
+            if _is_private_ip(hostname):
+                result["flags"].append("private_ip_skipped")
+                return result
+
+            # Skip non-HTTP URLs
+            if parsed.scheme not in ("http", "https"):
+                return result
+
+            # URL points to raw IP (not a domain) — mildly suspicious
+            try:
+                ipaddress.ip_address(hostname)
+                result["flags"].append("raw_ip_url")
+                result["score"] += 5
+            except ValueError:
+                pass
+
+            req_timeout = aiohttp.ClientTimeout(total=timeout)
+            async with session.get(url, timeout=req_timeout, allow_redirects=True,
+                                   max_redirects=10,
+                                   headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                result["status"] = resp.status
+
+                # Track redirect chain
+                if resp.history:
+                    result["redirects"] = [str(r.url) for r in resp.history]
+                    orig_domain = parsed.hostname or ""
+                    final_domain = resp.url.host or ""
+                    if orig_domain and final_domain and orig_domain != final_domain:
+                        # CDN redirects are infrastructure, not suspicious — every site
+                        # behind Cloudflare/CloudFront/Akamai does this
+                        _CDN_DOMAINS = {"cloudflare.com", "cloudfront.net", "akamai.net",
+                                        "akamaiedge.net", "akamaized.net",
+                                        "fastly.net", "cdn.cloudflare.com",
+                                        "azureedge.net", "cloudflare-dns.com",
+                                        "awsglobalaccelerator.com"}
+                        final_lower = final_domain.lower()
+                        is_cdn_redirect = any(
+                            final_lower == cdn or final_lower.endswith("." + cdn)
+                            for cdn in _CDN_DOMAINS
+                        )
+                        if not is_cdn_redirect:
+                            result["flags"].append(f"cross_domain_redirect:{orig_domain}->{final_domain}")
+                            result["score"] += 5
+
+                ct = resp.content_type or ""
+                result["content_type"] = ct
+                content_length = resp.content_length or 0
+
+                # Content-Disposition: attachment = file download
+                cd = resp.headers.get("Content-Disposition", "")
+                is_download = "attachment" in cd.lower()
+
+                # Binary/download content type
+                is_binary = ct in _DOWNLOAD_CONTENT_TYPES
+                if is_binary:
+                    result["flags"].append(f"serves_download:{ct}")
+                    result["score"] += 10
+                if is_download:
+                    result["flags"].append("download_attachment")
+                    result["score"] += 8
+
+                # If this URL serves a downloadable file, save it
+                if (is_binary or is_download) and drop_dir and content_length < MAX_DOWNLOAD_SIZE:
+                    # Extract filename from Content-Disposition or URL
+                    dl_name = None
+                    if cd:
+                        fn_match = re.search(r'filename[*]?=["\']?([^"\';\r\n]+)', cd)
+                        if fn_match:
+                            dl_name = fn_match.group(1).strip()
+                    if not dl_name:
+                        dl_name = Path(_urlparse.urlparse(str(resp.url)).path).name or "downloaded_file"
+                    dl_name = re.sub(r'[^\w.\-]', '_', dl_name)[:80]
+                    dl_path_url = drop_dir / dl_name
+
+                    body_bytes = b""
+                    async for chunk in resp.content.iter_chunked(8192):
+                        body_bytes += chunk
+                        if len(body_bytes) > MAX_DOWNLOAD_SIZE:
+                            result["flags"].append("oversized_download")
+                            break
+
+                    if len(body_bytes) <= MAX_DOWNLOAD_SIZE and body_bytes:
+                        dl_path_url.write_bytes(body_bytes)
+                        result["downloaded_path"] = str(dl_path_url)
+                        result["flags"].append(f"file_downloaded:{dl_name}({len(body_bytes)} bytes)")
+                        result["score"] += 5
+                        log.info(f"[{scan_id}] URL dropped file: {dl_name} ({len(body_bytes)} bytes) from {url[:60]}")
+                else:
+                    # Read text body for analysis (max 32KB)
+                    body_bytes = await resp.content.read(32768)
+                    body = ""
+                    try:
+                        body = body_bytes.decode("utf-8", errors="replace")
+                    except Exception:
+                        pass
+
+                    if body:
+                        # Check for suspicious patterns in body
+                        for pattern, flag_name, flag_score in _SUSPICIOUS_BODY_PATTERNS:
+                            if pattern.search(body):
+                                result["flags"].append(flag_name)
+                                result["score"] += flag_score
+
+                        # Check if body looks like a C2 config endpoint — requires
+                        # MULTIPLE threat-specific keys, not just generic API fields.
+                        # "url" and "host" alone are in every REST API response.
+                        if ct and ("json" in ct or "text/plain" in ct):
+                            _c2_keys_found = sum(1 for kw in [
+                                "webhook", "c2", "exfil", "payload", "inject",
+                                "rat", "stealer", "token", "botnet", "miner",
+                            ] if re.search(rf'"{kw}"\s*:', body, re.I))
+                            if _c2_keys_found >= 2:
+                                result["flags"].append("config_endpoint")
+                                result["score"] += 10
+                            elif _c2_keys_found == 1:
+                                result["flags"].append("config_endpoint_weak")
+                                result["score"] += 3
+
+                        # Detect "raw content" pages — minimal pages that just serve
+                        # a URL, config, code, or command. Catches pastebins, custom
+                        # C2 pages, and any site that's basically just serving raw data.
+                        # Skip Cloudflare challenge/protection pages which are small HTML
+                        # with JS but are not malicious.
+                        is_html = ct and "html" in ct
+                        visible_text = re.sub(r'<[^>]+>', ' ', body).strip()
+                        visible_text = re.sub(r'\s+', ' ', visible_text).strip()
+                        is_cloudflare = ("cloudflare" in body.lower()
+                                         or "cf-browser-verification" in body.lower()
+                                         or "challenges.cloudflare.com" in body.lower()
+                                         or resp.headers.get("server", "").lower() == "cloudflare")
+                        # Non-HTML with < 200 chars OR HTML with < 100 chars visible = raw content
+                        # But skip Cloudflare protection pages
+                        is_raw = (
+                            not is_cloudflare
+                            and ((not is_html and len(visible_text) < 200)
+                                 or (is_html and len(visible_text) < 100))
+                        )
+                        if is_raw:
+                            # Check if it's mostly a URL
+                            text_urls = re.findall(r'https?://[^\s]+', visible_text)
+                            if text_urls:
+                                for tu in text_urls[:3]:
+                                    result["discovered_urls"].append(tu.rstrip('.,;)'))
+                                result["flags"].append(f"raw_content_page:{len(text_urls)} URL(s)")
+                                result["score"] += 8
+                            # Check if it looks like shell code/commands (not just any code)
+                            if re.search(r'(?:exec\(|system\(|cmd\.exe|powershell|/bin/(?:sh|bash)|wget |curl .*-[oO])', visible_text, re.I):
+                                result["flags"].append("raw_code_page")
+                                result["score"] += 10
+                            # Check if it's a C2-style config (needs multiple threat indicators)
+                            _raw_threat_kw = sum(1 for kw in ["webhook", "token", "c2", "payload", "inject", "exfil"]
+                                                 if kw in visible_text.lower())
+                            if _raw_threat_kw >= 2:
+                                result["flags"].append("raw_config_page")
+                                result["score"] += 10
+
+                        # Check if body is a redirect page pointing to another URL
+                        meta_refresh = re.search(
+                            r'<meta[^>]*http-equiv=["\']?refresh[^>]*url=(["\']?)(https?://\S+)',
+                            body, re.I)
+                        if meta_refresh:
+                            redirect_url = meta_refresh.group(2).rstrip('"\'>')
+                            result["flags"].append(f"meta_redirect:{redirect_url[:80]}")
+                            result["score"] += 5
+                            result["discovered_urls"].append(redirect_url)
+
+                        # Extract URLs from response body — only follow suspicious ones
+                        # Skip ad/tracking/analytics domains that appear in page content
+                        _NOISE_URL_PATTERNS = {
+                            # Ad networks and tracking
+                            "googleads", "googlesyndication", "doubleclick", "google-analytics",
+                            "googletagmanager", "facebook.com/tr", "facebook.net",
+                            "analytics", "adsystem", "adserver", "adform", "adsense",
+                            "amazon-adsystem", "criteo", "outbrain", "taboola",
+                            "hotjar", "hubspot", "optimizely", "segment.io",
+                            "cloudflareinsights",
+                            # CDNs and static assets
+                            "cdn.jsdelivr", "cdnjs.cloudflare",
+                            "fonts.googleapis", "fonts.gstatic", "jquery", "bootstrap",
+                            # CMS noise
+                            "wp-content/plugins", "wp-includes", "gravatar",
+                            # Navigation/legal/social boilerplate
+                            "/terms", "/privacy", "/tos", "/cookie", "/legal",
+                            "/about", "/contact", "/faq", "/help",
+                            "/login", "/signup", "/register", "/account",
+                            "twitter.com/share", "facebook.com/share",
+                            "linkedin.com/share", "pinterest.com/pin",
+                            "/rss", "/feed", "/sitemap",
+                        }
+                        body_urls = re.findall(r'https?://[^\s"\'<>]+', body)
+                        for bu in body_urls[:10]:
+                            bu = bu.rstrip('.,;)\'\"')
+                            bu_lower = bu.lower()
+                            # Skip ad/tracking/CDN/navigation URLs
+                            if any(noise in bu_lower for noise in _NOISE_URL_PATTERNS):
+                                continue
+                            # Skip static assets (css, js, images, fonts)
+                            if re.search(r'\.(css|js|png|jpg|jpeg|gif|svg|woff|ttf|ico)(\?|$)', bu_lower):
+                                continue
+                            # Only follow URLs that look like downloads or payloads
+                            if any(x in bu_lower for x in [
+                                ".exe", ".dll", ".bat", ".ps1",
+                                ".bin", ".scr", ".vbs",
+                                "payload", "drop", "webhook",
+                                "paste",
+                            ]):
+                                result["discovered_urls"].append(bu)
+                                result["flags"].append(f"suspicious_link:{bu[:60]}")
+                                result["score"] += 5
+
+        except asyncio.TimeoutError:
+            result["error"] = "timeout"
+        except aiohttp.ClientError as e:
+            result["error"] = str(e)[:80]
+        except Exception as e:
+            result["error"] = f"{type(e).__name__}: {str(e)[:60]}"
+
+        # Cap per-URL score so one noisy site can't dominate
+        result["score"] = min(result["score"], 20)
+        return result
+
+    # Run URL checks concurrently (max 5 at a time)
+    sem = asyncio.Semaphore(5)
+
+    async def _limited_check(url):
+        async with sem:
+            return await _check_url(url)
+
+    tasks = [_limited_check(u) for u in unique_urls]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for r in results:
+        if isinstance(r, Exception):
+            continue
+        details.append(r)
+        if r.get("flags"):
+            for flag in r["flags"]:
+                findings.append(f"URL `{r['url'][:60]}`: {flag}")
+            total_score += r.get("score", 0)
+        if r.get("downloaded_path"):
+            downloaded_files.append(r["downloaded_path"])
+        if r.get("discovered_urls"):
+            discovered_urls.extend(r["discovered_urls"])
+
+    # Recursively analyze discovered URLs (max depth 2)
+    if discovered_urls and depth < 2:
+        new_urls = [u for u in discovered_urls if u not in seen]
+        if new_urls:
+            log.info(f"[{scan_id}] Following {len(new_urls)} discovered URL(s) (depth={depth + 1})")
+            sub_result = await analyze_urls(
+                new_urls, session, scan_id, max_urls=5, timeout=timeout,
+                work_dir=work_dir, depth=depth + 1,
+            )
+            findings.extend(sub_result["findings"])
+            total_score += sub_result["score_adjust"]
+            details.extend(sub_result["details"])
+            downloaded_files.extend(sub_result["downloaded_files"])
+
+    # Log summary
+    flagged = [d for d in details if d.get("flags")]
+    log.info(f"[{scan_id}] URL analysis: {len(unique_urls)} checked, "
+             f"{len(flagged)} flagged, {len(downloaded_files)} file(s) downloaded, "
+             f"score_adjust={total_score}")
+
+    return {
+        "findings": findings,
+        "score_adjust": min(total_score, 40),  # cap at 40
+        "details": details,
+        "downloaded_files": downloaded_files,
+    }
+
+
+# ─── ETH Contract C2 Resolver ────────────────────────────────────────────────
+
+_ETH_RPC_ENDPOINTS = [
+    "https://cloudflare-eth.com",
+    "https://eth.llamarpc.com",
+    "https://rpc.ankr.com/eth",
+    "https://ethereum.publicnode.com",
+    "https://1rpc.io/eth",
+    "https://eth.drpc.org",
+]
+
+
+def _decode_eth_string(hex_data: str) -> str:
+    """Decode an ABI-encoded string from eth_call result."""
+    raw = bytes.fromhex(hex_data[2:])
+    offset = int.from_bytes(raw[0:32], "big")
+    length = int.from_bytes(raw[offset:offset + 32], "big")
+    return raw[offset + 32:offset + 32 + length].decode("utf-8", errors="replace")
+
+
+async def resolve_eth_contracts(eth_addresses: list[str], session: aiohttp.ClientSession,
+                                scan_id: str, work_dir: str = None) -> dict:
+    """Try to resolve ETH contract addresses to C2 domains/URLs.
+
+    Some malware (e.g. Weedhack/EtherHiding) stores C2 domain in an ETH smart
+    contract so it can be updated without changing the malware binary.
+
+    Returns dict with:
+        findings: list of human-readable findings
+        resolved: dict mapping contract -> resolved data
+        urls_found: list of URLs discovered from contracts
+        score_adjust: int score adjustment
+    """
+    if not eth_addresses:
+        return {"findings": [], "resolved": {}, "urls_found": [], "score_adjust": 0}
+
+    findings = []
+    resolved = {}
+    urls_found = []
+    total_score = 0
+
+    # Common function selectors for reading string data from contracts
+    # 0xce6d41de = common getter seen in Weedhack
+    # 0x06fdde03 = name()
+    # 0x95d89b41 = symbol()
+    selectors = ["0xce6d41de", "0x06fdde03"]
+
+    for contract in eth_addresses[:5]:  # Limit to 5 contracts
+        if not contract.startswith("0x") or len(contract) != 42:
+            continue
+
+        for rpc_url in _ETH_RPC_ENDPOINTS:
+            try:
+                payload = {
+                    "jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                    "params": [{"to": contract, "data": selectors[0]}, "latest"],
+                }
+                req_timeout = aiohttp.ClientTimeout(total=8)
+                async with session.post(rpc_url, json=payload, timeout=req_timeout) as resp:
+                    data = await resp.json()
+                    result_hex = data.get("result", "")
+
+                    if result_hex and result_hex != "0x" and len(result_hex) > 66:
+                        decoded = _decode_eth_string(result_hex)
+                        if decoded.strip():
+                            log.info(f"[{scan_id}] ETH contract {contract[:10]}... resolved: {decoded[:100]}")
+                            resolved[contract] = decoded
+                            findings.append(f"ETH contract `{contract[:10]}...` resolves to: `{decoded[:100]}`")
+                            total_score += 20  # Contract resolving to data = C2 infrastructure
+
+                            # Extract URLs from resolved data
+                            found_urls = re.findall(r"https?://[^\s|\"'<>]+", decoded)
+                            for u in found_urls:
+                                urls_found.append(u)
+                                findings.append(f"C2 URL from ETH contract: `{u[:80]}`")
+                                total_score += 10
+
+                            # Check for pipe-separated data (Weedhack pattern: domain|data)
+                            if "|" in decoded:
+                                parts = decoded.split("|")
+                                findings.append(f"Contract data has {len(parts)} pipe-separated fields (C2 config pattern)")
+                                total_score += 5
+                            break  # Got data, no need to try more RPCs
+            except Exception as e:
+                log.debug(f"[{scan_id}] ETH RPC {rpc_url} failed for {contract[:10]}...: {e}")
+                continue
+
+    if resolved:
+        log.info(f"[{scan_id}] ETH resolution: {len(resolved)} contract(s) resolved, "
+                 f"{len(urls_found)} URL(s) found, score_adjust={total_score}")
+
+        # If we found C2 URLs from contracts, analyze them too
+        if urls_found and session:
+            url_analysis = await analyze_urls(
+                urls_found, session, scan_id, max_urls=5, timeout=8.0, work_dir=work_dir)
+            findings.extend(url_analysis["findings"])
+            total_score += url_analysis["score_adjust"]
+
+    return {
+        "findings": findings,
+        "resolved": resolved,
+        "urls_found": urls_found,
+        "score_adjust": min(total_score, 50),  # cap at 50
+    }
 
 
 # ─── VirusTotal ──────────────────────────────────────────────────────────────
@@ -2601,10 +3109,12 @@ def compute_risk_score(
 ) -> tuple[int, str, int]:
     """Returns (score, level, color_int)."""
     score = 0
+    is_minecraft_mod = bool(iocs and iocs.get("modLoaders"))
 
     if iocs:
         variant = (iocs.get("variant") or "").lower()
         markers = iocs.get("behavioralMarkers", [])
+        mod_loaders = iocs.get("modLoaders", [])
 
         if variant in HIGH_RISK_VARIANTS:
             score += 40
@@ -2615,7 +3125,34 @@ def compute_risk_score(
             score += 15
         if iocs.get("exfilUrl") or iocs.get("stage2Url"):
             score += 5
-        if iocs.get("urls") and len(iocs["urls"]) > 3:
+        # URL scoring: URLs alone are not suspicious — many legitimate mods/apps embed
+        # URLs for APIs, resources, documentation, etc. Only score URLs when combined
+        # with other threat signals (C2, exfil, webhooks, dangerous API calls).
+        has_threat_context = bool(
+            iocs.get("c2Base") or iocs.get("ethContract") or iocs.get("contracts")
+            or iocs.get("exfilUrl") or iocs.get("stage2Url")
+            or any("webhook" in k.lower() and iocs[k] for k in iocs)
+            or any("HIGH RISK" in m for m in markers)
+        )
+        # For non-mod JARs, Runtime.exec etc. in any marker = threat context.
+        # For Minecraft mods, bytecode API refs are constant pool hits — they fire
+        # when the class merely references Runtime/ProcessBuilder in its constant pool,
+        # not necessarily calling them. Only count as threat context if the marker is
+        # NOT a bytecode ref (i.e., from decompiled source pattern matching).
+        if not has_threat_context:
+            dangerous_api_markers = [m for m in markers if any(x in m for x in [
+                "Runtime.exec", "ProcessBuilder", "defineClass", "URLClassLoader",
+            ])]
+            if is_minecraft_mod:
+                # Only source-level (non-bytecode-ref) dangerous API calls count
+                source_level_dangerous = [m for m in dangerous_api_markers
+                                          if not m.startswith("Bytecode API ref:")]
+                if source_level_dangerous:
+                    has_threat_context = True
+            elif dangerous_api_markers:
+                has_threat_context = True
+
+        if iocs.get("urls") and len(iocs["urls"]) > 3 and has_threat_context:
             score += 10
 
         webhook_keys = [k for k in iocs if "webhook" in k.lower() and iocs[k]]
@@ -2625,9 +3162,33 @@ def compute_risk_score(
         high_risk_markers = [m for m in markers if "HIGH RISK" in m]
         score += min(len(high_risk_markers) * 5, 15)
 
+        # Markers that are expected/normal in Minecraft mods — don't count toward score
+        # These fire on legitimate Fabric/Forge mods that need session data for auth,
+        # JNDI for SRV resolution, ClassLoaders for protocol translation, etc.
+        _MOD_EXPECTED_PATTERNS = [
+            "Fabric session accessor",   # Session tokens needed for protocol translation auth
+            "Fabric session get",         # Raw bytecode version of session accessor
+            "JNDI naming API",            # SRV record DNS resolution
+            "JNDI API reference",         # Same
+            "Directory context access",   # javax.naming.directory.DirContext for SRV
+            "DNS lookup API",             # SRV resolution
+            "Custom ClassLoader",         # Protocol translation, Mixin framework
+            "Reflection-based class loading",  # Mixin compat
+            "Reflection method invocation",    # Event bus systems (method.invoke)
+            "Reflection declared method",      # getDeclaredMethods for event scanning
+            "Thread.sleep in suspicious context",  # Normal for async mod code
+            "Scheduled execution",         # ScheduledExecutorService for periodic tasks
+            "Timer-based delayed execution",   # java.util.Timer for scheduled work
+            "GitHub raw payload hosting",  # Mods hosting resources/configs on GitHub
+        ]
+
+        # Filter out non-suspicious markers: skip URL markers and benign bytecode refs
         non_library_markers = [
             m for m in markers
-            if m not in high_risk_markers and (
+            if m not in high_risk_markers
+            and not m.startswith("Constant pool URL:")  # URLs scored separately above
+            and not m.startswith("invokedynamic dispatch:")  # normal Java feature
+            and (
                 not m.startswith("Bytecode API ref:")
                 or (
                     "[LIB]" not in m  # Skip library-origin bytecode refs
@@ -2638,6 +3199,18 @@ def compute_risk_score(
                 )
             )
         ]
+
+        # For Minecraft mods, additionally filter out expected mod patterns and
+        # bytecode-level API refs (constant pool hits, not actual method calls)
+        if is_minecraft_mod:
+            non_library_markers = [
+                m for m in non_library_markers
+                if not any(pat in m for pat in _MOD_EXPECTED_PATTERNS)
+                and not (m.startswith("Bytecode API ref:") and any(x in m for x in [
+                    "Runtime.exec", "ProcessBuilder", "System.load",
+                ]))
+            ]
+
         score += min(len(non_library_markers), 8)
 
         # Persistence indicators (LOCALAPPDATA paths, scheduled tasks, Python droppers)
@@ -2685,9 +3258,17 @@ def compute_risk_score(
         score += min(generic_obfs * 2, 6)
 
     # entropy — moderate weight; obfuscated but legitimate code often has high entropy
+    # Filter out embedded JARs/ZIPs from suspicious entries — compressed archives
+    # naturally have very high entropy (>7.8) and are not suspicious
     if entropy:
-        if entropy.get("suspicious_entries"):
-            score += min(len(entropy["suspicious_entries"]) * 2, 6)
+        real_suspicious = [
+            e for e in entropy.get("suspicious_entries", [])
+            if not any(e.get("name", "").lower().endswith(ext)
+                       for ext in (".jar", ".zip", ".gz", ".xz", ".lzma", ".so", ".dll",
+                                   ".png", ".jpg", ".jpeg", ".gif", ".ogg", ".wav"))
+        ]
+        if real_suspicious:
+            score += min(len(real_suspicious) * 2, 6)
         if entropy.get("max_class_entropy", 0) > 7.5:
             score += 3
 
@@ -2709,9 +3290,17 @@ def compute_risk_score(
     if has_webhooks and has_launcher_accounts:
         score += 15
 
-    # manifest — reduced weight for Mixin-related keys (Premain-Class, Can-Redefine-Classes)
+    # manifest — reduced weight for Mixin-related keys
+    # Fabric/Forge mods using Mixin framework require Premain-Class, Can-Redefine-Classes,
+    # Can-Retransform-Classes in their manifest — filter these for recognized mods
+    _MIXIN_MANIFEST_PREFIXES = ("Premain-Class:", "Can-Redefine-Classes:", "Can-Retransform-Classes:")
     if manifest and manifest.get("suspicious_keys"):
-        score += min(len(manifest["suspicious_keys"]) * 2, 8)
+        if is_minecraft_mod:
+            non_mixin_keys = [k for k in manifest["suspicious_keys"]
+                              if not any(k.startswith(p) for p in _MIXIN_MANIFEST_PREFIXES)]
+            score += min(len(non_mixin_keys) * 2, 8)
+        else:
+            score += min(len(manifest["suspicious_keys"]) * 2, 8)
 
     # Multi-format analysis scoring
     if format_analysis:
@@ -2823,6 +3412,41 @@ def compute_risk_score(
             score = 61
 
     score = min(score, 100)
+
+    # Debug: always log score breakdown for non-zero scores
+    if score > 0:
+        _parts = [f"mod={is_minecraft_mod}"]
+        if iocs:
+            _parts.append(f"markers={len(iocs.get('behavioralMarkers',[]))}")
+        if vt and vt.get('total', 0) > 0:
+            _parts.append(f"vt={vt['detected']}/{vt['total']}")
+        if mb_result and mb_result.get("status") == "found":
+            _parts.append("mb=found")
+        if ha_result and ha_result.get("threat_score") is not None:
+            _parts.append(f"ha={ha_result['threat_score']}")
+        if yara_matches:
+            _parts.append(f"yara={len(yara_matches)}")
+        if obfuscators:
+            _parts.append(f"obf={len(obfuscators)}")
+        if entropy:
+            real_susp = [e for e in entropy.get("suspicious_entries", [])
+                         if not any(e.get("name", "").lower().endswith(ext)
+                                    for ext in (".jar", ".zip", ".gz", ".xz", ".lzma", ".so", ".dll",
+                                                ".png", ".jpg", ".jpeg", ".gif", ".ogg", ".wav"))]
+            if real_susp:
+                _parts.append(f"entropy_real={len(real_susp)}")
+            _parts.append(f"entropy_raw={len(entropy.get('suspicious_entries', []))}")
+            if entropy.get("max_class_entropy", 0) > 7.5:
+                _parts.append(f"entropy_max={entropy['max_class_entropy']}")
+        if extracted_strings:
+            for k in ("discord_webhooks", "discord_tokens", "eth_addresses"):
+                if extracted_strings.get(k):
+                    _parts.append(f"str_{k}={len(extracted_strings[k])}")
+        if manifest and manifest.get("suspicious_keys"):
+            _parts.append(f"manifest={len(manifest['suspicious_keys'])}keys")
+        if format_analysis:
+            _parts.append(f"format={format_analysis.get('type','?')}")
+        log.info(f"[SCORE] base={score}: {', '.join(_parts)}")
 
     if score <= DETECTION_THRESHOLD:
         return score, "LOW", 0x2ECC71
@@ -3075,6 +3699,9 @@ def build_embeds(
     format_analysis: dict = None,
     deobfuscation: dict = None,
     mb_result: dict = None,
+    approved_exception: bool = False,
+    url_analysis: dict = None,
+    eth_analysis: dict = None,
 ) -> list[discord.Embed]:
     embeds = []
     emoji = LEVEL_EMOJI.get(level, "")
@@ -3095,11 +3722,19 @@ def build_embeds(
         scan_steps.append("not found in MalwareBazaar")
     scan_desc = "Analyzed: " + ", ".join(scan_steps) + "."
 
-    e = discord.Embed(
-        title=f"{emoji} Scan Results: {filename[:70]}",
-        color=color,
-        timestamp=datetime.now(timezone.utc),
-    )
+    # Override title/color for approved exceptions
+    if approved_exception:
+        e = discord.Embed(
+            title=f"\u2705 Proven Safe: {filename[:70]}",
+            color=0x2ECC71,
+            timestamp=datetime.now(timezone.utc),
+        )
+    else:
+        e = discord.Embed(
+            title=f"{emoji} Scan Results: {filename[:70]}",
+            color=color,
+            timestamp=datetime.now(timezone.utc),
+        )
 
     # ── Plain-language summary at the top ──
     variant_raw = ""
@@ -3107,6 +3742,9 @@ def build_embeds(
         variant_raw = (iocs.get("variant") or "").lower()
     summary = _build_plain_summary(score, level, variant_raw, iocs, vt, yara_matches,
                                    extracted_strings, mb_result)
+    if approved_exception:
+        summary = ("\u2705 **This file is on the approved exceptions list and has been verified as safe.**\n"
+                   "*Full analysis shown below for transparency.*\n\n" + summary)
     e.description = summary
 
     # risk score with context
@@ -3327,6 +3965,37 @@ def build_embeds(
     if extracted_strings and extracted_strings.get("eth_addresses"):
         eth_text = "\n".join(f"`{a}`" for a in extracted_strings["eth_addresses"][:5])
         e.add_field(name="\U0001F4B0 Ethereum Addresses", value=eth_text, inline=False)
+
+    # ETH contract resolution results
+    if eth_analysis and eth_analysis.get("findings"):
+        eth_lines = []
+        for f in eth_analysis["findings"][:8]:
+            eth_lines.append(f"\U0001F6A8 {f}")
+        e.add_field(
+            name="\u26D3 ETH Contract Resolution",
+            value=_trunc("\n".join(eth_lines)),
+            inline=False,
+        )
+
+    # URL content analysis results
+    if url_analysis and url_analysis.get("findings"):
+        url_a_lines = []
+        for f in url_analysis["findings"][:10]:
+            url_a_lines.append(f"\u2022 {f}")
+        e.add_field(
+            name="\U0001F50D URL Analysis",
+            value=_trunc("\n".join(url_a_lines)),
+            inline=False,
+        )
+    elif url_analysis and not url_analysis.get("findings"):
+        # All URLs checked out clean — show that
+        checked = len(url_analysis.get("details", []))
+        if checked > 0:
+            e.add_field(
+                name="\U0001F50D URL Analysis",
+                value=f"Checked {checked} URL(s) — all returned normal web content, no suspicious redirects or downloads.",
+                inline=False,
+            )
 
     # behavioral markers — split into threats vs informational
     marker_details = {}
@@ -4711,7 +5380,7 @@ def _is_blocked_ip(ip_str: str) -> Optional[str]:
     try:
         addr = ipaddress.ip_address(ip_str)
     except ValueError:
-        return "Invalid IP address"
+        return None  # Not an IP address (it's a domain) — not blocked
     if addr.is_loopback:
         return "Loopback address"
     if addr.is_private:
@@ -5827,7 +6496,6 @@ def _start_scraper(channel=None):
     async def _scrape_loop():
         global _scrape_runner
         runner = _scrape_runner
-        batch_num = 0
         status_msg = None  # Single Discord message we edit with live updates
         session_start = time.time()
 
@@ -5866,33 +6534,97 @@ def _start_scraper(channel=None):
             except Exception:
                 pass
 
-        def _build_status(phase="scanning", batch_scanned=0, batch_total=0, rate=0):
+        def _build_status(phase="scanning"):
             s = runner.stats
             elapsed = time.time() - session_start
             elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m"
             overall_rate = s['scanned'] / (elapsed / 3600) if elapsed > 60 else 0
             lines = [
                 f"**Scraper Status** ({elapsed_str} elapsed)",
-                f"Batch {batch_num}: {phase}",
+                f"Phase: {phase}",
             ]
-            if phase == "scanning" and batch_total > 0:
-                lines.append(f"Progress: {batch_scanned}/{batch_total} scanned")
             if overall_rate > 0:
                 lines.append(f"Rate: **{overall_rate:.0f} mods/hr** avg")
-            lines.append(f"**Totals:** {s['downloaded']} downloaded | {s['scanned']} scanned | {s['errors']} errors")
+            q_size = scan_queue.qsize() if scan_queue else 0
+            lines.append(f"Queued: {q_size} | Downloaded: {s['downloaded']} | Scanned: {s['scanned']} | Errors: {s['errors']}")
             return "\n".join(lines)
+
+        # Pipeline: producer downloads into queue, consumers scan from queue
+        SCAN_QUEUE_MAX = 20
+        scan_queue: asyncio.Queue = asyncio.Queue(maxsize=SCAN_QUEUE_MAX)
+        max_concurrent = CFG["scanner"].get("max_concurrent_scans", 6)
+        last_status_update = [0.0]
+
+        async def _scan_worker():
+            """Consumer: pull mods from queue and scan them."""
+            while True:
+                item = await scan_queue.get()
+                if item is None:  # Poison pill = shutdown
+                    scan_queue.task_done()
+                    break
+                jar_path, mod_name, source = item
+                try:
+                    # Wait if paused for user scans
+                    if _scrape_pause:
+                        await _scrape_pause.wait_if_paused()
+                    if runner.stopped:
+                        scan_queue.task_done()
+                        continue
+                    scan_id = f"scrape_{uuid.uuid4().hex[:8]}"
+                    log.info(f"[scraper] Scanning: {mod_name} ({jar_path.name})")
+                    await run_scan(
+                        ctx=None,
+                        attachment=None,
+                        url=None,
+                        scan_id=scan_id,
+                        local_file=str(jar_path),
+                        private=True,
+                        silent=True,
+                        skip_nested=True,
+                        fast=True,
+                    )
+                    runner.stats["scanned"] += 1
+                    now = time.time()
+                    if now - last_status_update[0] >= 10:
+                        last_status_update[0] = now
+                        await _update_status(_build_status("downloading + scanning"))
+                except asyncio.CancelledError:
+                    log.warning(f"[scraper] Scan cancelled: {mod_name}")
+                except Exception as e:
+                    log.warning(f"[scraper] Scan error {mod_name}: {e}")
+                finally:
+                    try:
+                        jar_path.unlink(missing_ok=True)
+                        if jar_path.parent.exists() and not any(jar_path.parent.iterdir()):
+                            jar_path.parent.rmdir()
+                    except Exception:
+                        pass
+                    log_name = derive_log_dir_name(str(jar_path))
+                    scan_log_dir = MASTER_DIR / "logs" / log_name
+                    if scan_log_dir.exists():
+                        for subdir in ["source", "main"]:
+                            p = scan_log_dir / subdir
+                            if p.is_dir():
+                                shutil.rmtree(p, ignore_errors=True)
+                    scan_queue.task_done()
 
         try:
             conn = aiohttp.TCPConnector(limit=20, limit_per_host=5)
             async with aiohttp.ClientSession(connector=conn) as session:
+                # Start scan worker pool
+                workers = [asyncio.create_task(_scan_worker()) for _ in range(max_concurrent)]
+
+                log.info(f"[scraper] Scrape loop started (pipeline mode: {max_concurrent} scan workers, queue max {SCAN_QUEUE_MAX})")
+
+                batch_num = 0
                 while not runner.stopped:
                     # Wait if paused for user scans
                     if _scrape_pause and _scrape_pause.is_paused:
-                        await _update_status(_build_status(phase="**paused** (user scan in progress)"))
+                        await _update_status(_build_status("**paused** (user scan in progress)"))
                         await _scrape_pause.wait_if_paused()
                         if runner.stopped:
                             break
-                        continue  # Re-check pause state and loop condition
+                        continue
 
                     # Check disk space
                     free_gb = _get_free_space_gb()
@@ -5903,7 +6635,7 @@ def _start_scraper(channel=None):
 
                     batch_num += 1
                     log.info(f"[scraper] Batch {batch_num}: collecting {runner.batch_size} mods... ({free_gb:.1f} GB free)")
-                    await _update_status(_build_status(phase="collecting mods..."))
+                    await _update_status(_build_status(f"batch {batch_num}: collecting mods..."))
 
                     try:
                         batch = await runner.collect_batch(session)
@@ -5916,74 +6648,22 @@ def _start_scraper(channel=None):
                         log.info("[scraper] No more mods to download. Stopping.")
                         break
 
-                    log.info(f"[scraper] Batch {batch_num}: downloaded {len(batch)} JARs, scanning...")
+                    log.info(f"[scraper] Batch {batch_num}: feeding {len(batch)} JARs to scan queue...")
 
-                    max_concurrent = CFG["scanner"].get("max_concurrent_scans", 6)
-                    sem = asyncio.Semaphore(max_concurrent)
-                    batch_start = time.time()
-                    batch_scanned = 0
-                    batch_total = len(batch)
-                    last_status_update = 0.0
-
-                    async def _scan_one(jar_path, mod_name, source):
-                        nonlocal batch_scanned, last_status_update
-                        async with sem:
-                            # Wait if paused for user scans (inside sem so we recheck after unpause)
-                            if _scrape_pause:
-                                await _scrape_pause.wait_if_paused()
-                            if runner.stopped:
-                                return
-                            try:
-                                scan_id = f"scrape_{uuid.uuid4().hex[:8]}"
-                                log.info(f"[scraper] Scanning: {mod_name} ({jar_path.name})")
-                                await run_scan(
-                                    ctx=None,
-                                    attachment=None,
-                                    url=None,
-                                    scan_id=scan_id,
-                                    local_file=str(jar_path),
-                                    private=True,
-                                    silent=True,
-                                    skip_nested=True,
-                                    fast=True,
-                                )
-                                runner.stats["scanned"] += 1
-                                batch_scanned += 1
-                                now = time.time()
-                                if now - last_status_update >= 10:
-                                    last_status_update = now
-                                    elapsed_batch = now - batch_start
-                                    rate = batch_scanned / (elapsed_batch / 3600) if elapsed_batch > 0 else 0
-                                    await _update_status(_build_status("scanning", batch_scanned, batch_total, rate))
-                            except Exception as e:
-                                log.warning(f"[scraper] Scan error {mod_name}: {e}")
-                            finally:
-                                try:
-                                    jar_path.unlink(missing_ok=True)
-                                    if jar_path.parent.exists() and not any(jar_path.parent.iterdir()):
-                                        jar_path.parent.rmdir()
-                                except Exception:
-                                    pass
-                                log_name = derive_log_dir_name(str(jar_path))
-                                scan_log_dir = MASTER_DIR / "logs" / log_name
-                                if scan_log_dir.exists():
-                                    for subdir in ["source", "main"]:
-                                        p = scan_log_dir / subdir
-                                        if p.is_dir():
-                                            shutil.rmtree(p, ignore_errors=True)
-
-                    await asyncio.gather(*[
-                        _scan_one(jar_path, mod_name, source)
-                        for jar_path, mod_name, source in batch
-                    ])
+                    # Feed downloaded mods into scan queue (blocks if queue full = backpressure)
+                    for jar_path, mod_name, source in batch:
+                        if runner.stopped:
+                            break
+                        await scan_queue.put((jar_path, mod_name, source))
 
                     runner.progress.flush()
-                    batch_elapsed = time.time() - batch_start
-                    rate = len(batch) / (batch_elapsed / 3600) if batch_elapsed > 0 else 0
+                    log.info(f"[scraper] Batch {batch_num} queued. Stats: {runner.stats}")
+                    await _update_status(_build_status(f"batch {batch_num} queued"))
 
-                    log.info(f"[scraper] Batch {batch_num} complete in {batch_elapsed:.0f}s "
-                             f"({rate:.0f} mods/hr). Stats: {runner.stats}")
-                    await _update_status(_build_status(f"batch {batch_num} done", batch_total, batch_total, rate))
+                # Drain the queue: send poison pills to shut down workers
+                for _ in workers:
+                    await scan_queue.put(None)
+                await asyncio.gather(*workers, return_exceptions=True)
 
             log.info(f"[scraper] Finished. Final stats: {runner.stats}")
             runner.progress.flush()
@@ -6112,6 +6792,7 @@ async def run_scan(
 
     stage_start_times: dict[str, float] = {}
     stage_details: dict[str, str] = {}
+    is_approved_exception = False
 
     async def update_progress(stages: dict, filename: str, file_size: int, hashes: dict, force: bool = False):
         nonlocal scan_msg
@@ -6185,21 +6866,10 @@ async def run_scan(
             mod_name = sha256[:12]
         log.info(f"[{scan_id}] Downloaded {filename} ({file_size} bytes, SHA256={sha256[:16]}...)")
 
-        # ── Exception check ──
-        if await check_exception(sha256):
-            await safe_send(
-                embed=discord.Embed(
-                    title=f"\u2705 Known Safe: {filename[:70]}",
-                    description=(
-                        f"This file (`{sha256[:16]}...`) is in the **approved exceptions list** and has been verified as safe.\n\n"
-                        f"**SHA-256:** `{sha256}`\n"
-                        f"**Size:** {file_size:,} bytes\n\n"
-                        f"*To remove this exception, edit `exceptions.var` in the bot folder.*"
-                    ),
-                    color=0x2ECC71,
-                )
-            )
-            return
+        # ── Exception check (flag only — full scan still runs) ──
+        is_approved_exception = await check_exception(sha256)
+        if is_approved_exception:
+            log.info(f"[{scan_id}] File is in approved exceptions list — running full analysis with proven-safe badge")
 
         # ── Catalog check ──
         prev_scan = await catalog_lookup(sha256)
@@ -6558,8 +7228,21 @@ async def run_scan(
         for jar in jars_to_scan:
             if scan_id in _cancelled_scans:
                 raise asyncio.CancelledError("Scan cancelled by user")
+            # Scale timeout based on JAR size — give decompilers enough time
+            # Base: 60s fast / 300s normal. Scale: +60s per MB for large JARs.
+            jar_size_mb = os.path.getsize(jar) / (1024 * 1024) if os.path.exists(jar) else 0
+            is_sub_jar = len(jars_to_scan) > 1 and jar != dl_path
+            if fast:
+                sub_timeout = max(60, int(60 + jar_size_mb * 20))
+            elif is_sub_jar:
+                # Sub-JARs get scaled timeout: 180s base + 60s per MB, max 600s
+                sub_timeout = min(600, max(180, int(180 + jar_size_mb * 60)))
+            else:
+                sub_timeout = 0  # Use global scan_timeout_seconds for the main JAR
+            log.info(f"[{scan_id}] Analyzing {os.path.basename(jar)} "
+                     f"({jar_size_mb:.1f}MB, timeout={sub_timeout or 'global'}s)")
             result = await run_jar_analyzer(jar, progress_cb=_jar_progress,
-                                                  timeout_override=60 if fast else 0)
+                                                  timeout_override=sub_timeout)
             if result.get("log_dir"):
                 all_log_dirs.append(result["log_dir"])
             if result.get("iocs"):
@@ -6666,12 +7349,18 @@ async def run_scan(
         # ── YARA (original + all extracted files; fast mode: main file only) ──
         stage_details["Local Analysis"] = "Running YARA rules..."
         await update_progress(stages, filename, file_size, hashes)
-        yara_matches = await run_in_scan_thread(run_yara, dl_path)
+        # YARA scanning with size limits to prevent hangs with 82k+ rules:
+        # Fast/scraper: 2MB limit. Full Discord scan: 10MB limit per file.
+        if fast:
+            yara_matches = await run_in_scan_thread(lambda: run_yara(dl_path, max_size_mb=2.0))
+        else:
+            yara_matches = await run_in_scan_thread(lambda: run_yara(dl_path, max_size_mb=10.0))
         if not fast:
             all_scan_files = jars_to_scan + extracted_files
             for sf in all_scan_files:
                 if sf != dl_path:
-                    yara_matches.extend(await run_in_scan_thread(run_yara, sf))
+                    yara_matches.extend(await run_in_scan_thread(
+                        lambda p=sf: run_yara(p, max_size_mb=5.0)))
         seen_rules = set()
         unique_yara = []
         for m in yara_matches:
@@ -6699,12 +7388,140 @@ async def run_scan(
             for wh_url in all_webhooks:
                 webhook_kills[wh_url] = await kill_webhook(wh_url, http_session)
 
+        # ── URL content analysis + ETH contract resolution (skip in fast/scraper mode) ──
+        url_analysis = None
+        eth_analysis = None
+        if not fast and http_session:
+            # Gather all URLs from IOCs + extracted strings
+            all_urls = []
+            if all_iocs and all_iocs.get("urls"):
+                all_urls.extend(all_iocs["urls"])
+            if extracted_strings and extracted_strings.get("urls"):
+                for u in extracted_strings["urls"]:
+                    if u not in all_urls:
+                        all_urls.append(u)
+
+            if all_urls:
+                stage_details["Local Analysis"] = "Analyzing URLs..."
+                stages["Local Analysis"] = "running"
+                await update_progress(stages, filename, file_size, hashes)
+                url_analysis = await analyze_urls(
+                    all_urls, http_session, scan_id, work_dir=work_dir)
+                stages["Local Analysis"] = "complete"
+                stage_details.pop("Local Analysis", None)
+
+                # Static-analyze any files downloaded from URLs (YARA + strings only, no execution)
+                if url_analysis.get("downloaded_files"):
+                    stage_details["Local Analysis"] = "Analyzing dropped files..."
+                    stages["Local Analysis"] = "running"
+                    await update_progress(stages, filename, file_size, hashes)
+                    for drop_path in url_analysis["downloaded_files"]:
+                        drop_name = os.path.basename(drop_path)
+                        log.info(f"[{scan_id}] Static analysis of URL-dropped file: {drop_name}")
+                        # YARA scan
+                        drop_yara = await run_in_scan_thread(run_yara, drop_path)
+                        if drop_yara:
+                            for ym in drop_yara:
+                                if ym["rule"] not in {m["rule"] for m in yara_matches}:
+                                    yara_matches.append(ym)
+                            url_analysis["findings"].append(
+                                f"Dropped file `{drop_name}`: {len(drop_yara)} YARA rule(s) matched")
+                            url_analysis["score_adjust"] = min(
+                                url_analysis["score_adjust"] + len(drop_yara) * 5, 40)
+                        # String extraction
+                        drop_strings = await run_in_scan_thread(extract_strings, drop_path)
+                        if drop_strings:
+                            if drop_strings.get("discord_webhooks"):
+                                url_analysis["findings"].append(
+                                    f"Dropped file `{drop_name}`: contains Discord webhook(s)")
+                                url_analysis["score_adjust"] = min(
+                                    url_analysis["score_adjust"] + 15, 40)
+                            if drop_strings.get("discord_tokens"):
+                                url_analysis["findings"].append(
+                                    f"Dropped file `{drop_name}`: contains Discord token pattern(s)")
+                                url_analysis["score_adjust"] = min(
+                                    url_analysis["score_adjust"] + 15, 40)
+                        # Format analysis (PE, script, etc.)
+                        drop_fmt = await run_in_scan_thread(analyze_file_format, drop_path)
+                        if drop_fmt and drop_fmt.get("findings"):
+                            url_analysis["findings"].append(
+                                f"Dropped file `{drop_name}` ({drop_fmt.get('type', 'unknown')}): "
+                                f"{len(drop_fmt['findings'])} finding(s)")
+                            # Merge into main format_analysis
+                            if format_analysis is None:
+                                format_analysis = drop_fmt
+                            else:
+                                format_analysis.setdefault("findings", []).append(
+                                    f"--- URL-dropped: `{drop_name}` ---")
+                                format_analysis["findings"].extend(drop_fmt["findings"])
+                    stages["Local Analysis"] = "complete"
+                    stage_details.pop("Local Analysis", None)
+
+            # Resolve ETH contract addresses
+            eth_addresses = []
+            if all_iocs and all_iocs.get("ethContract"):
+                eth_addresses.append(all_iocs["ethContract"])
+            if all_iocs and all_iocs.get("contracts"):
+                eth_addresses.extend(all_iocs["contracts"])
+            if extracted_strings and extracted_strings.get("eth_addresses"):
+                for addr in extracted_strings["eth_addresses"]:
+                    if addr not in eth_addresses:
+                        eth_addresses.append(addr)
+
+            if eth_addresses:
+                stage_details["Local Analysis"] = "Resolving ETH contracts..."
+                stages["Local Analysis"] = "running"
+                await update_progress(stages, filename, file_size, hashes)
+                eth_analysis = await resolve_eth_contracts(
+                    eth_addresses, http_session, scan_id, work_dir=work_dir)
+                stages["Local Analysis"] = "complete"
+                stage_details.pop("Local Analysis", None)
+
+                # If ETH resolution found new URLs, analyze those too
+                if eth_analysis.get("urls_found"):
+                    for u in eth_analysis["urls_found"]:
+                        if u not in all_urls:
+                            all_urls.append(u)
+
         # ── LOCAL-ONLY risk score (no VT/MB/HA yet) ──
         score, level, color = compute_risk_score(
             all_iocs, None, yara_matches, obfuscators,
             entropy, extracted_strings, manifest, format_analysis,
             mb_result=None, ha_result=None,
         )
+        # Apply URL and ETH analysis score adjustments
+        # For recognized Minecraft mods, discount URL analysis score — legitimate mods
+        # commonly reference server lists, APIs, and community sites that may trigger
+        # cross-domain redirect or raw content page flags
+        is_minecraft_mod = bool(all_iocs and all_iocs.get("modLoaders"))
+        if url_analysis:
+            url_adj = url_analysis["score_adjust"]
+            if is_minecraft_mod:
+                # Check for real threat signals before applying full URL score
+                _has_real_threats = bool(all_iocs and (
+                    all_iocs.get("c2Base") or all_iocs.get("ethContract")
+                    or all_iocs.get("exfilUrl") or all_iocs.get("stage2Url")
+                    or any("webhook" in k.lower() and all_iocs[k] for k in all_iocs)
+                ))
+                if not _has_real_threats:
+                    url_adj = url_adj // 3  # Heavy discount for known mods without threat signals
+            score += url_adj
+        if eth_analysis:
+            score += eth_analysis["score_adjust"]
+        score = min(score, 100)
+        # Debug: log full score breakdown including external adjustments
+        _base = score - (url_adj if url_analysis else 0) - (eth_analysis["score_adjust"] if eth_analysis else 0)
+        log.info(f"[{scan_id}] SCORE TRACE: base={_base}, "
+                 f"url_adj={url_adj if url_analysis else 0} (raw={url_analysis['score_adjust'] if url_analysis else 0}), "
+                 f"eth_adj={eth_analysis['score_adjust'] if eth_analysis else 0}, "
+                 f"mod={is_minecraft_mod}, total={score}")
+        # Recalculate level after adjustments
+        if score <= DETECTION_THRESHOLD:
+            level, color = "LOW", 0x2ECC71
+        elif score <= 60:
+            level, color = "MEDIUM", 0xF39C12
+        else:
+            level, color = "HIGH", 0xE74C3C
 
         # ── Update stats ──
         if score > DETECTION_THRESHOLD:
@@ -6810,6 +7627,9 @@ async def run_scan(
             format_analysis=format_analysis,
             deobfuscation=deobfuscation,
             mb_result=None,
+            approved_exception=is_approved_exception,
+            url_analysis=url_analysis,
+            eth_analysis=eth_analysis,
         )
 
         if not is_zip and not format_analysis:
@@ -6861,6 +7681,8 @@ async def run_scan(
 
         # ── Send main results — replace progress embed ──
         scan_header = f"Scan requested by {ctx.author.mention}" if ctx else "Background scan"
+        if is_approved_exception:
+            scan_header += " \u2705 **Approved Exception** — full analysis shown for transparency"
         if private:
             scan_header += " \U0001F512 **Private scan** — no external uploads"
 
@@ -6871,7 +7693,11 @@ async def run_scan(
 
         try:
             if scan_msg:
-                await scan_msg.edit(content=scan_header, embeds=embeds, view=None)
+                try:
+                    await scan_msg.edit(content=scan_header, embeds=embeds, view=None)
+                    log.info(f"[{scan_id}] Final results embed sent ({len(embeds)} embeds)")
+                except Exception as exc:
+                    log.warning(f"[{scan_id}] scan_msg.edit FAILED: {type(exc).__name__}: {exc}")
                 if files_to_send:
                     if private:
                         # Private: send zip as ephemeral DM to the requester
@@ -7010,8 +7836,9 @@ async def run_scan(
                     if vt_result and vt_msg:
                         try:
                             await vt_msg.edit(embed=build_vt_embed(vt_result, primary_sha256, scan_id))
-                        except discord.HTTPException:
-                            pass
+                            log.info(f"[{scan_id}] VT embed updated successfully")
+                        except Exception as exc:
+                            log.warning(f"[{scan_id}] VT embed edit failed: {type(exc).__name__}: {exc}")
                         if vt_result.get("status") == "queued" and vt_msg:
                             _track_poll_task(_poll_vt_completion(primary_sha256, vt_msg, scan_id))
                     # VT Sandbox (depends on VT completing)
@@ -7026,13 +7853,14 @@ async def run_scan(
                         if vt_sb_msg:
                             try:
                                 await vt_sb_msg.edit(embed=build_vt_sandbox_embed(vt_sb, primary_sha256, scan_id))
-                            except discord.HTTPException:
-                                pass
+                                log.info(f"[{scan_id}] VT Sandbox embed updated")
+                            except Exception as exc:
+                                log.warning(f"[{scan_id}] VT Sandbox embed edit failed: {type(exc).__name__}: {exc}")
                     elif vt_sb_msg:
                         try:
                             await vt_sb_msg.edit(embed=build_vt_sandbox_embed(None, primary_sha256, scan_id))
-                        except discord.HTTPException:
-                            pass
+                        except Exception as exc:
+                            log.warning(f"[{scan_id}] VT Sandbox (none) embed edit failed: {type(exc).__name__}: {exc}")
 
                 async def _collect_mb():
                     nonlocal mb_result
@@ -7056,8 +7884,9 @@ async def run_scan(
                     if mb_msg:
                         try:
                             await mb_msg.edit(embed=build_mb_embed(mb_result, primary_sha256, scan_id))
-                        except discord.HTTPException:
-                            pass
+                            log.info(f"[{scan_id}] MB embed updated")
+                        except Exception as exc:
+                            log.warning(f"[{scan_id}] MB embed edit failed: {type(exc).__name__}: {exc}")
 
                 async def _collect_ha():
                     nonlocal ha_result
@@ -7074,8 +7903,9 @@ async def run_scan(
                     if ha_msg:
                         try:
                             await ha_msg.edit(embed=build_ha_embed(ha_result, primary_sha256, scan_id))
-                        except discord.HTTPException:
-                            pass
+                            log.info(f"[{scan_id}] HA embed updated")
+                        except Exception as exc:
+                            log.warning(f"[{scan_id}] HA embed edit failed: {type(exc).__name__}: {exc}")
                         if ha_result and ha_result.get("status") == "submitted" and ha_msg:
                             _track_poll_task(_poll_ha_completion(primary_sha256, ha_msg, scan_id))
 
@@ -7108,6 +7938,28 @@ async def run_scan(
                     entropy, extracted_strings, manifest, format_analysis,
                     mb_result=mb_result, ha_result=ha_result,
                 )
+                # Re-apply URL and ETH adjustments (same logic as initial scoring)
+                _is_mc_mod = bool(all_iocs and all_iocs.get("modLoaders"))
+                if url_analysis:
+                    _url_adj = url_analysis["score_adjust"]
+                    if _is_mc_mod:
+                        _has_threats = bool(all_iocs and (
+                            all_iocs.get("c2Base") or all_iocs.get("ethContract")
+                            or all_iocs.get("exfilUrl") or all_iocs.get("stage2Url")
+                            or any("webhook" in k.lower() and all_iocs[k] for k in all_iocs)
+                        ))
+                        if not _has_threats:
+                            _url_adj = _url_adj // 3
+                    new_score += _url_adj
+                if eth_analysis:
+                    new_score += eth_analysis["score_adjust"]
+                new_score = min(new_score, 100)
+                if new_score <= DETECTION_THRESHOLD:
+                    new_level, new_color = "LOW", 0x2ECC71
+                elif new_score <= 60:
+                    new_level, new_color = "MEDIUM", 0xF39C12
+                else:
+                    new_level, new_color = "HIGH", 0xE74C3C
                 if new_score != score:
                     log.info(f"[{scan_id}] Score updated: {score} -> {new_score} ({level} -> {new_level}) after API results")
                     # Update stats if detection status changed (check BEFORE reassigning)
@@ -7127,6 +7979,8 @@ async def run_scan(
                         nested_count=max(0, len(jars_to_scan) - 1),
                         zip_bomb_warning=zip_bomb_warning, format_analysis=format_analysis,
                         deobfuscation=deobfuscation, mb_result=mb_result,
+                        approved_exception=is_approved_exception,
+                        url_analysis=url_analysis, eth_analysis=eth_analysis,
                     )
                     if scan_msg:
                         try:

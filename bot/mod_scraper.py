@@ -310,12 +310,10 @@ class CurseForgeScraper(BaseScraper):
                     "pageSize": page_size, "index": idx,
                 })
             if not data or not data.get("data"):
-                # API key might be invalid — try web fallback
+                # API key might be invalid — skip web scraping (curl_cffi blocks event loop)
                 if idx == offset:
-                    log.warning("[curseforge] API key rejected, falling back to web scraping")
+                    log.warning("[curseforge] API key rejected, skipping CurseForge (web scraping disabled — blocks event loop)")
                     self._api_key = ""
-                    async for mod in self._iter_mods_web(offset):
-                        yield mod
                 return
             for m in data["data"]:
                 authors = m.get("authors", [])
@@ -339,12 +337,17 @@ class CurseForgeScraper(BaseScraper):
         while True:
             await self._wait()
             try:
-                r = await curl.get(
-                    f"https://www.curseforge.com/minecraft/mc-mods?page={page}&pageSize=20&sortBy=popularity",
-                    timeout=DOWNLOAD_TIMEOUT, allow_redirects=True)
+                r = await asyncio.wait_for(
+                    curl.get(
+                        f"https://www.curseforge.com/minecraft/mc-mods?page={page}&pageSize=20&sortBy=popularity",
+                        timeout=DOWNLOAD_TIMEOUT, allow_redirects=True),
+                    timeout=DOWNLOAD_TIMEOUT + 10)
                 if r.status_code != 200:
                     log.warning(f"[curseforge] Web listing HTTP {r.status_code}")
                     break
+            except asyncio.TimeoutError:
+                log.warning("[curseforge] Web listing timed out (asyncio)")
+                break
             except Exception as e:
                 log.warning(f"[curseforge] Web listing error: {e}")
                 break
@@ -379,12 +382,17 @@ class CurseForgeScraper(BaseScraper):
             return None
         await self._wait()
         try:
-            r = await curl.get(f"https://www.curseforge.com/minecraft/mc-mods/{slug}",
-                               timeout=DOWNLOAD_TIMEOUT, allow_redirects=True)
+            r = await asyncio.wait_for(
+                curl.get(f"https://www.curseforge.com/minecraft/mc-mods/{slug}",
+                         timeout=DOWNLOAD_TIMEOUT, allow_redirects=True),
+                timeout=DOWNLOAD_TIMEOUT + 10)
             if r.status_code != 200:
                 return None
             m = re.search(r'project[_-]?[iI]d[^0-9]*(\d+)', r.text)
             return m.group(1) if m else None
+        except asyncio.TimeoutError:
+            log.warning(f"[curseforge] Project ID fetch timed out: {slug}")
+            return None
         except Exception:
             return None
 
@@ -398,10 +406,12 @@ class CurseForgeScraper(BaseScraper):
             if use_internal:
                 await self._wait()
                 try:
-                    r = await self._curl.get(
-                        f"https://www.curseforge.com/api/v1/mods/{mod.source_id}/files",
-                        params={"pageSize": page_size, "index": idx},
-                        timeout=DOWNLOAD_TIMEOUT)
+                    r = await asyncio.wait_for(
+                        self._curl.get(
+                            f"https://www.curseforge.com/api/v1/mods/{mod.source_id}/files",
+                            params={"pageSize": page_size, "index": idx},
+                            timeout=DOWNLOAD_TIMEOUT),
+                        timeout=DOWNLOAD_TIMEOUT + 10)
                     if r.status_code != 200:
                         break
                     data = {"data": r.json().get("data", [])}
@@ -447,7 +457,9 @@ class CurseForgeScraper(BaseScraper):
         dest.parent.mkdir(parents=True, exist_ok=True)
         for attempt in range(RETRY_COUNT):
             try:
-                r = await curl.get(file_info.url, timeout=DOWNLOAD_TIMEOUT * 2, allow_redirects=True)
+                r = await asyncio.wait_for(
+                    curl.get(file_info.url, timeout=DOWNLOAD_TIMEOUT * 2, allow_redirects=True),
+                    timeout=DOWNLOAD_TIMEOUT * 2 + 10)
                 if r.status_code in (401, 403):
                     log.warning(f"[{self.name}] Auth error {r.status_code}: {file_info.url[:100]}")
                     return False
@@ -485,7 +497,9 @@ class PlanetMinecraftScraper(BaseScraper):
         await self._wait()
         for attempt in range(RETRY_COUNT):
             try:
-                r = await self._curl.get(url, timeout=DOWNLOAD_TIMEOUT, allow_redirects=True)
+                r = await asyncio.wait_for(
+                    self._curl.get(url, timeout=DOWNLOAD_TIMEOUT, allow_redirects=True),
+                    timeout=DOWNLOAD_TIMEOUT + 10)
                 if r.status_code == 200:
                     return r.text
                 if r.status_code in (401, 403):
@@ -580,7 +594,9 @@ class PlanetMinecraftScraper(BaseScraper):
         dest.parent.mkdir(parents=True, exist_ok=True)
         for attempt in range(RETRY_COUNT):
             try:
-                r = await self._curl.get(file_info.url, timeout=DOWNLOAD_TIMEOUT * 2, allow_redirects=True)
+                r = await asyncio.wait_for(
+                    self._curl.get(file_info.url, timeout=DOWNLOAD_TIMEOUT * 2, allow_redirects=True),
+                    timeout=DOWNLOAD_TIMEOUT * 2 + 10)
                 if r.status_code in (401, 403):
                     log.warning(f"[{self.name}] Auth error {r.status_code} downloading: {file_info.url[:100]}")
                     return False

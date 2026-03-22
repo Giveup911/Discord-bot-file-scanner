@@ -20068,3 +20068,100 @@ To approve, add this line to `exceptions.var`:
 9b572605cd278ecda85772f8d05f24f27dbdcb624f272553df431ea07e0b73ab  # ImmediatelyFast-Fabric-1.8.6_1.21.4.jar
 ```
 ---
+
+## ui_utils-1.0.21.21.10.jar — 2026-03-21 15:35 UTC
+- **SHA-256:** `9103dedd5929ce4f9b925050eb2dbdf73dab1c26ed6b7d055f63b2f6444a0346`
+- **File size:** 1,084,872 bytes
+- **Score:** 24/100 (LOW)
+- **URLs found in file:**
+  - `http://localhost`
+  - `http://localhost:`
+  - `http://localhost:5173`
+  - `https://api.mrbreaknfix.com`
+  - `https://api.ui-utils.com/bulletin`
+  - `https://api.ui-utils.com/offline`
+  - `https://api.ui-utils.com/online`
+  - `https://cmd-utils.com`
+  - `https://httpbin.org/post`
+  - `https://localhost`
+- **Hash verification results:**
+  - `https://github.com/TooTallNate/Java-WebSocket/wiki/Lost-connection-detection` — NO MATCH
+    Page hash: `d527eac2999d06fa66e8c33bd8ba3bb8021ead2ca0578e5c7deb7198a2651484`
+  - `https://github.com/TooTallNate/Java-WebSocket/wiki/Lost-connection-detection` — NO MATCH
+    Page hash: `d527eac2999d06fa66e8c33bd8ba3bb8021ead2ca0578e5c7deb7198a2651484`
+- **Recommendation:** Could not verify — hash does not match any published hash
+
+To approve, add this line to `exceptions.var`:
+```
+9103dedd5929ce4f9b925050eb2dbdf73dab1c26ed6b7d055f63b2f6444a0346  # ui_utils-1.0.21.21.10.jar
+```
+---
+
+## SPOILER_spammer.py — 2026-03-21 15:45 UTC
+- **SHA-256:** `f787e84065a96c3ba63bb40599b2547a8ae16437bef394194e3bb209abe2fce3`
+- **File size:** 3,296 bytes
+- **Score:** 20/100 (LOW)
+- **URLs found in file:**
+  - `https://1rpc.io/eth`
+  - `https://api.securerpc.com/v1`
+  - `https://api.zmok.io/mainnet/oaen6dy8ff6hju9k`
+  - `https://cloudflare-eth.com`
+  - `https://core.gashawk.io/rpc`
+  - `https://endpoints.omniatech.io/v1/eth/mainnet/public`
+  - `https://eth-mainnet.g.alchemy.com/v2/demo`
+  - `https://eth-mainnet.nodereal.io/v1/1659dfb40aa24bbb8153a677b98064d7`
+  - `https://eth-mainnet.public.blastapi.io`
+  - `https://eth-pokt.nodies.app`
+- **Recommendation:** Could not verify — no hashes found on linked pages
+
+To approve, add this line to `exceptions.var`:
+```
+f787e84065a96c3ba63bb40599b2547a8ae16437bef394194e3bb209abe2fce3  # SPOILER_spammer.py
+```
+---
+
+## CakeHaus-src.zip — 2026-03-21 23:10 UTC
+- **SHA-256:** `7f8710b3956e809890e27f17a39eeaf43856de204110c4919e1a9c7fb0c41627`
+- **File size:** 22,657 bytes
+- **Score:** 20/100 (LOW)
+- **URLs found in file:**
+  - `https://api.cakehaus.io/v2`
+  - `https://smittenkitchen.com/2008/10/carrot-cake-with-brown-butter-frosting/`
+  - `https://www.bonappetit.com/recipe/lemon-blueberry-bundt-cake`
+  - `https://www.justonecookbook.com/japanese-cheesecake/`
+  - `https://www.kingarthurbaking.com/recipes/easy-cheesecake-recipe`
+  - `https://www.loveandlemons.com/red-velvet-cupcakes/`
+  - `https://www.sallysbakingaddiction.com/triple-chocolate-layer-cake/`
+  - `https://www.seriouseats.com/tiramisu-cake-recipe`
+  - `https://food52.com/recipes/baking`
+  - `https://handletheheat.com`
+- **Recommendation:** Could not verify — no hashes found on linked pages
+
+To approve, add this line to `exceptions.var`:
+```
+7f8710b3956e809890e27f17a39eeaf43856de204110c4919e1a9c7fb0c41627  # CakeHaus-src.zip
+```
+---
+
+## CakeHaus.jar — 2026-03-21 23:11 UTC
+- **SHA-256:** `55ea4dc235179e2bae604dcd495c5f9adafc8356c0c166c070a29080618bc643`
+- **File size:** 54,385 bytes
+- **Score:** 20/100 (LOW)
+- **URLs found in file:**
+  - `https://api.cakehaus.io/v2`
+  - `https://food52.com/recipes/baking`
+  - `https://handletheheat.com`
+  - `https://preppykitchen.com`
+  - `https://sallysbakingaddiction.com`
+  - `https://smittenkitchen.com`
+  - `https://smittenkitchen.com/2008/10/carrot-cake-with-brown-butter-frosting/`
+  - `https://sugargeekshow.com`
+  - `https://www.bonappetit.com/recipe/lemon-blueberry-bundt-cake`
+  - `https://www.justonecookbook.com/japanese-cheesecake/`
+- **Recommendation:** Could not verify — no hashes found on linked pages
+
+To approve, add this line to `exceptions.var`:
+```
+55ea4dc235179e2bae604dcd495c5f9adafc8356c0c166c070a29080618bc643  # CakeHaus.jar
+```
+---

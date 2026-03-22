@@ -54,6 +54,8 @@ public class JarAnalyzer {
     static Set<String> cpUrlsCollected = new LinkedHashSet<>();
     /** Constant pool domains collected during metadata extraction — available to all variant analyzers */
     static Set<String> cpDomainsCollected = new LinkedHashSet<>();
+    /** Detected mod loader(s): "fabric", "quilt", "forge", "bukkit", etc. */
+    static Set<String> detectedModLoaders = new LinkedHashSet<>();
 
     /** Resolve a file path inside the per-JAR output directory. */
     static Path out(String filename) { return outDir.resolve(filename); }
@@ -201,8 +203,19 @@ public class JarAnalyzer {
         CFG.setProperty("casino.class.hints", "LegitRigController|PaperGameDispenser|aseity|optimization_rig");
 
         // Library class prefixes to skip during decompilation (pipe-separated)
+        // Covers: Google libs, Apache, Kotlin, Netty, Mojang, SLF4J, javax, java stdlib,
+        // ASM, Fabric/Quilt internals, ViaVersion protocol libs, Architectury, Mixin,
+        // LWJGL, JNA, Guava, Jackson, Fastutil, Adventure text, Log4j, commons-*
         CFG.setProperty("library.class.prefixes",
-            "com_google_|org_apache_|kotlin_|io_netty_|com_mojang_|org_slf4j_|javax_|java_|org_objectweb_");
+            "com_google_|org_apache_|kotlin_|io_netty_|com_mojang_|org_slf4j_|javax_|java_|org_objectweb_|" +
+            "net_fabricmc_|org_quiltmc_|com_viaversion_|com_raphfrk_|de_gerrygames_|" +
+            "net_raphimc_|com_llamalad7_|org_spongepowered_|net_lenni0451_|" +
+            "io_github_classgraph_|org_lwjgl_|com_sun_jna_|it_unimi_dsi_|" +
+            "net_kyori_|org_joml_|com_fasterxml_|org_json_|org_yaml_|" +
+            "org_checkerframework_|org_jetbrains_|org_intellij_|" +
+            "org_ow2_|net_minecraftforge_|cpw_mods_|" +
+            "com_electronwill_|org_jline_|io_github_retrooper_|com_github_retrooper_|" +
+            "net_minecraft_|org_vineflower_|org_benf_|de_florianmichael_");
 
         // Behavioral source patterns: "srcPattern=label" entries, pipe-separated
         // IMPORTANT: These defaults are the fallback when config.properties is missing.
@@ -729,6 +742,7 @@ public class JarAnalyzer {
         markerDetails.clear();
         cpUrlsCollected.clear();
         cpDomainsCollected.clear();
+        detectedModLoaders.clear();
         infoLog = null;
         configLog = null;
         cachedBlocklist = null;
@@ -838,7 +852,7 @@ public class JarAnalyzer {
         ok("Stripped JAR: " + strippedClasses + " class(es) to decompile (library classes excluded)");
 
         step("Decompiling full JAR to source/...");
-        decompilerUsed = decompileFullJar(decompileTarget, sourceDir, vineflowerPath, jadxPath, procyonPath, cfrPath);
+        decompilerUsed = decompileFullJar(decompileTarget, sourceDir, vineflowerPath, jadxPath, procyonPath, cfrPath, strippedClasses);
         ok("Full decompilation complete (used: " + decompilerUsed + ")");
 
         // Also build the in-memory source string + per-file map for pattern matching
@@ -2498,6 +2512,16 @@ public class JarAnalyzer {
                 if (i < markers.size() - 1) sb.append(", ");
             }
             sb.append("],\n");
+            // Mod loader metadata — helps scoring understand legitimate mod patterns
+            if (!detectedModLoaders.isEmpty()) {
+                sb.append("  \"modLoaders\": [");
+                int mli = 0;
+                for (String ml : detectedModLoaders) {
+                    sb.append("\"").append(escJson(ml)).append("\"");
+                    if (++mli < detectedModLoaders.size()) sb.append(", ");
+                }
+                sb.append("],\n");
+            }
             appendMarkerDetails(sb);
             sb.append("\n}\n");
             Files.writeString(out(jarName + "_iocs.json"), sb.toString());
@@ -3526,17 +3550,23 @@ public class JarAnalyzer {
     /** Decompile a full JAR using cascade: Vineflower -> JADX -> Procyon -> CFR.
      *  After each decompiler, checks that critical files actually decompiled
      *  (not just error stubs). Falls through if key files have "Couldn't be decompiled". */
-    static String decompileFullJar(String jarPath, Path sourceDir, String vineflower, String jadx, String procyon, String cfr) {
+    static String decompileFullJar(String jarPath, Path sourceDir, String vineflower, String jadx, String procyon, String cfr, long classCount) {
+        // Scale timeout and heap based on class count
+        // Base: 120s / 512m for ≤50 classes. Scale up for larger JARs.
+        int decompileTimeout = (int) Math.min(600, Math.max(120, classCount * 2));
+        String heap = classCount > 500 ? "-Xmx2g" : classCount > 100 ? "-Xmx1g" : "-Xmx512m";
+        clog("  Decompile budget: " + classCount + " classes, timeout=" + decompileTimeout + "s, heap=" + heap);
+
         // Try Vineflower first (best output quality)
         if (vineflower != null) {
             try {
                 step("  Trying Vineflower...");
-                Process p = new ProcessBuilder("java", "-Xmx512m", "-jar", vineflower,
-                        "-ren=1", "-thr=0", "-dgs=1", "-lit=1",
+                Process p = new ProcessBuilder("java", heap, "-jar", vineflower,
+                        "-ren=1", "-thr=4", "-dgs=1", "-lit=1",
                         jarPath, sourceDir.toString())
                     .redirectErrorStream(true).start();
                 p.getInputStream().transferTo(OutputStream.nullOutputStream());
-                boolean done = p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS);
+                boolean done = p.waitFor(decompileTimeout, java.util.concurrent.TimeUnit.SECONDS);
                 if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
                 else p.destroyForcibly();
                 long fileCount = countJavaFiles(sourceDir);
@@ -3547,7 +3577,7 @@ public class JarAnalyzer {
                 } else if (fileCount > 0 && failedCount > 0) {
                     warn("  Vineflower produced " + fileCount + " file(s) but " + failedCount + " failed to decompile — trying other decompilers for failed files");
                     // Keep Vineflower output but supplement with other decompilers
-                    String supplement = supplementFailedFiles(jarPath, sourceDir, jadx, procyon, cfr);
+                    String supplement = supplementFailedFiles(jarPath, sourceDir, jadx, procyon, cfr, decompileTimeout, heap);
                     return "Vineflower+" + supplement;
                 }
             } catch (Exception e) {
@@ -3559,10 +3589,10 @@ public class JarAnalyzer {
         if (jadx != null) {
             try {
                 step("  Trying JADX...");
-                Process p = new ProcessBuilder("java", "-jar", jadx, "--deobf", "-d", sourceDir.toString(), jarPath)
+                Process p = new ProcessBuilder("java", heap, "-jar", jadx, "--deobf", "-d", sourceDir.toString(), jarPath)
                     .redirectErrorStream(true).start();
                 p.getInputStream().transferTo(OutputStream.nullOutputStream());
-                boolean done = p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS);
+                boolean done = p.waitFor(decompileTimeout, java.util.concurrent.TimeUnit.SECONDS);
                 if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
                 else p.destroyForcibly();
                 long fileCount = countJavaFiles(sourceDir);
@@ -3579,11 +3609,11 @@ public class JarAnalyzer {
         if (procyon != null) {
             try {
                 step("  Trying Procyon...");
-                Process p = new ProcessBuilder("java", "-Xmx512m", "-jar", procyon,
+                Process p = new ProcessBuilder("java", heap, "-jar", procyon,
                         "-jar", jarPath, "-o", sourceDir.toString())
                     .redirectErrorStream(true).start();
                 p.getInputStream().transferTo(OutputStream.nullOutputStream());
-                boolean done = p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS);
+                boolean done = p.waitFor(decompileTimeout, java.util.concurrent.TimeUnit.SECONDS);
                 if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
                 else p.destroyForcibly();
                 long fileCount = countJavaFiles(sourceDir);
@@ -3600,11 +3630,11 @@ public class JarAnalyzer {
         if (cfr != null) {
             try {
                 step("  Falling back to CFR per-class...");
-                Process p = new ProcessBuilder("java", "-jar", cfr, jarPath,
+                Process p = new ProcessBuilder("java", heap, "-jar", cfr, jarPath,
                         "--outputdir", sourceDir.toString(), "--renameillegalidents", "true")
                     .redirectErrorStream(true).start();
                 p.getInputStream().transferTo(OutputStream.nullOutputStream());
-                boolean done = p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS);
+                boolean done = p.waitFor(decompileTimeout, java.util.concurrent.TimeUnit.SECONDS);
                 if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
                 else p.destroyForcibly();
                 long fileCount = countJavaFiles(sourceDir);
@@ -3632,7 +3662,8 @@ public class JarAnalyzer {
     }
 
     /** Re-decompile files that Vineflower failed on using JADX, Procyon, or CFR */
-    static String supplementFailedFiles(String jarPath, Path sourceDir, String jadx, String procyon, String cfr) {
+    static String supplementFailedFiles(String jarPath, Path sourceDir, String jadx, String procyon, String cfr) { return supplementFailedFiles(jarPath, sourceDir, jadx, procyon, cfr, 120, "-Xmx512m"); }
+    static String supplementFailedFiles(String jarPath, Path sourceDir, String jadx, String procyon, String cfr, int timeout, String heap) {
         try {
             // Find which .java files failed
             List<Path> failedFiles;
@@ -3656,10 +3687,10 @@ public class JarAnalyzer {
                 Path jadxTmp = Files.createTempDirectory("jadx_supplement_");
                 try {
                     step("  Supplementing " + failedFiles.size() + " failed file(s) with JADX...");
-                    Process p = new ProcessBuilder("java", "-jar", jadx, "--deobf", "-d", jadxTmp.toString(), jarPath)
+                    Process p = new ProcessBuilder("java", heap, "-jar", jadx, "--deobf", "-d", jadxTmp.toString(), jarPath)
                         .redirectErrorStream(true).start();
                     p.getInputStream().transferTo(OutputStream.nullOutputStream());
-                    boolean done = p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS);
+                    boolean done = p.waitFor(timeout, java.util.concurrent.TimeUnit.SECONDS);
                     if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
                     else p.destroyForcibly();
 
@@ -3698,11 +3729,11 @@ public class JarAnalyzer {
                 Path procTmp = Files.createTempDirectory("procyon_supplement_");
                 try {
                     step("  Supplementing " + failedFiles.size() + " failed file(s) with Procyon...");
-                    Process p = new ProcessBuilder("java", "-Xmx512m", "-jar", procyon,
+                    Process p = new ProcessBuilder("java", heap, "-jar", procyon,
                             "-jar", jarPath, "-o", procTmp.toString())
                         .redirectErrorStream(true).start();
                     p.getInputStream().transferTo(OutputStream.nullOutputStream());
-                    boolean done = p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS);
+                    boolean done = p.waitFor(timeout, java.util.concurrent.TimeUnit.SECONDS);
                     if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
                     else p.destroyForcibly();
 
@@ -3741,11 +3772,11 @@ public class JarAnalyzer {
                 Path cfrTmp = Files.createTempDirectory("cfr_supplement_");
                 try {
                     step("  Supplementing " + failedFiles.size() + " failed file(s) with CFR...");
-                    Process p = new ProcessBuilder("java", "-jar", cfr, jarPath,
+                    Process p = new ProcessBuilder("java", heap, "-jar", cfr, jarPath,
                             "--outputdir", cfrTmp.toString(), "--renameillegalidents", "true")
                         .redirectErrorStream(true).start();
                     p.getInputStream().transferTo(OutputStream.nullOutputStream());
-                    boolean done = p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS);
+                    boolean done = p.waitFor(timeout, java.util.concurrent.TimeUnit.SECONDS);
                     if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
                     else p.destroyForcibly();
 
@@ -4589,7 +4620,20 @@ public class JarAnalyzer {
                 json.append("\"").append(escJson(markers.get(i))).append("\"");
                 if (i < markers.size()-1) json.append(",");
             }
-            json.append("]\n");
+            json.append("],\n");
+            if (!detectedModLoaders.isEmpty()) {
+                json.append("  \"modLoaders\": [");
+                int mli = 0;
+                for (String ml : detectedModLoaders) {
+                    json.append("\"").append(escJson(ml)).append("\"");
+                    if (++mli < detectedModLoaders.size()) json.append(",");
+                }
+                json.append("]\n");
+            } else {
+                // Remove trailing comma from markers line
+                json.setLength(json.length() - 2);
+                json.append("\n");
+            }
             json.append("}\n");
             Files.writeString(out(jarName + "_iocs.json"), prettyJson(json.toString()));
         } catch (Exception e) {
@@ -5108,6 +5152,13 @@ public class JarAnalyzer {
             for (String meta : modMetas) {
                 ZipEntry e = zf.getEntry(meta);
                 if (e != null) {
+                    // Track which mod loader this JAR targets
+                    if (meta.equals("fabric.mod.json")) detectedModLoaders.add("fabric");
+                    else if (meta.equals("quilt.mod.json")) detectedModLoaders.add("quilt");
+                    else if (meta.equals("META-INF/mods.toml")) detectedModLoaders.add("forge");
+                    else if (meta.equals("plugin.yml") || meta.equals("paper-plugin.yml")) detectedModLoaders.add("bukkit");
+                    else if (meta.equals("bungee.yml")) detectedModLoaders.add("bungee");
+
                     String content;
                     try (InputStream metaIs = zf.getInputStream(e)) { content = new String(readBounded(metaIs, 1_000_000), StandardCharsets.UTF_8); }
                     ilog("  " + meta + ":");
