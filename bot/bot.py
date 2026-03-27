@@ -6212,40 +6212,65 @@ async def _do_download(session, url: str, work_dir: str, dl_path: str, display_n
 # (direct_url, optional_filename) or None if it can't resolve.
 
 async def _resolve_gofile(session: aiohttp.ClientSession, url: str, parsed) -> tuple[str, str | None] | None:
-    """Gofile: gofile.io/d/{id} → API lookup for direct download link."""
+    """Gofile: gofile.io/d/{id} → API lookup for direct download link.
+    Gofile requires a guest account token (POST) and contents API.
+    As of 2026-03 the contents API requires premium — raises ValueError to inform user."""
     m = re.match(r'/d/([a-zA-Z0-9]+)', parsed.path)
     if not m:
         return None
     content_id = m.group(1)
-    # Gofile requires a guest account token
     try:
-        async with session.get("https://api.gofile.io/accounts",
-                               timeout=aiohttp.ClientTimeout(total=15),
-                               headers={"Accept": "application/json"}) as resp:
+        # Step 1: Create guest account (POST, not GET)
+        async with session.post("https://api.gofile.io/accounts",
+                                timeout=aiohttp.ClientTimeout(total=15),
+                                headers={"Accept": "application/json",
+                                          "Content-Type": "application/json"},
+                                json={}) as resp:
             if resp.status != 200:
-                return None
-            data = await resp.json()
+                raise ValueError(
+                    "**Gofile** links cannot be resolved automatically (API unavailable).\n"
+                    "Please download the file and upload it directly, or provide a direct download link."
+                )
+            data = await resp.json(content_type=None)
             token = data.get("data", {}).get("token")
             if not token:
-                return None
+                raise ValueError(
+                    "**Gofile** links cannot be resolved automatically.\n"
+                    "Please download the file and upload it directly."
+                )
+        # Step 2: Fetch contents
         async with session.get(f"https://api.gofile.io/contents/{content_id}?wt=4fd6sg89d7s6",
                                timeout=aiohttp.ClientTimeout(total=15),
                                headers={"Authorization": f"Bearer {token}",
                                          "Accept": "application/json"}) as resp:
+            if resp.status == 401:
+                # Premium-only error
+                raise ValueError(
+                    "**Gofile** now requires premium access for API downloads.\n"
+                    "Please download the file from Gofile and upload it directly to the bot, "
+                    "or use a different file hosting service."
+                )
             if resp.status != 200:
-                return None
-            data = await resp.json()
+                raise ValueError(
+                    f"**Gofile** API returned HTTP {resp.status}.\n"
+                    "Please download the file and upload it directly."
+                )
+            data = await resp.json(content_type=None)
             contents = data.get("data", {}).get("children", {})
-            # Get first file
             for _fid, finfo in contents.items():
                 if finfo.get("type") == "file":
                     direct = finfo.get("link")
                     fname = finfo.get("name")
                     if direct:
                         return (direct, fname)
-    except (aiohttp.ClientError, asyncio.TimeoutError, KeyError, ValueError):
+    except ValueError:
+        raise  # Re-raise our user-facing errors
+    except (aiohttp.ClientError, asyncio.TimeoutError, KeyError):
         pass
-    return None
+    raise ValueError(
+        "**Gofile** link could not be resolved.\n"
+        "Please download the file and upload it directly, or provide a direct download link."
+    )
 
 
 async def _resolve_pixeldrain(session: aiohttp.ClientSession, url: str, parsed) -> tuple[str, str | None] | None:
@@ -6623,6 +6648,8 @@ async def _resolve_file_hosting_url(
                 log.info(f"[FileHosting] Resolved {hostname} → direct download")
                 return result
             log.warning(f"[FileHosting] Resolver for {hostname} returned None — trying as-is")
+        except ValueError:
+            raise  # Propagate user-facing errors (e.g. "Gofile requires premium")
         except Exception as e:
             log.warning(f"[FileHosting] Resolver error for {hostname}: {e}")
 
@@ -6736,6 +6763,8 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
                         display_name = safe_fname.lstrip(".") or "downloaded_file"
                         dl_path = os.path.join(work_dir, display_name)
                 log.info(f"[FileHosting] Using URL: {resolved_url[:80]}")
+            except ValueError:
+                raise  # Propagate user-facing errors
             except Exception as e:
                 log.warning(f"[FileHosting] Resolution failed, trying original URL: {e}")
                 resolved_url = url
@@ -6829,6 +6858,8 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
                         if safe_fname and safe_fname not in (".", ".."):
                             display_name = safe_fname.lstrip(".") or "downloaded_file"
                             dl_path = os.path.join(work_dir, display_name)
+                except ValueError:
+                    raise
                 except Exception:
                     resolved_url = url
 
