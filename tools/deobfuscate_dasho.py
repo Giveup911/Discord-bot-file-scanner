@@ -327,6 +327,8 @@ def scan_class_for_decrypted_strings(data, decrypt_class_names=None, indexof_cla
     except Exception:
         return None, []
 
+    class_name = None
+    results = []
     try:
         # access flags, this_class, super_class
         this_class_idx = struct.unpack_from('>H', data, offset + 2)[0]
@@ -367,43 +369,46 @@ def scan_class_for_decrypted_strings(data, decrypt_class_names=None, indexof_cla
             if entry is not None and entry[0] == 'Utf8' and entry[1] == 'Code':
                 code_utf8_indices.add(i)
 
-        results = []
-
         for _ in range(method_count):
-            if offset + 6 > len(data):
+            if offset + 8 > len(data):
                 break
-            m_access = struct.unpack_from('>H', data, offset)[0]
-            m_name_idx = struct.unpack_from('>H', data, offset + 2)[0]
-            m_desc_idx = struct.unpack_from('>H', data, offset + 4)[0]
-            offset += 6
-            m_attr_count = struct.unpack_from('>H', data, offset)[0]
-            offset += 2
+            try:
+                m_access = struct.unpack_from('>H', data, offset)[0]
+                m_name_idx = struct.unpack_from('>H', data, offset + 2)[0]
+                m_desc_idx = struct.unpack_from('>H', data, offset + 4)[0]
+                offset += 6
+                m_attr_count = struct.unpack_from('>H', data, offset)[0]
+                offset += 2
 
-            method_name = cp.get_utf8(m_name_idx) or f"method_{m_name_idx}"
+                method_name = cp.get_utf8(m_name_idx) or f"method_{m_name_idx}"
 
-            for _ in range(m_attr_count):
-                if offset + 6 > len(data):
-                    break
-                a_name_idx = struct.unpack_from('>H', data, offset)[0]
-                a_len = struct.unpack_from('>I', data, offset + 2)[0]
-                a_start = offset + 6
+                for _ in range(m_attr_count):
+                    if offset + 6 > len(data):
+                        break
+                    a_name_idx = struct.unpack_from('>H', data, offset)[0]
+                    a_len = struct.unpack_from('>I', data, offset + 2)[0]
+                    a_start = offset + 6
 
-                if a_name_idx in code_utf8_indices and a_len >= 12:
-                    # Code attribute: max_stack(2) + max_locals(2) + code_length(4) + code(N) + ...
-                    code_len = struct.unpack_from('>I', data, a_start + 4)[0]
-                    code_start = a_start + 8
-                    if code_start + code_len <= len(data):
-                        code = data[code_start:code_start + code_len]
-                        found = scan_bytecode(code, cp, decrypt_refs, method_name,
-                                              decrypt_class_names, indexof_class_names)
-                        results.extend(found)
+                    if a_name_idx in code_utf8_indices and a_len >= 12:
+                        # Code attribute: max_stack(2) + max_locals(2) + code_length(4) + code(N) + ...
+                        if a_start + 8 <= len(data):
+                            code_len = struct.unpack_from('>I', data, a_start + 4)[0]
+                            code_start = a_start + 8
+                            if code_start + code_len <= len(data):
+                                code = data[code_start:code_start + code_len]
+                                found = scan_bytecode(code, cp, decrypt_refs, method_name,
+                                                      decrypt_class_names, indexof_class_names)
+                                results.extend(found)
 
-                offset = a_start + a_len
+                    offset = a_start + a_len
+            except (struct.error, IndexError):
+                # Malformed method — can't determine correct offset, stop scanning
+                break
 
         return class_name, results
     except (struct.error, IndexError):
         # Truncated or malformed class file
-        return None, []
+        return class_name if class_name else None, results
 
 
 def scan_bytecode(code, cp, decrypt_refs, method_name,

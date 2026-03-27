@@ -54,6 +54,11 @@ try:
     GENERIC_DEOBFUSCATOR_AVAILABLE = True
 except ImportError:
     GENERIC_DEOBFUSCATOR_AVAILABLE = False
+try:
+    from deobfuscator import deobfuscate as _source_deobfuscate, fingerprint_obfuscator as _fingerprint_obfuscator
+    SOURCE_DEOBFUSCATOR_AVAILABLE = True
+except ImportError:
+    SOURCE_DEOBFUSCATOR_AVAILABLE = False
 
 # ─── Logging ────────────────────────────────────────────────────────────────
 
@@ -107,7 +112,7 @@ DEFAULT_CFG = {
     "hybrid_analysis": {"api_key": "", "enabled": True},
     "scanner": {
         "java_path": "java",
-        "max_file_size_mb": 100,
+        "max_file_size_mb": 2048,
         "scan_timeout_seconds": 300,
         "max_concurrent_scans": 3,
         "cooldown_seconds": 30,
@@ -390,13 +395,10 @@ def save_stats(stats: dict):
 
 
 scan_stats = load_stats()
-_stats_lock = None
+_stats_lock = asyncio.Lock()
 
 
 def _get_stats_lock():
-    global _stats_lock
-    if _stats_lock is None:
-        _stats_lock = asyncio.Lock()
     return _stats_lock
 
 
@@ -539,22 +541,16 @@ def save_catalog(catalog: dict):
 
 
 file_catalog = load_catalog()
-_catalog_lock = None
+_catalog_lock = asyncio.Lock()
 _sha256_locks: dict[str, asyncio.Lock] = {}
-_sha256_locks_guard = None
+_sha256_locks_guard = asyncio.Lock()
 
 
 def _get_catalog_lock():
-    global _catalog_lock
-    if _catalog_lock is None:
-        _catalog_lock = asyncio.Lock()
     return _catalog_lock
 
 
 def _get_sha256_locks_guard():
-    global _sha256_locks_guard
-    if _sha256_locks_guard is None:
-        _sha256_locks_guard = asyncio.Lock()
     return _sha256_locks_guard
 
 
@@ -564,13 +560,12 @@ async def _get_sha256_lock(sha256: str) -> asyncio.Lock:
         if sha256 not in _sha256_locks:
             _sha256_locks[sha256] = asyncio.Lock()
         lock = _sha256_locks[sha256]
-        # Evict unlocked entries to prevent unbounded growth
+        # Evict unlocked entries to prevent unbounded growth (skip our own key)
         if len(_sha256_locks) > 1000:
-            to_remove = [k for k, v in _sha256_locks.items() if not v.locked()]
+            to_remove = [k for k, v in _sha256_locks.items()
+                         if not v.locked() and k != sha256]
             for k in to_remove:
                 del _sha256_locks[k]
-            # Re-add our lock in case it was evicted
-            _sha256_locks[sha256] = lock
         return lock
 
 
@@ -602,13 +597,10 @@ def load_exceptions() -> set:
     return hashes
 
 approved_exceptions = load_exceptions()
-_exceptions_md_lock = None
+_exceptions_md_lock = asyncio.Lock()
 
 
 def _get_exceptions_md_lock():
-    global _exceptions_md_lock
-    if _exceptions_md_lock is None:
-        _exceptions_md_lock = asyncio.Lock()
     return _exceptions_md_lock
 
 async def check_exception(sha256: str) -> bool:
@@ -827,12 +819,15 @@ _DOWNLOAD_CONTENT_TYPES = {
 
 
 def _is_private_ip(hostname: str) -> bool:
-    """Check if hostname resolves to a private/internal IP (SSRF protection)."""
+    """Check if hostname resolves to a private/internal/dangerous IP (SSRF protection)."""
     if hostname.lower() in ("localhost", "localhost.localdomain", ""):
         return True
     try:
         addr = ipaddress.ip_address(hostname)
-        return addr.is_private or addr.is_loopback or addr.is_reserved
+        return (addr.is_private or addr.is_loopback or addr.is_reserved
+                or addr.is_link_local or addr.is_multicast or addr.is_unspecified
+                or (isinstance(addr, ipaddress.IPv4Address)
+                    and addr in ipaddress.IPv4Network('100.64.0.0/10')))  # CGNAT
     except ValueError:
         return False
 
@@ -1323,15 +1318,13 @@ async def resolve_eth_contracts(eth_addresses: list[str], session: aiohttp.Clien
 VT_BASE = "https://www.virustotal.com/api/v3"
 
 # VT free tier: 4 requests/minute, 500/day. Use a lock to serialize.
-_vt_rate_lock: Optional[asyncio.Lock] = None
+_vt_rate_lock = asyncio.Lock()
 _vt_last_request: float = 0.0
 
 
 async def _vt_rate_limit():
     """Ensure at least 15 seconds between VT API calls (4/min limit)."""
-    global _vt_rate_lock, _vt_last_request
-    if _vt_rate_lock is None:
-        _vt_rate_lock = asyncio.Lock()
+    global _vt_last_request
     async with _vt_rate_lock:
         now = time.time()
         elapsed = now - _vt_last_request
@@ -3413,6 +3406,40 @@ def _run_jar_sync(jar_path: str, master_dir: str, timeout: int) -> dict:
     if analysis_txt.exists():
         result["analysis_text"] = analysis_txt.read_text(encoding="utf-8", errors="replace")
 
+    # Fallback variant detection from stdout/info.log when _iocs.json is missing
+    # (JarAnalyzer may identify variant but crash/timeout before writing JSON)
+    if "iocs" not in result or not result.get("iocs", {}).get("variant"):
+        variant_from_stdout = None
+        # Check stdout for "[+] Variant: XXXX" line
+        for line in stdout_text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("[+] Variant:"):
+                v = stripped.split(":", 1)[1].strip().lower()
+                if v and v != "unknown":
+                    variant_from_stdout = v
+                    break
+        # Also check info.log file if present
+        if not variant_from_stdout and log_dir.exists():
+            info_logs = list(log_dir.glob("*_info.log"))
+            for ilf in info_logs:
+                try:
+                    for line in ilf.read_text(encoding="utf-8", errors="replace").splitlines():
+                        stripped = line.strip()
+                        if stripped.startswith("[+] Variant:"):
+                            v = stripped.split(":", 1)[1].strip().lower()
+                            if v and v != "unknown":
+                                variant_from_stdout = v
+                                break
+                except Exception:
+                    pass
+                if variant_from_stdout:
+                    break
+        if variant_from_stdout:
+            log.info(f"[JarAnalyzer] Variant recovered from stdout/logs: {variant_from_stdout}")
+            if "iocs" not in result:
+                result["iocs"] = {}
+            result["iocs"]["variant"] = variant_from_stdout
+
     return result
 
 
@@ -3470,7 +3497,7 @@ def _apply_url_eth_adj(score: int, url_analysis: Optional[dict],
     is_minecraft_mod = bool(all_iocs and all_iocs.get("modLoaders"))
     _fa_type = (format_analysis or {}).get("type", "")
     if url_analysis:
-        url_adj = url_analysis["score_adjust"]
+        url_adj = url_analysis.get("score_adjust", 0)
         # Benign media files (images/audio/video/fonts): URLs are embedded
         # resources, not indicators of compromise — zero out.
         if _fa_type == "benign_media":
@@ -3486,12 +3513,12 @@ def _apply_url_eth_adj(score: int, url_analysis: Optional[dict],
                 or any("webhook" in k.lower() and all_iocs[k] for k in all_iocs)
             ))
             if not _has_real_threats:
-                url_adj = url_adj // 3
+                url_adj = max(1, url_adj // 3) if url_adj > 0 else min(-1, url_adj // 3) if url_adj < 0 else 0
         if url_adj:
             score += url_adj
             breakdown["url_analysis"] = url_adj
     if eth_analysis:
-        _eth_adj = eth_analysis["score_adjust"]
+        _eth_adj = eth_analysis.get("score_adjust", 0)
         if _eth_adj:
             score += _eth_adj
             breakdown["eth_analysis"] = _eth_adj
@@ -3798,6 +3825,17 @@ def compute_risk_score(
     if has_webhooks and has_launcher_accounts:
         score += 14
         breakdown["stealer_combo"] = 14
+
+    # Combo: webhook + session accessor — mod accessing player session data
+    # AND exfiltrating it via Discord webhook is a token stealer pattern
+    has_session_access = iocs and any(
+        "session" in m.lower() and ("accessor" in m.lower() or "getusername" in m.lower()
+                                     or "getaccesstoken" in m.lower())
+        for m in iocs.get("behavioralMarkers", [])
+    )
+    if has_webhooks and has_session_access:
+        score += 14
+        breakdown["webhook_session_combo"] = 14
 
     # manifest — reduced weight for Mixin-related keys
     # Fabric/Forge mods using Mixin framework require Premain-Class, Can-Redefine-Classes,
@@ -5137,13 +5175,19 @@ def _is_scannable_entry(name: str, data: bytes) -> bool:
 
 def extract_files_from_zip(zip_path: str, extract_to: str, depth: int = 0, max_extract_bytes: int = 200 * 1024 * 1024) -> list[str]:
     """Extract scannable files from zip with streaming decompression and size limits."""
+    MAX_ENTRIES = 10000  # Prevent zip bomb via millions of tiny files
     if depth > 3:
         return []
     extracted = []
     total_extracted = 0
+    entries_processed = 0
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
             for entry in zf.namelist():
+                entries_processed += 1
+                if entries_processed > MAX_ENTRIES:
+                    log.warning(f"Max entries ({MAX_ENTRIES}) exceeded in {zip_path}")
+                    break
                 try:
                     info = zf.getinfo(entry)
                     if info.is_dir():
@@ -5175,8 +5219,9 @@ def extract_files_from_zip(zip_path: str, extract_to: str, depth: int = 0, max_e
                         log.warning(f"Extraction budget exceeded at {total_extracted} bytes")
                         break
                     if _is_scannable_entry(entry, data):
-                        safe_name = re.sub(r"[^\w.\-]", "_", os.path.basename(entry))
-                        if not safe_name:
+                        # ASCII-only sanitization to avoid YARA failures with Unicode filenames
+                        safe_name = re.sub(r"[^a-zA-Z0-9_.\-]", "_", os.path.basename(entry))
+                        if not safe_name or safe_name == '_':
                             safe_name = f"nested_{depth}_{len(extracted)}"
                         dest = os.path.join(extract_to, f"depth{depth}_{safe_name}")
                         # Zip slip protection: ensure dest stays within extract_to
@@ -5244,7 +5289,7 @@ def extract_files_from_tar(tar_path: str, extract_to: str, max_extract_bytes: in
                         break
 
                     # Path traversal protection
-                    safe_name = re.sub(r"[^\w.\-]", "_", os.path.basename(member.name))
+                    safe_name = re.sub(r"[^a-zA-Z0-9_.\-]", "_", os.path.basename(member.name))
                     if not safe_name:
                         safe_name = f"tar_entry_{len(extracted)}"
                     dest = os.path.join(extract_to, f"tar_{safe_name}")
@@ -5832,8 +5877,9 @@ def package_logs(log_dir: str, work_dir: str, mod_name: str) -> list[str]:
 # ─── Archival ────────────────────────────────────────────────────────────────
 
 
-def archive_scan(log_dir: str, original_file: str, sha256: str = ""):
-    """Archive scan results. If sha256 matches an existing scanned/ folder, reuse it."""
+def archive_scan(log_dir: str, original_file: str, sha256: str = "", skip_source: bool = False):
+    """Archive scan results. If sha256 matches an existing scanned/ folder, reuse it.
+    If skip_source=True, only logs/analysis are saved — the original file is not copied."""
     scanned_dir = MASTER_DIR / "scanned"
     scanned_dir.mkdir(exist_ok=True)
 
@@ -5882,7 +5928,20 @@ def archive_scan(log_dir: str, original_file: str, sha256: str = ""):
             shutil.move(str(log_path), str(dest_logs))
 
     if os.path.exists(original_file):
-        shutil.copy2(original_file, str(dest / os.path.basename(original_file)))
+        file_size = os.path.getsize(original_file)
+        if skip_source or file_size > LARGE_FILE_THRESHOLD:
+            log.info(f"Large file ({file_size / 1024 / 1024:.1f} MB) — saving analysis only, not archiving source")
+            # Write a marker file so we know the source was intentionally omitted
+            marker = dest / "_source_not_saved.txt"
+            marker.write_text(
+                f"Original file: {os.path.basename(original_file)}\n"
+                f"Size: {file_size / 1024 / 1024:.1f} MB\n"
+                f"SHA256: {sha256}\n"
+                f"Reason: File exceeds {LARGE_FILE_THRESHOLD / 1024 / 1024:.0f} MB threshold — "
+                f"analysis saved, source deleted to conserve disk space.\n"
+            )
+        else:
+            shutil.copy2(original_file, str(dest / os.path.basename(original_file)))
 
     return str(dest)
 
@@ -5920,7 +5979,8 @@ except ImportError:
     pass
 
 URL_PATTERN = re.compile(r'^https?://[a-zA-Z0-9\-._~:/?#\[\]@!$&\'()*+,;=%]+$')
-MAX_URL_DOWNLOAD = 100 * 1024 * 1024  # 100MB
+MAX_URL_DOWNLOAD = 2 * 1024 * 1024 * 1024  # 2GB — large files scanned but not archived
+LARGE_FILE_THRESHOLD = 100 * 1024 * 1024  # 100MB — files above this: analysis saved, source file deleted
 
 # Known IP grabber / redirect tracking domains
 IP_GRABBER_DOMAINS = {
@@ -6119,6 +6179,10 @@ async def _do_download(session, url: str, work_dir: str, dl_path: str, display_n
                         cd_name = "downloaded_file"
                     display_name = cd_name
                     dl_path = os.path.join(work_dir, display_name)
+                    # Final containment check — ensure path stays inside work_dir
+                    if not os.path.abspath(dl_path).startswith(os.path.abspath(work_dir) + os.sep):
+                        dl_path = os.path.join(work_dir, "downloaded_file")
+                        display_name = "downloaded_file"
 
         total = 0
         try:
@@ -6139,6 +6203,441 @@ async def _do_download(session, url: str, work_dir: str, dl_path: str, display_n
     return dl_path, display_name, total
 
 
+# ─── File Hosting URL Resolvers ──────────────────────────────────────────────
+
+# Maps file hosting domains to resolver functions.
+# Each resolver takes (session, url, parsed_url) and returns
+# (direct_url, optional_filename) or None if it can't resolve.
+
+async def _resolve_gofile(session: aiohttp.ClientSession, url: str, parsed) -> tuple[str, str | None] | None:
+    """Gofile: gofile.io/d/{id} → API lookup for direct download link."""
+    m = re.match(r'/d/([a-zA-Z0-9]+)', parsed.path)
+    if not m:
+        return None
+    content_id = m.group(1)
+    # Gofile requires a guest account token
+    try:
+        async with session.get("https://api.gofile.io/accounts",
+                               timeout=aiohttp.ClientTimeout(total=15),
+                               headers={"Accept": "application/json"}) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            token = data.get("data", {}).get("token")
+            if not token:
+                return None
+        async with session.get(f"https://api.gofile.io/contents/{content_id}?wt=4fd6sg89d7s6",
+                               timeout=aiohttp.ClientTimeout(total=15),
+                               headers={"Authorization": f"Bearer {token}",
+                                         "Accept": "application/json"}) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            contents = data.get("data", {}).get("children", {})
+            # Get first file
+            for _fid, finfo in contents.items():
+                if finfo.get("type") == "file":
+                    direct = finfo.get("link")
+                    fname = finfo.get("name")
+                    if direct:
+                        return (direct, fname)
+    except (aiohttp.ClientError, asyncio.TimeoutError, KeyError, ValueError):
+        pass
+    return None
+
+
+async def _resolve_pixeldrain(session: aiohttp.ClientSession, url: str, parsed) -> tuple[str, str | None] | None:
+    """Pixeldrain: pixeldrain.com/u/{id} → API direct download."""
+    m = re.match(r'/u/([a-zA-Z0-9]+)', parsed.path)
+    if not m:
+        return None
+    file_id = m.group(1)
+    # Get filename from info endpoint
+    fname = None
+    try:
+        async with session.get(f"https://pixeldrain.com/api/file/{file_id}/info",
+                               timeout=aiohttp.ClientTimeout(total=10),
+                               headers={"Accept": "application/json"}) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                fname = data.get("name")
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        pass
+    return (f"https://pixeldrain.com/api/file/{file_id}?download", fname)
+
+
+async def _resolve_mediafire(session: aiohttp.ClientSession, url: str, parsed) -> tuple[str, str | None] | None:
+    """MediaFire: parse the download page to find direct link."""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20),
+                               headers={"User-Agent": "Mozilla/5.0"},
+                               allow_redirects=True) as resp:
+            if resp.status != 200:
+                return None
+            html_text = await resp.text()
+            # MediaFire direct link is in an element with id="downloadButton"
+            m = re.search(r'href="(https?://download\d*\.mediafire\.com/[^"]+)"', html_text)
+            if not m:
+                # Fallback: aria-label="Download file" pattern
+                m = re.search(r'href="(https?://[^"]*mediafire\.com/[^"]*)"[^>]*id="downloadButton"', html_text)
+            if m:
+                direct = m.group(1)
+                # Try to extract filename from URL
+                fname = os.path.basename(urlparse(direct).path) or None
+                return (direct, fname)
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        pass
+    return None
+
+
+async def _resolve_krakenfiles(session: aiohttp.ClientSession, url: str, parsed) -> tuple[str, str | None] | None:
+    """Krakenfiles: parse page for download hash, POST to get link."""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20),
+                               headers={"User-Agent": "Mozilla/5.0"},
+                               allow_redirects=True) as resp:
+            if resp.status != 200:
+                return None
+            html_text = await resp.text()
+            # Extract download token
+            m_token = re.search(r'data-file-hash="([^"]+)"', html_text)
+            if not m_token:
+                m_token = re.search(r'name="token"\s+value="([^"]+)"', html_text)
+            if not m_token:
+                return None
+            # Extract filename
+            fname = None
+            m_name = re.search(r'<span class="coin-name"[^>]*>([^<]+)</span>', html_text)
+            if m_name:
+                fname = m_name.group(1).strip()
+            # Find the download endpoint
+            m_action = re.search(r'action="(/download/[^"]+)"', html_text)
+            if not m_action:
+                return None
+            dl_endpoint = f"https://krakenfiles.com{m_action.group(1)}"
+            async with session.post(dl_endpoint,
+                                     data={"token": m_token.group(1)},
+                                     timeout=aiohttp.ClientTimeout(total=15),
+                                     headers={"User-Agent": "Mozilla/5.0",
+                                               "Referer": url},
+                                     allow_redirects=False) as post_resp:
+                if post_resp.status in (301, 302, 303, 307):
+                    direct = post_resp.headers.get("Location")
+                    if direct:
+                        return (direct, fname)
+                elif post_resp.status == 200:
+                    data = await post_resp.json()
+                    direct = data.get("url")
+                    if direct:
+                        return (direct, fname)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        pass
+    return None
+
+
+async def _resolve_workupload(session: aiohttp.ClientSession, url: str, parsed) -> tuple[str, str | None] | None:
+    """Workupload: parse page for direct download link."""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20),
+                               headers={"User-Agent": "Mozilla/5.0"},
+                               allow_redirects=True) as resp:
+            if resp.status != 200:
+                return None
+            html_text = await resp.text()
+            m = re.search(r'href="(https?://[^"]*workupload\.com/[^"]*start/[^"]*)"', html_text)
+            if not m:
+                m = re.search(r'id="downloadButton"[^>]*href="([^"]+)"', html_text)
+            if not m:
+                m = re.search(r'href="([^"]+)"[^>]*id="downloadButton"', html_text)
+            if m:
+                fname_m = re.search(r'<h1[^>]*class="[^"]*filename[^"]*"[^>]*>([^<]+)</h1>', html_text)
+                fname = fname_m.group(1).strip() if fname_m else None
+                return (m.group(1), fname)
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        pass
+    return None
+
+
+async def _resolve_wetransfer(session: aiohttp.ClientSession, url: str, parsed) -> tuple[str, str | None] | None:
+    """WeTransfer: use public API to get direct download URL."""
+    # Pattern: we.tl/{short_id} or wetransfer.com/downloads/{id}/{security_hash}
+    try:
+        m = re.match(r'/downloads/([a-f0-9]+)/([a-f0-9]+)(?:/([a-f0-9]+))?', parsed.path)
+        if not m:
+            # Might be a we.tl short link — resolve redirect first
+            async with session.head(url, timeout=aiohttp.ClientTimeout(total=10),
+                                     allow_redirects=True) as resp:
+                resolved = str(resp.url)
+                resolved_parsed = urlparse(resolved)
+                m = re.match(r'/downloads/([a-f0-9]+)/([a-f0-9]+)(?:/([a-f0-9]+))?', resolved_parsed.path)
+        if not m:
+            return None
+        transfer_id = m.group(1)
+        security_hash = m.group(2)
+        async with session.post(
+            f"https://wetransfer.com/api/v4/transfers/{transfer_id}/download",
+            json={"security_hash": security_hash, "intent": "entire_transfer"},
+            timeout=aiohttp.ClientTimeout(total=15),
+            headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"}
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                direct = data.get("direct_link")
+                if direct:
+                    return (direct, None)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        pass
+    return None
+
+
+async def _resolve_swisstransfer(session: aiohttp.ClientSession, url: str, parsed) -> tuple[str, str | None] | None:
+    """SwissTransfer: API-based download link resolution."""
+    m = re.match(r'/d/([a-f0-9-]+)', parsed.path)
+    if not m:
+        return None
+    link_uuid = m.group(1)
+    try:
+        async with session.get(f"https://www.swisstransfer.com/api/links/{link_uuid}",
+                               timeout=aiohttp.ClientTimeout(total=15),
+                               headers={"Accept": "application/json"}) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            container = data.get("data", {}).get("container", {})
+            dl_host = container.get("downloadHost", "")
+            container_uuid = container.get("UUID", "")
+            files = container.get("files", [])
+            if files and dl_host and container_uuid:
+                f = files[0]
+                direct = f"{dl_host}/api/download/{container_uuid}/{f.get('UUID', '')}"
+                return (direct, f.get("fileName"))
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError):
+        pass
+    return None
+
+
+async def _resolve_uploadhaven(session: aiohttp.ClientSession, url: str, parsed) -> tuple[str, str | None] | None:
+    """Uploadhaven: parse download page for direct link."""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20),
+                               headers={"User-Agent": "Mozilla/5.0"},
+                               allow_redirects=True) as resp:
+            if resp.status != 200:
+                return None
+            html_text = await resp.text()
+            m = re.search(r'href="(https?://[^"]*uploadhaven[^"]*download[^"]*)"', html_text)
+            if m:
+                return (m.group(1), None)
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        pass
+    return None
+
+
+async def _resolve_send_forks(session: aiohttp.ClientSession, url: str, parsed) -> tuple[str, str | None] | None:
+    """Send (Firefox Send forks like send.vis.ee): get download link via API."""
+    # Pattern: /download/{id}#{key}
+    m = re.match(r'/download/([a-f0-9]+)', parsed.path)
+    if not m:
+        return None
+    file_id = m.group(1)
+    base = f"{parsed.scheme}://{parsed.hostname}"
+    try:
+        async with session.get(f"{base}/api/info/{file_id}",
+                               timeout=aiohttp.ClientTimeout(total=10),
+                               headers={"Accept": "application/json"}) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                fname = data.get("name")
+                # The actual download requires the encryption key from the fragment
+                # which the server never sees — so we provide the API download URL
+                return (f"{base}/api/download/{file_id}", fname)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        pass
+    return None
+
+
+async def _resolve_filebin(session: aiohttp.ClientSession, url: str, parsed) -> tuple[str, str | None] | None:
+    """Filebin.net: /{bin}/{filename} → direct download with Accept header."""
+    parts = parsed.path.strip("/").split("/")
+    if len(parts) < 2:
+        return None
+    bin_id = parts[0]
+    filename = parts[1]
+    # Filebin returns the file directly when Accept is not text/html
+    return (f"https://filebin.net/{bin_id}/{filename}", filename)
+
+
+async def _resolve_tmpfiles(session: aiohttp.ClientSession, url: str, parsed) -> tuple[str, str | None] | None:
+    """tmpfiles.org: /dl/{id}/{filename} is direct; /api/v1/... also works."""
+    m = re.match(r'/dl/(\d+)/(.+)', parsed.path)
+    if m:
+        return (url, m.group(2))
+    # Convert /api/v1/... or regular page to /dl/ format
+    m = re.match(r'(?:/api/v1)?/(\d+)/(.+)', parsed.path)
+    if m:
+        return (f"https://tmpfiles.org/dl/{m.group(1)}/{m.group(2)}", m.group(2))
+    return None
+
+
+async def _resolve_anonymfile(session: aiohttp.ClientSession, url: str, parsed) -> tuple[str, str | None] | None:
+    """Anonymfile: parse page for direct download link."""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20),
+                               headers={"User-Agent": "Mozilla/5.0"},
+                               allow_redirects=True) as resp:
+            if resp.status != 200:
+                return None
+            html_text = await resp.text()
+            m = re.search(r'href="(https?://[^"]+)"[^>]*id="download(?:Btn|Button)"', html_text)
+            if not m:
+                m = re.search(r'id="download(?:Btn|Button)"[^>]*href="(https?://[^"]+)"', html_text)
+            if not m:
+                m = re.search(r'href="(https?://cdn[^"]*anonymfile[^"]*)"', html_text)
+            if m:
+                return (m.group(1), None)
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        pass
+    return None
+
+
+async def _resolve_filehaus(session: aiohttp.ClientSession, url: str, parsed) -> tuple[str, str | None] | None:
+    """Filehaus (filehaus.su/filehaus.top/filehaus.pk): parse for direct link."""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20),
+                               headers={"User-Agent": "Mozilla/5.0"},
+                               allow_redirects=True) as resp:
+            if resp.status != 200:
+                return None
+            html_text = await resp.text()
+            m = re.search(r'href="(https?://[^"]+)"[^>]*class="[^"]*download[^"]*"', html_text)
+            if not m:
+                m = re.search(r'class="[^"]*download[^"]*"[^>]*href="(https?://[^"]+)"', html_text)
+            if m:
+                return (m.group(1), None)
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        pass
+    return None
+
+
+async def _resolve_sourceforge(session: aiohttp.ClientSession, url: str, parsed) -> tuple[str, str | None] | None:
+    """SourceForge: append /download to get direct link."""
+    if "/download" not in parsed.path:
+        direct = url.rstrip("/") + "/download"
+    else:
+        direct = url
+    fname = None
+    parts = parsed.path.rstrip("/").split("/")
+    if parts:
+        candidate = parts[-1] if parts[-1] != "download" else (parts[-2] if len(parts) >= 2 else None)
+        if candidate and "." in candidate:
+            fname = candidate
+    return (direct, fname)
+
+
+# ── Domain → Resolver map ──
+
+_FILE_HOSTING_RESOLVERS: dict[str, object] = {
+    # API-based resolvers
+    "gofile.io":            _resolve_gofile,
+    "pixeldrain.com":       _resolve_pixeldrain,
+    "mediafire.com":        _resolve_mediafire,
+    "www.mediafire.com":    _resolve_mediafire,
+    "krakenfiles.com":      _resolve_krakenfiles,
+    "workupload.com":       _resolve_workupload,
+    "www.workupload.com":   _resolve_workupload,
+    "wetransfer.com":       _resolve_wetransfer,
+    "we.tl":                _resolve_wetransfer,
+    "swisstransfer.com":    _resolve_swisstransfer,
+    "www.swisstransfer.com": _resolve_swisstransfer,
+    "uploadhaven.com":      _resolve_uploadhaven,
+    "www.uploadhaven.com":  _resolve_uploadhaven,
+    "filebin.net":          _resolve_filebin,
+    "tmpfiles.org":         _resolve_tmpfiles,
+    "www.tmpfiles.org":     _resolve_tmpfiles,
+    "anonymfile.com":       _resolve_anonymfile,
+    "www.anonymfile.com":   _resolve_anonymfile,
+    "filehaus.su":          _resolve_filehaus,
+    "filehaus.top":         _resolve_filehaus,
+    "filehaus.pk":          _resolve_filehaus,
+    "sourceforge.net":      _resolve_sourceforge,
+    # Send forks (encrypted file sharing)
+    "send.vis.ee":          _resolve_send_forks,
+    "send.zcyph.cc":        _resolve_send_forks,
+    "send.tresorit.com":    _resolve_send_forks,
+}
+
+# These domains already serve direct downloads — just need to bypass HTML check
+_DIRECT_DOWNLOAD_HOSTS: set[str] = {
+    "files.catbox.moe",     # Catbox
+    "litter.catbox.moe",    # Litterbox (temp catbox)
+    "file.io",              # file.io
+    "temp.sh",              # temp.sh
+    "transfer.sh",          # transfer.sh
+    "0x0.st",               # 0x0.st null pointer
+    "uguu.se",              # uguu
+    "a.uguu.se",            # uguu CDN
+    "oshi.at",              # oshi.at
+    "upload.disroot.org",   # Disroot upload (Lufi)
+    "bashupload.com",       # bashupload
+    "free.keep.sh",         # keep.sh
+    "up.uploadgram.me",     # uploadgram
+    "cdn.discordapp.com",   # Discord CDN
+    "media.discordapp.net", # Discord media
+    "objects.githubusercontent.com",  # GitHub release assets
+    "github.com",           # GitHub (releases/archive)
+    "raw.githubusercontent.com",      # GitHub raw
+    "gitlab.com",           # GitLab releases
+}
+
+
+async def _resolve_file_hosting_url(
+    session: aiohttp.ClientSession, url: str
+) -> tuple[str, str | None]:
+    """
+    Detect file hosting URLs and resolve them to direct download links.
+
+    Returns (resolved_url, optional_filename).
+    If the URL is not a known file hosting site, returns (url, None) unchanged.
+    """
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+
+    # Check if it's a known direct-download host (bypass HTML check later)
+    if hostname in _DIRECT_DOWNLOAD_HOSTS:
+        fname = os.path.basename(parsed.path) if parsed.path else None
+        return (url, fname)
+
+    # Check for domain match (exact or with www. prefix)
+    resolver = _FILE_HOSTING_RESOLVERS.get(hostname)
+    if not resolver:
+        # Try stripping www.
+        bare = hostname.removeprefix("www.")
+        resolver = _FILE_HOSTING_RESOLVERS.get(bare)
+
+    if resolver:
+        try:
+            result = await resolver(session, url, parsed)
+            if result:
+                log.info(f"[FileHosting] Resolved {hostname} → direct download")
+                return result
+            log.warning(f"[FileHosting] Resolver for {hostname} returned None — trying as-is")
+        except Exception as e:
+            log.warning(f"[FileHosting] Resolver error for {hostname}: {e}")
+
+    return (url, None)
+
+
+def _is_file_hosting_domain(url: str) -> bool:
+    """Check if URL is from a known file hosting service."""
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    bare = hostname.removeprefix("www.")
+    return (hostname in _DIRECT_DOWNLOAD_HOSTS
+            or bare in _DIRECT_DOWNLOAD_HOSTS
+            or hostname in _FILE_HOSTING_RESOLVERS
+            or bare in _FILE_HOSTING_RESOLVERS)
+
+
 async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
     """Download a file from URL via Tor (if configured). Returns (filepath, display_filename)."""
     if not URL_PATTERN.match(url):
@@ -6153,14 +6652,16 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
         raise ValueError(f"Blocked: {block_reason}")
 
     # Block non-download domains (YouTube, social media, etc.)
+    # Skip this check for known file hosting sites
     hn_lower = hostname.lower()
-    for nd_domain in NON_DOWNLOAD_DOMAINS:
-        if hn_lower == nd_domain or hn_lower.endswith("." + nd_domain):
-            raise ValueError(
-                f"**{nd_domain}** is not a file download link.\n"
-                "This command scans files for malware — please provide a direct download URL "
-                "(e.g. a `.jar`, `.zip`, or `.exe` link)."
-            )
+    if not _is_file_hosting_domain(url):
+        for nd_domain in NON_DOWNLOAD_DOMAINS:
+            if hn_lower == nd_domain or hn_lower.endswith("." + nd_domain):
+                raise ValueError(
+                    f"**{nd_domain}** is not a file download link.\n"
+                    "This command scans files for malware — please provide a direct download URL "
+                    "(e.g. a `.jar`, `.zip`, or `.exe` link)."
+                )
 
     # Warn (but allow) paste site URLs — attackers commonly host payloads there
     _PASTE_WARN_DOMAINS = {"pastebin.com", "hastebin.com", "gist.github.com",
@@ -6217,11 +6718,30 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
     else:
         connector = aiohttp.TCPConnector(resolver=_SafeResolver())
 
+    is_file_hosting = _is_file_hosting_domain(url)
+
     async with aiohttp.ClientSession(connector=connector) as session:
+        # ── File hosting URL resolution ──
+        # For known file hosting sites, resolve page URL → direct download URL
+        resolved_url = url
+        resolved_fname = None
+        if is_file_hosting:
+            try:
+                resolved_url, resolved_fname = await _resolve_file_hosting_url(session, url)
+                if resolved_fname:
+                    safe_fname = re.sub(r"[^\w.\-]", "_", resolved_fname)[:100]
+                    if safe_fname and safe_fname not in (".", ".."):
+                        display_name = safe_fname.lstrip(".") or "downloaded_file"
+                        dl_path = os.path.join(work_dir, display_name)
+                log.info(f"[FileHosting] Using URL: {resolved_url[:80]}")
+            except Exception as e:
+                log.warning(f"[FileHosting] Resolution failed, trying original URL: {e}")
+                resolved_url = url
+
         # First, HEAD request to check for redirects and content type
         # (catches IP grabbers that redirect through tracking)
         try:
-            async with session.head(url, timeout=aiohttp.ClientTimeout(total=15),
+            async with session.head(resolved_url, timeout=aiohttp.ClientTimeout(total=15),
                                      allow_redirects=True, max_redirects=5) as head_resp:
                 # Check final URL after redirects
                 final_url = str(head_resp.url)
@@ -6238,18 +6758,19 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
                 if final_dns_block:
                     raise ValueError(f"Redirect blocked: {final_dns_block}")
 
-                # Check content type
-                ct = head_resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
-                if ct and ct.startswith("text/html"):
-                    # HTML response = likely a webpage, not a file
-                    # Only allow if content-disposition suggests a download
-                    cd = head_resp.headers.get("Content-Disposition", "")
-                    if "attachment" not in cd.lower():
-                        raise ValueError(
-                            "URL returns an HTML page, not a downloadable file.\n"
-                            "Please provide a **direct download link** to a file "
-                            "(e.g. a `.jar`, `.zip`, or `.exe` URL)."
-                        )
+                # Check content type — skip for known file hosting (resolver already got direct URL)
+                if not is_file_hosting:
+                    ct = head_resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+                    if ct and ct.startswith("text/html"):
+                        # HTML response = likely a webpage, not a file
+                        # Only allow if content-disposition suggests a download
+                        cd = head_resp.headers.get("Content-Disposition", "")
+                        if "attachment" not in cd.lower():
+                            raise ValueError(
+                                "URL returns an HTML page, not a downloadable file.\n"
+                                "Please provide a **direct download link** to a file "
+                                "(e.g. a `.jar`, `.zip`, or `.exe` URL)."
+                            )
         except (asyncio.TimeoutError, TimeoutError, OSError, ConnectionError) as tor_err:
             if use_tor:
                 log.warning(f"Tor proxy failed for HEAD request: {tor_err}")
@@ -6273,7 +6794,7 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
             # Actual download via current session (Tor or direct)
             try:
                 dl_path, display_name, total = await _do_download(
-                    session, url, work_dir, dl_path, display_name
+                    session, resolved_url, work_dir, dl_path, display_name
                 )
             except (asyncio.TimeoutError, TimeoutError, OSError, ConnectionError) as dl_err:
                 if use_tor:
@@ -6296,9 +6817,21 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
     if tor_failed:
         log.warning("Tor proxy unreachable — falling back to direct download (no Tor)")
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=_SafeResolver())) as direct_session:
+            # Re-resolve file hosting URLs with direct session (Tor was down)
+            if is_file_hosting and resolved_url == url:
+                try:
+                    resolved_url, resolved_fname = await _resolve_file_hosting_url(direct_session, url)
+                    if resolved_fname:
+                        safe_fname = re.sub(r"[^\w.\-]", "_", resolved_fname)[:100]
+                        if safe_fname and safe_fname not in (".", ".."):
+                            display_name = safe_fname.lstrip(".") or "downloaded_file"
+                            dl_path = os.path.join(work_dir, display_name)
+                except Exception:
+                    resolved_url = url
+
             # Re-do HEAD check without Tor
             try:
-                async with direct_session.head(url, timeout=aiohttp.ClientTimeout(total=15),
+                async with direct_session.head(resolved_url, timeout=aiohttp.ClientTimeout(total=15),
                                                 allow_redirects=True, max_redirects=5) as head_resp:
                     final_url = str(head_resp.url)
                     final_parsed = urlparse(final_url)
@@ -6311,14 +6844,15 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
                     final_dns_block = await _resolve_and_check(final_host)
                     if final_dns_block:
                         raise ValueError(f"Redirect blocked: {final_dns_block}")
-                    ct = head_resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
-                    if ct and ct.startswith("text/html"):
-                        cd = head_resp.headers.get("Content-Disposition", "")
-                        if "attachment" not in cd.lower():
-                            raise ValueError(
-                                "URL returns an HTML page, not a downloadable file.\n"
-                                "Please provide a **direct download link** to a file."
-                            )
+                    if not is_file_hosting:
+                        ct = head_resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+                        if ct and ct.startswith("text/html"):
+                            cd = head_resp.headers.get("Content-Disposition", "")
+                            if "attachment" not in cd.lower():
+                                raise ValueError(
+                                    "URL returns an HTML page, not a downloadable file.\n"
+                                    "Please provide a **direct download link** to a file."
+                                )
             except aiohttp.ClientError as head_err:
                 raise ValueError(f"Download failed (Tor down, direct also failed): {head_err}")
             except (asyncio.TimeoutError, TimeoutError) as head_err:
@@ -6326,7 +6860,7 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
 
             try:
                 dl_path, display_name, total = await _do_download(
-                    direct_session, url, work_dir, dl_path, display_name
+                    direct_session, resolved_url, work_dir, dl_path, display_name
                 )
             except (asyncio.TimeoutError, TimeoutError, aiohttp.ClientError) as dl_err:
                 raise ValueError(f"Download failed (Tor down, direct also failed): {dl_err}")
@@ -6781,7 +7315,7 @@ async def giverat_command(
             async def _update_queue_msg(_qm=_qm, _dn=_dn):
                 if _qm is None:
                     return
-                while True:
+                for _ in range(200):  # Max ~10 min (200 * 3s)
                     await asyncio.sleep(3)
                     pos = scan_queue.pending
                     if pos <= 0:
@@ -7966,6 +8500,54 @@ async def run_scan(
                 except Exception as exc:
                     log.warning(f"Generic deobfuscation failed: {exc}")
 
+            # ── Source-level deobfuscation (Bozar, ZKM, Allatori, etc.) ──
+            if SOURCE_DEOBFUSCATOR_AVAILABLE and all_log_dirs:
+                stage_details["Local Analysis"] = "Source-level deobfuscation..."
+                await update_progress(stages, filename, file_size, hashes)
+                try:
+                    def _run_source_deobf():
+                        results = []
+                        for ld in all_log_dirs:
+                            ld_path = Path(ld)
+                            # Find decompiled .java files in the log dir tree
+                            java_files = list(ld_path.rglob("*.java"))
+                            for jf in java_files:
+                                try:
+                                    src = jf.read_text(encoding="utf-8", errors="replace")
+                                    if len(src.strip()) < 50:
+                                        continue
+                                    # Quick fingerprint check — skip files with no obfuscation
+                                    fp = _fingerprint_obfuscator(src)
+                                    if not fp:
+                                        continue
+                                    out_path = str(jf.with_name(jf.stem + "_deobfuscated.java"))
+                                    out, conf = _source_deobfuscate(str(jf), out_path, verbose=False)
+                                    results.append({
+                                        "file": jf.name,
+                                        "obfuscators": fp,
+                                        "confidence": conf.get("confidence", 0) * 100,
+                                        "level": conf.get("level", "UNKNOWN"),
+                                        "reduction": conf.get("code_reduction", 0) * 100,
+                                    })
+                                except Exception as e:
+                                    log.debug(f"Source deobf skipped {jf.name}: {e}")
+                        return results
+                    src_deobf_results = await run_in_scan_thread(_run_source_deobf)
+                    if src_deobf_results:
+                        obf_names = set()
+                        for r in src_deobf_results:
+                            obf_names.update(r["obfuscators"].keys())
+                        avg_conf = sum(r["confidence"] for r in src_deobf_results) / len(src_deobf_results)
+                        log.info(f"Source deobfuscation: {len(src_deobf_results)} file(s), "
+                                 f"detected: {', '.join(obf_names)}, avg confidence: {avg_conf:.0f}%")
+                        # Add detected obfuscators to the obfuscators list
+                        for name in obf_names:
+                            pretty = name.title() + " (source-level deobfuscation applied)"
+                            if not any(name.lower() in o.lower() for o in obfuscators):
+                                obfuscators.append(pretty)
+                except Exception as exc:
+                    log.warning(f"Source-level deobfuscation failed: {exc}")
+
             # ── Entropy analysis ──
             stage_details["Local Analysis"] = "Analyzing entropy..."
             await update_progress(stages, filename, file_size, hashes)
@@ -8020,11 +8602,11 @@ async def run_scan(
         stage_details["Local Analysis"] = "Running YARA rules..."
         await update_progress(stages, filename, file_size, hashes)
         # YARA scanning with size limits to prevent hangs with 82k+ rules:
-        # Fast/scraper: 2MB limit. Full Discord scan: 10MB limit per file.
+        # Fast/scraper: 2MB limit. Full Discord scan: 50MB (covers large JARs like RusherClient 12.9MB).
         if fast:
             yara_matches = await run_in_scan_thread(lambda: run_yara(dl_path, max_size_mb=2.0))
         else:
-            yara_matches = await run_in_scan_thread(lambda: run_yara(dl_path, max_size_mb=10.0))
+            yara_matches = await run_in_scan_thread(lambda: run_yara(dl_path, max_size_mb=50.0))
         if not fast:
             all_scan_files = jars_to_scan + extracted_files
             for sf in all_scan_files:
@@ -8174,8 +8756,12 @@ async def run_scan(
         async with sha_lock:
             # Archive must happen before catalog update so scanned_path is set
             if CFG["scanner"].get("save_samples", False):
+                _file_size = os.path.getsize(dl_path) if os.path.exists(dl_path) else 0
+                _skip_src = _file_size > LARGE_FILE_THRESHOLD
+                if _skip_src:
+                    log.info(f"[{scan_id}] Large file ({_file_size / 1024 / 1024:.1f} MB) — analysis only, source not archived")
                 for ld in all_log_dirs:
-                    scanned_path = archive_scan(ld, dl_path, sha256=sha256)
+                    scanned_path = archive_scan(ld, dl_path, sha256=sha256, skip_source=_skip_src)
 
             # Re-read catalog under lock to get latest submitters/guilds
             prev_scan_locked = await catalog_lookup(sha256)
@@ -8586,7 +9172,9 @@ async def run_scan(
                     entropy, extracted_strings, manifest, format_analysis,
                     mb_result=mb_result, ha_result=ha_result,
                 )
-                # Re-apply URL and ETH adjustments (shared helper)
+                # Re-apply URL and ETH adjustments (shared helper) — clear stale keys first
+                score_breakdown.pop("url_analysis", None)
+                score_breakdown.pop("eth_analysis", None)
                 new_score, new_level, new_color = _apply_url_eth_adj(
                     new_score, url_analysis, eth_analysis, all_iocs, score_breakdown, format_analysis)
                 if new_score != score:
@@ -8640,10 +9228,11 @@ async def run_scan(
                         pass
 
         # Fire-and-forget the API background task (it handles its own cleanup)
-        _has_bg_api = http_session and not http_session.closed and (vt_enabled or mb_enabled or ha_enabled)
-        if _has_bg_api:
+        _has_bg_api = False
+        if http_session and not http_session.closed and (vt_enabled or mb_enabled or ha_enabled):
             try:
                 _track_poll_task(_api_background())
+                _has_bg_api = True
             except Exception:
                 _has_bg_api = False
 
@@ -8973,12 +9562,12 @@ if __name__ == "__main__":
         for task in list(_background_poll_tasks):
             task.cancel()
         _background_poll_tasks.clear()
-        # Reset lazy-initialized asyncio locks — they're bound to the old event loop
-        _stats_lock = None
-        _catalog_lock = None
-        _sha256_locks_guard = None
-        _exceptions_md_lock = None
-        _vt_rate_lock = None
+        # Reinitialize asyncio locks for the new event loop
+        _stats_lock = asyncio.Lock()
+        _catalog_lock = asyncio.Lock()
+        _sha256_locks_guard = asyncio.Lock()
+        _exceptions_md_lock = asyncio.Lock()
+        _vt_rate_lock = asyncio.Lock()
         _sha256_locks.clear()
         scan_queue = ScanQueue(CFG["scanner"]["max_concurrent_scans"])
         _ready_fired = False
