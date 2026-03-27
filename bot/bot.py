@@ -6117,7 +6117,8 @@ class _SafeResolver(aiohttp.DefaultResolver):
         return results
 
 
-async def _do_download(session, url: str, work_dir: str, dl_path: str, display_name: str) -> tuple[str, str, int]:
+async def _do_download(session, url: str, work_dir: str, dl_path: str, display_name: str,
+                       skip_html_check: bool = False) -> tuple[str, str, int]:
     """Execute the actual GET download. Returns (filepath, display_name, total_bytes)."""
     async with session.get(url, timeout=aiohttp.ClientTimeout(total=120),
                            allow_redirects=True, max_redirects=5) as resp:
@@ -6142,15 +6143,16 @@ async def _do_download(session, url: str, work_dir: str, dl_path: str, display_n
         if content_length and content_length > MAX_URL_DOWNLOAD:
             raise ValueError(f"File too large ({content_length / 1024 / 1024:.1f} MB)")
 
-        # Content type check on GET
-        ct = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
-        if ct == "text/html":
-            cd = resp.headers.get("Content-Disposition", "")
-            if "attachment" not in cd.lower():
-                raise ValueError(
-                    "URL serves an HTML page, not a file download.\n"
-                    "Please provide a **direct download link** to a file."
-                )
+        # Content type check on GET — skip for known file hosting sites
+        if not skip_html_check:
+            ct = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            if ct == "text/html":
+                cd = resp.headers.get("Content-Disposition", "")
+                if "attachment" not in cd.lower():
+                    raise ValueError(
+                        "URL serves an HTML page, not a file download.\n"
+                        "Please provide a **direct download link** to a file."
+                    )
 
         # Try to get filename from content-disposition
         cd = resp.headers.get("Content-Disposition", "")
@@ -6794,7 +6796,8 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
             # Actual download via current session (Tor or direct)
             try:
                 dl_path, display_name, total = await _do_download(
-                    session, resolved_url, work_dir, dl_path, display_name
+                    session, resolved_url, work_dir, dl_path, display_name,
+                    skip_html_check=is_file_hosting
                 )
             except (asyncio.TimeoutError, TimeoutError, OSError, ConnectionError) as dl_err:
                 if use_tor:
@@ -6860,7 +6863,8 @@ async def download_from_url(url: str, work_dir: str) -> tuple[str, str]:
 
             try:
                 dl_path, display_name, total = await _do_download(
-                    direct_session, resolved_url, work_dir, dl_path, display_name
+                    direct_session, resolved_url, work_dir, dl_path, display_name,
+                    skip_html_check=is_file_hosting
                 )
             except (asyncio.TimeoutError, TimeoutError, aiohttp.ClientError) as dl_err:
                 raise ValueError(f"Download failed (Tor down, direct also failed): {dl_err}")
