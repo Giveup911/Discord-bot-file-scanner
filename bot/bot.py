@@ -6211,64 +6211,131 @@ async def _do_download(session, url: str, work_dir: str, dl_path: str, display_n
 # Each resolver takes (session, url, parsed_url) and returns
 # (direct_url, optional_filename) or None if it can't resolve.
 
+def _gofile_generate_wt(token: str, wt_js_code: str) -> str | None:
+    """Run Gofile's obfuscated generateWT() function via Node.js to get the website token."""
+    try:
+        node_script = wt_js_code + f'\nconsole.log(generateWT("{token}"));'
+        fd, tmp = tempfile.mkstemp(suffix=".js")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(node_script)
+            result = subprocess.run(
+                ["node", tmp], capture_output=True, text=True, timeout=10
+            )
+            wt = result.stdout.strip()
+            if wt and len(wt) > 10:
+                return wt
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        log.warning(f"[Gofile] Node.js WT generation failed: {e}")
+    return None
+
+
 async def _resolve_gofile(session: aiohttp.ClientSession, url: str, parsed) -> tuple[str, str | None] | None:
-    """Gofile: gofile.io/d/{id} → API lookup for direct download link.
-    Gofile requires a guest account token (POST) and contents API.
-    As of 2026-03 the contents API requires premium — raises ValueError to inform user."""
+    """Gofile: gofile.io/d/{id} → scrape via API with browser-like auth.
+    Uses Node.js to evaluate Gofile's obfuscated wt.obf.js for the X-Website-Token."""
     m = re.match(r'/d/([a-zA-Z0-9]+)', parsed.path)
     if not m:
         return None
     content_id = m.group(1)
+
+    _ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
     try:
-        # Step 1: Create guest account (POST, not GET)
+        # Step 1: Create guest account (POST)
         async with session.post("https://api.gofile.io/accounts",
                                 timeout=aiohttp.ClientTimeout(total=15),
                                 headers={"Accept": "application/json",
-                                          "Content-Type": "application/json"},
+                                          "Content-Type": "application/json",
+                                          "User-Agent": _ua},
                                 json={}) as resp:
-            if resp.status != 200:
+            data = await resp.json(content_type=None)
+            if data.get("status") != "ok":
                 raise ValueError(
-                    "**Gofile** links cannot be resolved automatically (API unavailable).\n"
+                    f"**Gofile** API error: {data.get('status', 'unknown')}.\n"
                     "Please download the file and upload it directly, or provide a direct download link."
                 )
-            data = await resp.json(content_type=None)
             token = data.get("data", {}).get("token")
             if not token:
                 raise ValueError(
-                    "**Gofile** links cannot be resolved automatically.\n"
+                    "**Gofile** could not create guest account.\n"
                     "Please download the file and upload it directly."
                 )
-        # Step 2: Fetch contents
-        async with session.get(f"https://api.gofile.io/contents/{content_id}?wt=4fd6sg89d7s6",
-                               timeout=aiohttp.ClientTimeout(total=15),
-                               headers={"Authorization": f"Bearer {token}",
-                                         "Accept": "application/json"}) as resp:
-            if resp.status == 401:
-                # Premium-only error
-                raise ValueError(
-                    "**Gofile** now requires premium access for API downloads.\n"
-                    "Please download the file from Gofile and upload it directly to the bot, "
-                    "or use a different file hosting service."
-                )
-            if resp.status != 200:
-                raise ValueError(
-                    f"**Gofile** API returned HTTP {resp.status}.\n"
-                    "Please download the file and upload it directly."
-                )
+
+        # Step 2: Fetch and run wt.obf.js via Node.js to generate X-Website-Token
+        wt_value = None
+        try:
+            async with session.get("https://gofile.io/dist/js/wt.obf.js",
+                                   timeout=aiohttp.ClientTimeout(total=10),
+                                   headers={"User-Agent": _ua}) as resp:
+                if resp.status == 200:
+                    wt_js = await resp.text()
+                    wt_value = await asyncio.get_event_loop().run_in_executor(
+                        None, _gofile_generate_wt, token, wt_js
+                    )
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            pass
+
+        if not wt_value:
+            log.warning("[Gofile] Could not generate X-Website-Token (Node.js unavailable?)")
+            raise ValueError(
+                "**Gofile** requires browser-like authentication that needs Node.js.\n"
+                "Please download the file and upload it directly, or provide a direct download link."
+            )
+
+        # Step 3: Fetch contents with full browser-like headers
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Website-Token": wt_value,
+            "X-BL": "en-US",
+            "User-Agent": _ua,
+            "Origin": "https://gofile.io",
+            "Referer": "https://gofile.io/",
+            "Accept": "*/*",
+        }
+        api_url = (f"https://api.gofile.io/contents/{content_id}"
+                   f"?page=1&pageSize=1000&sortField=createTime&sortDirection=-1")
+
+        async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=20),
+                               headers=headers) as resp:
             data = await resp.json(content_type=None)
-            contents = data.get("data", {}).get("children", {})
-            for _fid, finfo in contents.items():
+            status = data.get("status", "")
+
+            if status == "error-notPremium":
+                raise ValueError(
+                    "**Gofile** blocked this request (premium-only or anti-bot).\n"
+                    "Please download the file from Gofile and upload it directly to the bot."
+                )
+            if status == "error-notFound":
+                raise ValueError(
+                    "**Gofile** link not found — the file may have been deleted or expired."
+                )
+            if status != "ok":
+                raise ValueError(
+                    f"**Gofile** API error: `{status}`.\n"
+                    "Please download the file and upload it directly."
+                )
+
+            children = data.get("data", {}).get("children", {})
+            for _fid, finfo in children.items():
                 if finfo.get("type") == "file":
                     direct = finfo.get("link")
                     fname = finfo.get("name")
                     if direct:
+                        log.info(f"[Gofile] Resolved: {fname} → {direct[:60]}...")
                         return (direct, fname)
+
     except ValueError:
-        raise  # Re-raise our user-facing errors
-    except (aiohttp.ClientError, asyncio.TimeoutError, KeyError):
-        pass
+        raise
+    except (aiohttp.ClientError, asyncio.TimeoutError, KeyError) as e:
+        log.warning(f"[Gofile] Connection error: {e}")
+
     raise ValueError(
-        "**Gofile** link could not be resolved.\n"
+        "**Gofile** link could not be resolved (no downloadable files found).\n"
         "Please download the file and upload it directly, or provide a direct download link."
     )
 
@@ -7201,7 +7268,7 @@ async def giverat_command(
     ),
     file: discord.Option(
         discord.Attachment,
-        description="File to scan (up to 100MB)",
+        description="File to scan (Discord limit ~25MB; use URL for larger files)",
         required=False,
         default=None,
     ),
@@ -8032,15 +8099,46 @@ async def run_scan(
             filename = re.sub(r"[^\w.\-]", "_", attachment.filename or "unknown")
             dl_path = os.path.join(work_dir, filename)
             max_bytes = CFG["scanner"]["max_file_size_mb"] * 1024 * 1024
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as dl_session:
-                async with dl_session.get(attachment.url) as resp:
-                    total_dl = 0
-                    async with aiofiles.open(dl_path, "wb") as f:
-                        async for chunk in resp.content.iter_chunked(65536):
-                            total_dl += len(chunk)
-                            if total_dl > max_bytes:
-                                raise ValueError(f"File exceeded {CFG['scanner']['max_file_size_mb']} MB during download")
-                            await f.write(chunk)
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as dl_session:
+                    async with dl_session.get(attachment.url) as resp:
+                        if resp.status != 200:
+                            raise ValueError(
+                                f"Discord returned HTTP {resp.status} downloading the attachment.\n"
+                                "The file may have expired or been removed. Try re-uploading."
+                            )
+                        total_dl = 0
+                        async with aiofiles.open(dl_path, "wb") as f:
+                            async for chunk in resp.content.iter_chunked(65536):
+                                total_dl += len(chunk)
+                                if total_dl > max_bytes:
+                                    raise ValueError(f"File exceeded {CFG['scanner']['max_file_size_mb']} MB during download")
+                                await f.write(chunk)
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as dl_err:
+                await safe_send(
+                    embed=discord.Embed(
+                        title="Download Failed",
+                        description=(
+                            f"Failed to download attachment: {type(dl_err).__name__}\n\n"
+                            "**Common causes:**\n"
+                            "- File too large for Discord (>25MB on most servers)\n"
+                            "- Upload timed out or was interrupted\n\n"
+                            "**Fix:** Upload the file to a hosting site (pixeldrain.com, temp.sh, "
+                            "catbox.moe, etc.) and use `/giverat url:<link>`"
+                        ),
+                        color=0xE74C3C,
+                    )
+                )
+                return
+            except ValueError as ve:
+                await safe_send(
+                    embed=discord.Embed(
+                        title="Download Failed",
+                        description=sanitize_path(str(ve)),
+                        color=0xE74C3C,
+                    )
+                )
+                return
         else:
             await progress("Downloading from URL...")
             try:
