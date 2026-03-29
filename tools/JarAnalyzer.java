@@ -155,7 +155,8 @@ public class JarAnalyzer {
         // VAPE_CURIUM detection
         // NetworkManager removed — too common in legitimate mods (every Fabric/Forge networking mod has one)
         CFG.setProperty("vape.curium.classes", "TextureAtlasCache|ShaderCompileCache|ChunkMeshPool");
-        CFG.setProperty("vape.curium.rawstrings", "curium|boobility|daddydex|fabric-perf-tweaks|lazydfu");
+        // lazydfu and fabric-perf-tweaks removed: legitimate mod names that cause FPs
+        CFG.setProperty("vape.curium.rawstrings", "curium|boobility|daddydex");
         CFG.setProperty("vape.curium.packages", "com_curium|com/curium");
 
         // MSHTA_DROPPER detection
@@ -178,11 +179,14 @@ public class JarAnalyzer {
         CFG.setProperty("weirdutils.classes", "ObfuscatedClassloader|WeirdUtils");
 
         // COMET detection
-        CFG.setProperty("comet.rawstrings", "*auth|81dc9bdb52d04dc20036dbd8313ed055|replit.dev|replit.app");
-        CFG.setProperty("comet.classes", "CometBackdoor|Comet");
+        // Comet: require MD5 hash or replit C2 — *auth alone is too generic
+        CFG.setProperty("comet.rawstrings", "81dc9bdb52d04dc20036dbd8313ed055|replit.dev|replit.app");
+        CFG.setProperty("comet.classes", "CometBackdoor");
 
         // ECTASY detection
-        CFG.setProperty("ectasy.rawstrings", "ectasy.club|PluginMetrics|TranslatableComponentDeserializer|bungee.jar");
+        // Ectasy: PluginMetrics removed (matches bStats in thousands of legit plugins)
+        // bungee.jar removed (matches legitimate BungeeCord); keeping ectasy.club domain + specific class
+        CFG.setProperty("ectasy.rawstrings", "ectasy.club|TranslatableComponentDeserializer");
         CFG.setProperty("ectasy.classes", "Ectasy|TranslatableComponentDeserializer");
 
         // SERVER_CRASHER detection (2Packets, xynis, etc.)
@@ -879,17 +883,23 @@ public class JarAnalyzer {
         } catch (Exception ignored) {}
 
         // Fallback: if source/ is empty, decompile in-memory with CFR
-        if (decompiled.length() == 0) {
+        if (decompiled.length() == 0 && cfrPath != null) {
             warn("Source dir empty, falling back to in-memory CFR decompilation");
             for (Map.Entry<String, byte[]> e : classes.entrySet()) {
                 if (isLibraryClass(e.getKey())) continue;
-                Path classFile = tempDir.resolve(e.getKey());
-                Files.createDirectories(classFile.getParent());
-                Files.write(classFile, e.getValue());
-                String cfrSrc = runCFR(cfrPath, classFile.toString());
-                decompiled.append(cfrSrc).append("\n");
-                sourceFiles.put(e.getKey().replace(".class", ".java"), cfrSrc);
+                try {
+                    Path classFile = tempDir.resolve(e.getKey());
+                    Files.createDirectories(classFile.getParent());
+                    Files.write(classFile, e.getValue());
+                    String cfrSrc = runCFR(cfrPath, classFile.toString());
+                    decompiled.append(cfrSrc).append("\n");
+                    sourceFiles.put(e.getKey().replace(".class", ".java"), cfrSrc);
+                } catch (Exception cfrEx) {
+                    warn("  CFR in-memory failed for " + e.getKey() + ": " + cfrEx.getMessage());
+                }
             }
+        } else if (decompiled.length() == 0) {
+            warn("Source dir empty and no CFR available — analysis will rely on bytecode markers only");
         }
         String src = decompiled.toString();
 
@@ -1007,6 +1017,8 @@ public class JarAnalyzer {
         }
 
         // ── Dispatch to variant-specific analyzer ────────────────────
+        // Wrapped in try/catch so a crash in any variant analyzer still produces IOCs JSON
+        try {
         switch (variant) {
             case WEEDHACK:
                 analyzeDropper(jarPath, jarSha256, src, classes, markers, ts, hasCasinoClasses);
@@ -1082,6 +1094,19 @@ public class JarAnalyzer {
             default:
                 analyzeUnknown(jarPath, jarSha256, src, classes, markers, ts, configEntry, configRaw, cfrPath, tempDir);
                 break;
+        }
+        } catch (Exception variantEx) {
+            // Variant analyzer crashed — still produce IOCs so the scan isn't lost
+            warn("Variant analyzer (" + variant + ") crashed: " + variantEx.getMessage());
+            ilog("  Stack trace: " + Arrays.toString(variantEx.getStackTrace()).substring(0, Math.min(500, Arrays.toString(variantEx.getStackTrace()).length())));
+            try {
+                // Export whatever we have as generic IOCs
+                exportGenericIocsJson(jarPath, jarSha256, variant.name().toLowerCase() + "_crashed",
+                    markers, new ArrayList<>(), new LinkedHashMap<>());
+                warn("Exported partial IOCs despite crash");
+            } catch (Exception iocsEx) {
+                warn("Failed to export fallback IOCs: " + iocsEx.getMessage());
+            }
         }
 
         // ── Step 7: Create main/ and main/important/ ─────────────────
@@ -1393,13 +1418,22 @@ public class JarAnalyzer {
             ilog("  → Vape Curium: " + curiumClassHits + " signature classes matched");
             return Variant.VAPE_CURIUM;
         }
-        for (byte[] classData : classes.values()) {
-            String ascii = new String(classData, StandardCharsets.US_ASCII);
-            for (String sig : cfgArr("vape.curium.rawstrings")) {
-                if (!sig.isEmpty() && ascii.contains(sig)) {
-                    ilog("  → Vape Curium (raw sig '" + sig + "' in class data)");
-                    return Variant.VAPE_CURIUM;
+        {
+            int curiumRawHits = 0;
+            Set<String> curiumRawMatched = new LinkedHashSet<>();
+            for (byte[] classData : classes.values()) {
+                String ascii = new String(classData, StandardCharsets.US_ASCII);
+                for (String sig : cfgArr("vape.curium.rawstrings")) {
+                    if (!sig.isEmpty() && !curiumRawMatched.contains(sig) && ascii.contains(sig)) {
+                        curiumRawMatched.add(sig);
+                        curiumRawHits++;
+                        ilog("  → Vape Curium candidate: raw sig '" + sig + "' in class data");
+                    }
                 }
+            }
+            if (curiumRawHits >= 2) {
+                ilog("  → Vape Curium: " + curiumRawHits + " distinct raw signature hits — classifying");
+                return Variant.VAPE_CURIUM;
             }
         }
 
@@ -3742,6 +3776,31 @@ public class JarAnalyzer {
         return cleanJar;
     }
 
+    /** Drain a process's stdout/stderr in a daemon thread to prevent deadlocks.
+     *  Returns immediately — the thread runs in the background. */
+    static void drainProcessOutput(Process p) {
+        Thread t = new Thread(() -> {
+            try { p.getInputStream().transferTo(OutputStream.nullOutputStream()); }
+            catch (Exception ignored) {}
+        });
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** Run a decompiler process with proper timeout handling.
+     *  Returns true if the process completed within the timeout. */
+    static boolean runDecompilerProcess(Process p, int timeoutSeconds) throws InterruptedException {
+        drainProcessOutput(p);
+        boolean done = p.waitFor(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS);
+        if (!done) {
+            p.destroyForcibly();
+            p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS);
+        } else {
+            p.destroyForcibly();
+        }
+        return done;
+    }
+
     /** Decompile a full JAR using cascade: Vineflower -> JADX -> Procyon -> CFR.
      *  After each decompiler, checks that critical files actually decompiled
      *  (not just error stubs). Falls through if key files have "Couldn't be decompiled". */
@@ -3760,10 +3819,8 @@ public class JarAnalyzer {
                         "-ren=1", "-thr=4", "-dgs=1", "-lit=1",
                         jarPath, sourceDir.toString())
                     .redirectErrorStream(true).start();
-                p.getInputStream().transferTo(OutputStream.nullOutputStream());
-                boolean done = p.waitFor(decompileTimeout, java.util.concurrent.TimeUnit.SECONDS);
-                if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
-                else p.destroyForcibly();
+                boolean done = runDecompilerProcess(p, decompileTimeout);
+                if (!done) warn("  Vineflower timed out after " + decompileTimeout + "s");
                 long fileCount = countJavaFiles(sourceDir);
                 long failedCount = countFailedDecompiles(sourceDir);
                 if (fileCount > 0 && failedCount == 0) {
@@ -3786,10 +3843,8 @@ public class JarAnalyzer {
                 step("  Trying JADX...");
                 Process p = new ProcessBuilder("java", heap, "-jar", jadx, "--deobf", "-d", sourceDir.toString(), jarPath)
                     .redirectErrorStream(true).start();
-                p.getInputStream().transferTo(OutputStream.nullOutputStream());
-                boolean done = p.waitFor(decompileTimeout, java.util.concurrent.TimeUnit.SECONDS);
-                if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
-                else p.destroyForcibly();
+                boolean done = runDecompilerProcess(p, decompileTimeout);
+                if (!done) warn("  JADX timed out after " + decompileTimeout + "s");
                 long fileCount = countJavaFiles(sourceDir);
                 if (fileCount > 0) {
                     ok("  JADX produced " + fileCount + " .java file(s)");
@@ -3807,10 +3862,8 @@ public class JarAnalyzer {
                 Process p = new ProcessBuilder("java", heap, "-jar", procyon,
                         "-jar", jarPath, "-o", sourceDir.toString())
                     .redirectErrorStream(true).start();
-                p.getInputStream().transferTo(OutputStream.nullOutputStream());
-                boolean done = p.waitFor(decompileTimeout, java.util.concurrent.TimeUnit.SECONDS);
-                if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
-                else p.destroyForcibly();
+                boolean done = runDecompilerProcess(p, decompileTimeout);
+                if (!done) warn("  Procyon timed out after " + decompileTimeout + "s");
                 long fileCount = countJavaFiles(sourceDir);
                 if (fileCount > 0) {
                     ok("  Procyon produced " + fileCount + " .java file(s)");
@@ -3828,10 +3881,8 @@ public class JarAnalyzer {
                 Process p = new ProcessBuilder("java", heap, "-jar", cfr, jarPath,
                         "--outputdir", sourceDir.toString(), "--renameillegalidents", "true")
                     .redirectErrorStream(true).start();
-                p.getInputStream().transferTo(OutputStream.nullOutputStream());
-                boolean done = p.waitFor(decompileTimeout, java.util.concurrent.TimeUnit.SECONDS);
-                if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
-                else p.destroyForcibly();
+                boolean done = runDecompilerProcess(p, decompileTimeout);
+                if (!done) warn("  CFR timed out after " + decompileTimeout + "s");
                 long fileCount = countJavaFiles(sourceDir);
                 if (fileCount > 0) return "CFR";
             } catch (Exception e) {
@@ -3841,15 +3892,20 @@ public class JarAnalyzer {
         return "none";
     }
 
-    /** Count .java files that contain "Couldn't be decompiled" */
+    /** Count .java files that contain "Couldn't be decompiled" or are empty/stub */
     static long countFailedDecompiles(Path dir) {
         try (var walker = Files.walk(dir)) {
             return walker
                 .filter(p -> p.toString().endsWith(".java"))
                 .filter(p -> {
                     try {
+                        long size = Files.size(p);
+                        if (size == 0) return true; // 0-byte file = decompiler created it but wrote nothing
                         String content = Files.readString(p);
-                        return content.contains("Couldn't be decompiled") || content.contains("// Failed to decompile");
+                        return content.contains("Couldn't be decompiled")
+                            || content.contains("// Failed to decompile")
+                            || content.trim().isEmpty()
+                            || (size < 50 && !content.contains("class ") && !content.contains("interface ")); // stub file
                     } catch (Exception e) { return false; }
                 })
                 .count();
@@ -3866,8 +3922,12 @@ public class JarAnalyzer {
                 failedFiles = new ArrayList<>(walker.filter(p -> p.toString().endsWith(".java"))
                     .filter(p -> {
                         try {
+                            long size = Files.size(p);
+                            if (size == 0) return true; // 0-byte = decompiler failed silently
                             String content = Files.readString(p);
-                            return content.contains("Couldn't be decompiled") || content.contains("// Failed to decompile");
+                            return content.contains("Couldn't be decompiled")
+                                || content.contains("// Failed to decompile")
+                                || content.trim().isEmpty();
                         } catch (Exception e) { return false; }
                     })
                     .collect(java.util.stream.Collectors.toList()));
@@ -3884,10 +3944,7 @@ public class JarAnalyzer {
                     step("  Supplementing " + failedFiles.size() + " failed file(s) with JADX...");
                     Process p = new ProcessBuilder("java", heap, "-jar", jadx, "--deobf", "-d", jadxTmp.toString(), jarPath)
                         .redirectErrorStream(true).start();
-                    p.getInputStream().transferTo(OutputStream.nullOutputStream());
-                    boolean done = p.waitFor(timeout, java.util.concurrent.TimeUnit.SECONDS);
-                    if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
-                    else p.destroyForcibly();
+                    runDecompilerProcess(p, timeout);
 
                     int replaced = 0;
                     List<Path> stillFailed = new ArrayList<>();
@@ -3927,10 +3984,7 @@ public class JarAnalyzer {
                     Process p = new ProcessBuilder("java", heap, "-jar", procyon,
                             "-jar", jarPath, "-o", procTmp.toString())
                         .redirectErrorStream(true).start();
-                    p.getInputStream().transferTo(OutputStream.nullOutputStream());
-                    boolean done = p.waitFor(timeout, java.util.concurrent.TimeUnit.SECONDS);
-                    if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
-                    else p.destroyForcibly();
+                    runDecompilerProcess(p, timeout);
 
                     int replaced = 0;
                     List<Path> stillFailed = new ArrayList<>();
@@ -3970,10 +4024,7 @@ public class JarAnalyzer {
                     Process p = new ProcessBuilder("java", heap, "-jar", cfr, jarPath,
                             "--outputdir", cfrTmp.toString(), "--renameillegalidents", "true")
                         .redirectErrorStream(true).start();
-                    p.getInputStream().transferTo(OutputStream.nullOutputStream());
-                    boolean done = p.waitFor(timeout, java.util.concurrent.TimeUnit.SECONDS);
-                    if (!done) { p.destroyForcibly(); p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS); }
-                    else p.destroyForcibly();
+                    runDecompilerProcess(p, timeout);
 
                     int replaced = 0;
                     for (Path failed : failedFiles) {
