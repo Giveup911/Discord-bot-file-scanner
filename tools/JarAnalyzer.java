@@ -160,7 +160,8 @@ public class JarAnalyzer {
         CFG.setProperty("vape.curium.packages", "com_curium|com/curium");
 
         // MSHTA_DROPPER detection
-        CFG.setProperty("mshta.dropper.rawstrings", "mshta|settings.tel|cmd.exe /k mshta");
+        // "mshta" removed: it's a substring of "cmd.exe /k mshta" causing double-counting
+        CFG.setProperty("mshta.dropper.rawstrings", "settings.tel|cmd.exe /k mshta|mshta.exe http");
 
         // FRACTUREISER detection
         CFG.setProperty("fractureiser.rawstrings", "dev.neko|nekoclient|85.217.144.130|107.189.3.101|files.skyrage.de|libWebGL64|lib.jar|neko.run");
@@ -2778,8 +2779,9 @@ public class JarAnalyzer {
     static byte[] extractXorKey(String src) { return extractXorKey(src, null); }
 
     static byte[] extractXorKey(String src, Map<String, byte[]> classes) {
+        // Match any access modifier (private/public/protected or none) for byte[] methods
         Pattern all = Pattern.compile(
-            "private static byte\\[\\]\\s+([\\w$]+)\\(\\)\\s*\\{\\s*return new byte\\[\\]\\{([^}]+)\\};");
+            "(?:private |public |protected )?static byte\\[\\]\\s+([\\w$]+)\\(\\)\\s*\\{\\s*return new byte\\[\\]\\{([^}]+)\\};");
         int primaryMin  = cfgInt("xor.key.primary.min");
         int primaryMax  = cfgInt("xor.key.primary.max");
         int fallbackMin = cfgInt("xor.key.fallback.min");
@@ -5762,7 +5764,8 @@ public class JarAnalyzer {
                 System.getProperty("user.home") + "/Downloads/cfr-0.152.jar"}) {
             if (Files.exists(Paths.get(p))) return p;
         }
-        throw new RuntimeException("cfr-0.152.jar not found — place it in the same folder");
+        warn("cfr-0.152.jar not found — decompilation will use other decompilers only");
+        return null;
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -5800,23 +5803,28 @@ public class JarAnalyzer {
     // ─────────────────────────────────────────────────────────────────────
 
     static String runCFR(String cfrPath, String classPath) {
+        if (cfrPath == null) return "/* CFR not available */";
         java.util.concurrent.ExecutorService exec = java.util.concurrent.Executors.newSingleThreadExecutor();
+        Process p = null;
         try {
-            Process p = new ProcessBuilder("java", "-jar", cfrPath, classPath)
+            p = new ProcessBuilder("java", "-jar", cfrPath, classPath)
                 .redirectErrorStream(true).start();
             // Read output concurrently to avoid deadlock if buffer fills
+            final Process proc = p;
             java.util.concurrent.Future<byte[]> outputFuture =
-                exec.submit(() -> readBounded(p.getInputStream(), 50_000_000));
+                exec.submit(() -> readBounded(proc.getInputStream(), 50_000_000));
             if (!p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS)) {
                 p.destroyForcibly();
                 outputFuture.cancel(true);
                 return "/* CFR timed out after 120s */";
             }
             byte[] out = outputFuture.get(10, java.util.concurrent.TimeUnit.SECONDS);
-            p.destroyForcibly();
             return new String(out, StandardCharsets.UTF_8);
         } catch (Exception e) { return "/* CFR failed: " + e.getMessage() + " */"; }
-        finally { exec.shutdownNow(); }
+        finally {
+            if (p != null) p.destroyForcibly();
+            exec.shutdownNow();
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -5854,7 +5862,12 @@ public class JarAnalyzer {
         return (printable * 100L / s.length()) >= 80;
     }
 
-    static int    parseHex(String h)  { return Integer.parseUnsignedInt(h.substring(2), 16); }
+    static int parseHex(String h) {
+        try {
+            String hex = h.startsWith("0x") || h.startsWith("0X") ? h.substring(2) : h;
+            return (int) Long.parseUnsignedLong(hex, 16); // handles values > 0x7FFFFFFF
+        } catch (NumberFormatException e) { return 0; }
+    }
     static byte[] hexToBytes(String h) {
         if (h.length() % 2 != 0) h = "0" + h;
         byte[] o = new byte[h.length()/2];
@@ -5904,11 +5917,11 @@ public class JarAnalyzer {
         System.out.println(RESET); infoLog.println();
     }
 
-    static void step(String m) { System.out.println(CYAN  +"[*] "+RESET+m); infoLog.println("[*] "+m); }
-    static void ok  (String m) { System.out.println(GREEN +"[+] "+RESET+m); infoLog.println("[+] "+m); }
-    static void warn(String m) { System.out.println(YELLOW+"[!] "+RESET+m); infoLog.println("[!] "+m); }
-    static void fail(String m) { System.out.println(RED   +"[-] "+RESET+m); infoLog.println("[-] "+m); }
-    static void ilog(String m) { System.out.println("    "+m);              infoLog.println(m); }
-    static void clog(String m) { configLog.println(m); }
-    static void llog(String m) { infoLog.println(m); }
+    static void step(String m) { System.out.println(CYAN  +"[*] "+RESET+m); if (infoLog != null) infoLog.println("[*] "+m); }
+    static void ok  (String m) { System.out.println(GREEN +"[+] "+RESET+m); if (infoLog != null) infoLog.println("[+] "+m); }
+    static void warn(String m) { System.out.println(YELLOW+"[!] "+RESET+m); if (infoLog != null) infoLog.println("[!] "+m); }
+    static void fail(String m) { System.out.println(RED   +"[-] "+RESET+m); if (infoLog != null) infoLog.println("[-] "+m); }
+    static void ilog(String m) { System.out.println("    "+m);              if (infoLog != null) infoLog.println(m); }
+    static void clog(String m) { if (configLog != null) configLog.println(m); }
+    static void llog(String m) { if (infoLog != null) infoLog.println(m); }
 }

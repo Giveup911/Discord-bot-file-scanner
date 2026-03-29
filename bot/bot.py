@@ -395,10 +395,13 @@ def save_stats(stats: dict):
 
 
 scan_stats = load_stats()
-_stats_lock = asyncio.Lock()
+_stats_lock = None  # Lazy init — created on first use inside event loop
 
 
 def _get_stats_lock():
+    global _stats_lock
+    if _stats_lock is None:
+        _stats_lock = asyncio.Lock()
     return _stats_lock
 
 
@@ -541,16 +544,22 @@ def save_catalog(catalog: dict):
 
 
 file_catalog = load_catalog()
-_catalog_lock = asyncio.Lock()
+_catalog_lock = None  # Lazy init
 _sha256_locks: dict[str, asyncio.Lock] = {}
-_sha256_locks_guard = asyncio.Lock()
+_sha256_locks_guard = None  # Lazy init
 
 
 def _get_catalog_lock():
+    global _catalog_lock
+    if _catalog_lock is None:
+        _catalog_lock = asyncio.Lock()
     return _catalog_lock
 
 
 def _get_sha256_locks_guard():
+    global _sha256_locks_guard
+    if _sha256_locks_guard is None:
+        _sha256_locks_guard = asyncio.Lock()
     return _sha256_locks_guard
 
 
@@ -597,10 +606,13 @@ def load_exceptions() -> set:
     return hashes
 
 approved_exceptions = load_exceptions()
-_exceptions_md_lock = asyncio.Lock()
+_exceptions_md_lock = None  # Lazy init
 
 
 def _get_exceptions_md_lock():
+    global _exceptions_md_lock
+    if _exceptions_md_lock is None:
+        _exceptions_md_lock = asyncio.Lock()
     return _exceptions_md_lock
 
 async def check_exception(sha256: str) -> bool:
@@ -822,8 +834,13 @@ def _is_private_ip(hostname: str) -> bool:
     """Check if hostname resolves to a private/internal/dangerous IP (SSRF protection)."""
     if hostname.lower() in ("localhost", "localhost.localdomain", ""):
         return True
+    # Strip IPv6 brackets
+    clean = hostname.strip("[]")
     try:
-        addr = ipaddress.ip_address(hostname)
+        addr = ipaddress.ip_address(clean)
+        # Unwrap IPv6-mapped IPv4 addresses (::ffff:127.0.0.1 → 127.0.0.1)
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+            addr = addr.ipv4_mapped
         return (addr.is_private or addr.is_loopback or addr.is_reserved
                 or addr.is_link_local or addr.is_multicast or addr.is_unspecified
                 or (isinstance(addr, ipaddress.IPv4Address)
@@ -1318,14 +1335,20 @@ async def resolve_eth_contracts(eth_addresses: list[str], session: aiohttp.Clien
 VT_BASE = "https://www.virustotal.com/api/v3"
 
 # VT free tier: 4 requests/minute, 500/day. Use a lock to serialize.
-_vt_rate_lock = asyncio.Lock()
+_vt_rate_lock = None  # Lazy init — module-level asyncio.Lock() crashes Python 3.12+
 _vt_last_request: float = 0.0
+
+def _get_vt_rate_lock():
+    global _vt_rate_lock
+    if _vt_rate_lock is None:
+        _vt_rate_lock = asyncio.Lock()
+    return _vt_rate_lock
 
 
 async def _vt_rate_limit():
     """Ensure at least 15 seconds between VT API calls (4/min limit)."""
     global _vt_last_request
-    async with _vt_rate_lock:
+    async with _get_vt_rate_lock():
         now = time.time()
         elapsed = now - _vt_last_request
         if elapsed < 15:
@@ -6322,7 +6345,11 @@ async def _do_download(session, url: str, work_dir: str, dl_path: str, display_n
 def _gofile_generate_wt(token: str, wt_js_code: str) -> str | None:
     """Run Gofile's obfuscated generateWT() function via Node.js to get the website token."""
     try:
-        node_script = wt_js_code + f'\nconsole.log(generateWT("{token}"));'
+        # Sanitize token to prevent JS injection from API response
+        safe_token = re.sub(r'[^a-zA-Z0-9_\-]', '', token)
+        if not safe_token or safe_token != token:
+            log.warning(f"[Gofile] Token contained suspicious chars, sanitized: {token[:20]}...")
+        node_script = wt_js_code + f'\nconsole.log(generateWT("{safe_token}"));'
         fd, tmp = tempfile.mkstemp(suffix=".js")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -9804,6 +9831,7 @@ if __name__ == "__main__":
             task.cancel()
         _background_poll_tasks.clear()
         # Reinitialize asyncio locks for the new event loop
+        # (module-level scope — no global needed, just reassign)
         _stats_lock = asyncio.Lock()
         _catalog_lock = asyncio.Lock()
         _sha256_locks_guard = asyncio.Lock()
