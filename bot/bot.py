@@ -3402,9 +3402,14 @@ def _run_jar_sync(jar_path: str, master_dir: str, timeout: int) -> dict:
         except Exception as e:
             log.warning(f"Failed to parse IOCs: {e}")
 
-    analysis_txt = log_dir / "analysis.txt"
-    if analysis_txt.exists():
-        result["analysis_text"] = analysis_txt.read_text(encoding="utf-8", errors="replace")
+    # Look for {jarName}_analysis.txt (new format) or analysis.txt (legacy)
+    analysis_files = list(log_dir.glob("*_analysis.txt")) if log_dir.exists() else []
+    if not analysis_files:
+        legacy = log_dir / "analysis.txt"
+        if legacy.exists():
+            analysis_files = [legacy]
+    if analysis_files:
+        result["analysis_text"] = analysis_files[0].read_text(encoding="utf-8", errors="replace")
 
     # Fallback variant detection from stdout/info.log when _iocs.json is missing
     # (JarAnalyzer may identify variant but crash/timeout before writing JSON)
@@ -3476,9 +3481,9 @@ def compute_hashes(filepath: str) -> dict:
 DETECTION_THRESHOLD = 25
 
 HIGH_RISK_VARIANTS = {
-    "adamrat", "weedhack", "session_harvester", "vape_curium",
+    "adamrat", "adamrat_unknown", "weedhack", "session_harvester", "vape_curium",
     "mshta_dropper", "fractureiser", "skyrage", "comet", "ectasy",
-    "mclauncher_loader", "silent_net",
+    "mclauncher_loader", "silent_net", "weirdutils", "packutil_rat",
 }
 
 
@@ -3659,7 +3664,7 @@ def compute_risk_score(
             score += 12
             breakdown["webhooks"] = 12
 
-        high_risk_markers = [m for m in markers if "HIGH RISK" in m]
+        high_risk_markers = [m for m in markers if "HIGH RISK" in m or "KNOWN MALICIOUS" in m]
         _hrm_pts = min(len(high_risk_markers) * 4, 16)
         if _hrm_pts:
             score += _hrm_pts
@@ -3685,6 +3690,13 @@ def compute_risk_score(
 
         # For Minecraft mods, additionally filter out expected mod patterns and
         # bytecode-level API refs (constant pool hits, not actual method calls)
+        # Obfuscated class name patterns — bytecode refs in these should NOT be filtered
+        _OBF_CLASS_PATTERNS = re.compile(
+            r'(?:^[a-z]_[a-z]_|_[a-z]{1,2}\.class|'  # a_b_c_ single-letter packages
+            r'com_example_|'                             # Default template package
+            r'[A-Z]{10,}|'                               # ALLCAPS obfuscated names
+            r'(?:^|\()(?:[a-z]{1,2}_){3,})'              # short_short_short_ pattern
+        )
         if is_minecraft_mod:
             non_library_markers = [
                 m for m in non_library_markers
@@ -3692,7 +3704,7 @@ def compute_risk_score(
                 and not (m.startswith("Bytecode API ref:") and any(x in m for x in [
                     "Runtime.exec", "ProcessBuilder", "System.load",
                     "defineClass", "URLClassLoader",
-                ]))
+                ]) and not _OBF_CLASS_PATTERNS.search(m))  # Keep refs from obfuscated classes
             ]
 
         _marker_pts = min(len(non_library_markers), 8)
@@ -3701,6 +3713,102 @@ def compute_risk_score(
             breakdown["behavioral"] = _marker_pts
             log.info(f"[SCORE] Surviving markers ({len(non_library_markers)}): "
                      + "; ".join(m[:80] for m in non_library_markers[:10]))
+
+        # ── Threat clustering: detect dangerous combos even in Minecraft mods ──
+        # The mod filter above removes individual markers that are common in legit mods,
+        # but when MULTIPLE dangerous capabilities appear together, it's a strong signal.
+        # Check the FULL (unfiltered) marker list for these combos.
+        _all_markers_lower = " ".join(m.lower() for m in markers)
+        _has_session_theft = any(x in _all_markers_lower for x in [
+            "session accessor", "session get", "getaccesstoken", "getuuidornull",
+            "getusername", "launcher_accounts", "launcher_profiles",
+        ])
+        _has_screen_capture = "screen capture" in _all_markers_lower or "createscreencapture" in _all_markers_lower
+        _has_runtime_exec = any(x in _all_markers_lower for x in ["runtime.exec", "processbuilder"])
+        _has_unsafe = "unsafe" in _all_markers_lower
+        _has_keylogger = any(x in _all_markers_lower for x in ["keylogger", "nativekeylistener", "getasynckeystate"])
+        _has_browser_steal = any(x in _all_markers_lower for x in [
+            "login data", "web data", "local state", "logins.json", "key4.db",
+            "chrome/user data", "firefox/profiles", "brave-browser",
+        ])
+        _has_clipboard = any(x in _all_markers_lower for x in ["clipboard", "clipboardowner"])
+        _has_webcam = "webcam" in _all_markers_lower
+
+        _threat_signals = sum([
+            _has_session_theft, _has_screen_capture, _has_runtime_exec,
+            _has_unsafe, _has_keylogger, _has_browser_steal, _has_clipboard, _has_webcam,
+        ])
+
+        # 3+ distinct threat signals = almost certainly malicious, even for a mod
+        if _threat_signals >= 4:
+            _cluster_pts = min(_threat_signals * 10, 50)
+            score += _cluster_pts
+            breakdown["threat_cluster"] = _cluster_pts
+            log.info(f"[SCORE] Threat cluster: {_threat_signals} signals "
+                     f"(session={_has_session_theft}, screen={_has_screen_capture}, "
+                     f"exec={_has_runtime_exec}, unsafe={_has_unsafe})")
+        elif _threat_signals >= 3:
+            _cluster_pts = min(_threat_signals * 8, 30)
+            score += _cluster_pts
+            breakdown["threat_cluster"] = _cluster_pts
+        elif _threat_signals == 2:
+            # 2 signals: moderate boost
+            score += 10
+            breakdown["threat_cluster"] = 10
+
+        # ── Suspicious package names (generic/placeholder packages hiding malware) ──
+        marker_details = iocs.get("markerDetails", {})
+        _all_files = set()
+        for _detail_list in marker_details.values():
+            if isinstance(_detail_list, list):
+                for d in _detail_list:
+                    f = d.get("file", "")
+                    if f:
+                        _all_files.add(f)
+        _SUSPICIOUS_PACKAGES = [
+            "com/example/", "com_example_",            # Default template package
+            "a/b/c/", "a_b_c_",                        # Single-letter obfuscated
+            "me/client/", "me_client_",                 # Generic client package
+            "net/client/", "net_client_",
+        ]
+        _has_sus_pkg = any(
+            any(f.startswith(pkg) or ("/" + pkg) in f or ("\\" + pkg) in f
+                for pkg in _SUSPICIOUS_PACKAGES)
+            for f in _all_files
+        )
+        # Also detect obfuscated class names directly in bytecode ref markers
+        _obf_in_markers = any(
+            _OBF_CLASS_PATTERNS.search(m) for m in markers
+            if m.startswith("Bytecode API ref:") and any(x in m for x in [
+                "Runtime.exec", "ProcessBuilder", "System.load",
+            ])
+        )
+        if _has_sus_pkg and _threat_signals >= 2:
+            _pkg_pts = 10
+            score += _pkg_pts
+            breakdown["suspicious_package"] = _pkg_pts
+            log.info(f"[SCORE] Suspicious package name with {_threat_signals} threat signals")
+        elif (_has_sus_pkg or _obf_in_markers) and _threat_signals >= 1:
+            # Obfuscated package with at least one threat signal
+            _pkg_pts = 10
+            score += _pkg_pts
+            breakdown["suspicious_package"] = _pkg_pts
+            log.info(f"[SCORE] Obfuscated class + threat signal (sus_pkg={_has_sus_pkg}, obf_markers={_obf_in_markers})")
+        elif _obf_in_markers:
+            # Runtime.exec/ProcessBuilder in obfuscated class — always suspicious
+            _pkg_pts = 8
+            score += _pkg_pts
+            breakdown["suspicious_package"] = _pkg_pts
+            log.info(f"[SCORE] Dangerous API in obfuscated class")
+
+        # ── High marker count override ──
+        # Legitimate mods rarely have 25+ behavioral markers. If a mod has this many,
+        # something suspicious is going on regardless of individual marker filtering.
+        if len(markers) >= 25 and is_minecraft_mod:
+            _count_pts = min((len(markers) - 20) // 3, 10)
+            if _count_pts > 0:
+                score += _count_pts
+                breakdown["high_marker_count"] = _count_pts
 
         # Persistence indicators (LOCALAPPDATA paths, scheduled tasks, Python droppers)
         persistence_markers = [m for m in markers if any(x in m for x in [
@@ -5811,7 +5919,7 @@ def package_logs(log_dir: str, work_dir: str, mod_name: str) -> list[str]:
 
     def sort_key(item):
         _, rel = item
-        if rel == "analysis.txt":
+        if rel.endswith("_analysis.txt") or rel == "analysis.txt":
             return (0, rel)
         if rel.endswith("_iocs.json"):
             return (1, rel)

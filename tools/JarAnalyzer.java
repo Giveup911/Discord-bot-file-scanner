@@ -75,6 +75,7 @@ public class JarAnalyzer {
         ECTASY,             // * command prefix, downloads bungee.jar, ectasy.club C2
         SERVER_CRASHER,     // Bundled MC client with crash/exploit tools (2Packets, xynis, etc.)
         MCLAUNCHER_LOADER,  // me/mclauncher package: IMCL defineClass injector, MEntrypoint ProcessBuilder, StagingHelper
+        PACKUTIL_RAT,      // com/example/addon + PackUtil* classes: session theft, screen capture, Runtime.exec, Unsafe
         UNKNOWN             // unrecognized — do best-effort analysis
     }
 
@@ -1069,6 +1070,15 @@ public class JarAnalyzer {
                     "LoaderClient orchestrates the payload delivery. Often bundled with legitimate mods " +
                     "(Meteor Client, AppleSkin, NoChatReports, Glazed, etc.) as a trojanized wrapper.");
                 break;
+            case PACKUTIL_RAT:
+                analyzeGenericMalware(jarPath, jarSha256, src, classes, markers, ts, "PACKUTIL_RAT",
+                    "PackUtil RAT — trojanized Minecraft mod using com.example.addon package with PackUtil* utility classes. " +
+                    "Capabilities: Minecraft session theft (getUuidOrNull/getAccessToken), screen capture, " +
+                    "Runtime.exec() command execution, sun.misc.Unsafe memory manipulation, " +
+                    "dynamic class loading via Class.forName, reflective method invocation, and native library loading. " +
+                    "Disguised as a legitimate Fabric mod addon (e.g. 'YungLightUI'). " +
+                    "Uses control-flow obfuscation and braille art ASCII arrays as padding.");
+                break;
             default:
                 analyzeUnknown(jarPath, jarSha256, src, classes, markers, ts, configEntry, configRaw, cfrPath, tempDir);
                 break;
@@ -1095,7 +1105,7 @@ public class JarAnalyzer {
         System.out.println(BOLD + GREEN + "  source/ (full decompiled source)" + RESET);
         System.out.println(BOLD + GREEN + "  main/ (main application source)" + RESET);
         System.out.println(BOLD + GREEN + "  main/important/ (C2/config code)" + RESET);
-        System.out.println(BOLD + GREEN + "  analysis.txt" + RESET);
+        System.out.println(BOLD + GREEN + "  " + jarName + "_analysis.txt" + RESET);
         } finally {
             closeLogs();
             if (cleanJar != null) try { Files.deleteIfExists(cleanJar); } catch (Exception ignored) {}
@@ -1301,6 +1311,19 @@ public class JarAnalyzer {
             if (mclauncherClassHits >= 2) {
                 ilog("  → MCLauncher Loader: " + mclauncherClassHits + " class hits — classifying");
                 return Variant.MCLAUNCHER_LOADER;
+            }
+        }
+
+        // PACKUTIL_RAT — com/example/addon + PackUtil* classes (session theft, screen capture, Unsafe)
+        {
+            boolean hasExampleAddon = namesJoined.contains("com/example/addon") || namesJoined.contains("com_example_addon");
+            int packUtilCount = 0;
+            for (String n : names) {
+                if (n.contains("PackUtil")) packUtilCount++;
+            }
+            if (hasExampleAddon && packUtilCount >= 3) {
+                ilog("  → PackUtil RAT: com/example/addon + " + packUtilCount + " PackUtil* classes");
+                return Variant.PACKUTIL_RAT;
             }
         }
 
@@ -1930,7 +1953,7 @@ public class JarAnalyzer {
 
         // XOR key extraction
         step("Extracting XOR key...");
-        byte[] xorKey = extractXorKey(src);
+        byte[] xorKey = extractXorKey(src, classes);
         if (xorKey == null) {
             fail("Could not find XOR key");
             writeUnknownConfigLog(jarPath, jarSha256, ts, markers, "XOR key not found");
@@ -1941,7 +1964,7 @@ public class JarAnalyzer {
 
         // Byte arrays
         step("Extracting encrypted byte arrays...");
-        Map<String, byte[]> byteArrays = extractByteArrays(src);
+        Map<String, byte[]> byteArrays = extractByteArrays(src, classes);
         ok("Found " + byteArrays.size() + " byte array(s)");
 
         // N candidates
@@ -2718,7 +2741,9 @@ public class JarAnalyzer {
     // XOR KEY & BYTE ARRAY EXTRACTION
     // ─────────────────────────────────────────────────────────────────────
 
-    static byte[] extractXorKey(String src) {
+    static byte[] extractXorKey(String src) { return extractXorKey(src, null); }
+
+    static byte[] extractXorKey(String src, Map<String, byte[]> classes) {
         Pattern all = Pattern.compile(
             "private static byte\\[\\]\\s+([\\w$]+)\\(\\)\\s*\\{\\s*return new byte\\[\\]\\{([^}]+)\\};");
         int primaryMin  = cfgInt("xor.key.primary.min");
@@ -2745,10 +2770,160 @@ public class JarAnalyzer {
                 return arr;
             }
         }
+        // Bytecode-level fallback: extract byte[] literals directly from raw class bytes
+        // when decompilation fails (e.g. heavy control-flow obfuscation)
+        if (classes != null) {
+            ilog("  Source-level XOR key not found — trying bytecode extraction...");
+            byte[] best = null;
+            String bestClass = null;
+            for (Map.Entry<String, byte[]> e : classes.entrySet()) {
+                String cname = e.getKey();
+                // Focus on ExampleModClient or similar main classes
+                if (!cname.toLowerCase().contains("examplemod") && !cname.toLowerCase().contains("client")
+                    && !cname.contains("$")) continue;
+                List<byte[]> arrays = extractByteArraysFromBytecode(e.getValue());
+                for (byte[] arr : arrays) {
+                    if (arr.length >= primaryMin && arr.length <= primaryMax) {
+                        ilog("  XOR key (bytecode primary " + primaryMin + "-" + primaryMax
+                            + ") from " + cname + " len=" + arr.length);
+                        return arr;
+                    }
+                    if (arr.length >= fallbackMin && arr.length <= fallbackMax) {
+                        if (best == null || Math.abs(arr.length - 46) < Math.abs(best.length - 46)) {
+                            best = arr;
+                            bestClass = cname;
+                        }
+                    }
+                }
+            }
+            if (best != null) {
+                ilog("  XOR key (bytecode fallback " + fallbackMin + "-" + fallbackMax
+                    + ") from " + bestClass + " len=" + best.length);
+                return best;
+            }
+        }
         return null;
     }
 
-    static Map<String, byte[]> extractByteArrays(String src) {
+    /**
+     * Extract byte[] literals from JVM bytecode.
+     * Looks for: bipush/sipush N, newarray T_BYTE(8), then dup+index+value+bastore sequences.
+     */
+    static List<byte[]> extractByteArraysFromBytecode(byte[] classBytes) {
+        List<byte[]> results = new ArrayList<>();
+        // JVM opcodes
+        final int BIPUSH = 0x10, SIPUSH = 0x11, ICONST_M1 = 0x02, ICONST_0 = 0x03, ICONST_5 = 0x08;
+        final int NEWARRAY = 0xBC, DUP = 0x59, BASTORE = 0x54, ARETURN = 0xB0;
+        final int T_BYTE = 8;
+
+        for (int i = 0; i < classBytes.length - 4; i++) {
+            int op = classBytes[i] & 0xFF;
+            int arrayLen = -1;
+            int next = i + 1;
+
+            // Read array size push
+            if (op == BIPUSH && i + 2 < classBytes.length) {
+                arrayLen = classBytes[i + 1]; // signed byte
+                if (arrayLen < 0) arrayLen += 256; // treat as unsigned for sizes
+                next = i + 2;
+            } else if (op == SIPUSH && i + 3 < classBytes.length) {
+                arrayLen = ((classBytes[i + 1] & 0xFF) << 8) | (classBytes[i + 2] & 0xFF);
+                next = i + 3;
+            } else if (op >= ICONST_0 && op <= ICONST_5) {
+                arrayLen = op - ICONST_0;
+                next = i + 1;
+            } else {
+                continue;
+            }
+
+            if (arrayLen < 10 || arrayLen > 200 || next >= classBytes.length) continue;
+            if ((classBytes[next] & 0xFF) != NEWARRAY || next + 1 >= classBytes.length) continue;
+            if ((classBytes[next + 1] & 0xFF) != T_BYTE) continue;
+
+            // Found: push N, newarray T_BYTE — now extract the byte values
+            byte[] arr = new byte[arrayLen];
+            boolean[] filled = new boolean[arrayLen];
+            int pos = next + 2;
+            int filledCount = 0;
+
+            while (pos < classBytes.length && filledCount < arrayLen) {
+                int b = classBytes[pos] & 0xFF;
+                if (b == DUP) {
+                    // Expected: dup, index_push, value_push, bastore
+                    pos++;
+                    if (pos >= classBytes.length) break;
+                    // Read index
+                    int idx = -1;
+                    b = classBytes[pos] & 0xFF;
+                    if (b == BIPUSH && pos + 1 < classBytes.length) {
+                        idx = classBytes[pos + 1]; if (idx < 0) idx += 256;
+                        pos += 2;
+                    } else if (b == SIPUSH && pos + 2 < classBytes.length) {
+                        idx = ((classBytes[pos + 1] & 0xFF) << 8) | (classBytes[pos + 2] & 0xFF);
+                        pos += 3;
+                    } else if (b >= ICONST_0 && b <= ICONST_5) {
+                        idx = b - ICONST_0;
+                        pos++;
+                    } else if (b == ICONST_M1) {
+                        break; // shouldn't have -1 index
+                    } else {
+                        break; // unexpected opcode
+                    }
+                    if (idx < 0 || idx >= arrayLen) break;
+
+                    // Read value
+                    if (pos >= classBytes.length) break;
+                    int val;
+                    b = classBytes[pos] & 0xFF;
+                    if (b == BIPUSH && pos + 1 < classBytes.length) {
+                        val = classBytes[pos + 1]; // signed byte value
+                        pos += 2;
+                    } else if (b == SIPUSH && pos + 2 < classBytes.length) {
+                        val = (short)(((classBytes[pos + 1] & 0xFF) << 8) | (classBytes[pos + 2] & 0xFF));
+                        pos += 3;
+                    } else if (b >= ICONST_M1 && b <= ICONST_5) {
+                        val = b - ICONST_0; // ICONST_M1=0x02 → -1, ICONST_0=0x03 → 0, etc.
+                        pos++;
+                    } else {
+                        break;
+                    }
+
+                    // Expect bastore
+                    if (pos >= classBytes.length || (classBytes[pos] & 0xFF) != BASTORE) break;
+                    pos++;
+
+                    arr[idx] = (byte) val;
+                    filled[idx] = true;
+                    filledCount++;
+                } else if (b == ARETURN || b == 0x4C || b == 0x4D || b == 0xB3) {
+                    // areturn or astore or putstatic — end of array init
+                    break;
+                } else {
+                    // Other opcode — might be control flow obfuscation interleaved
+                    // Skip up to 20 bytes looking for next DUP
+                    boolean foundDup = false;
+                    for (int skip = 1; skip <= 20 && pos + skip < classBytes.length; skip++) {
+                        if ((classBytes[pos + skip] & 0xFF) == DUP) {
+                            pos += skip;
+                            foundDup = true;
+                            break;
+                        }
+                    }
+                    if (!foundDup) break;
+                }
+            }
+
+            // Accept if we filled most of the array (>80%)
+            if (filledCount >= arrayLen * 0.8 && filledCount >= 10) {
+                results.add(arr);
+            }
+        }
+        return results;
+    }
+
+    static Map<String, byte[]> extractByteArrays(String src) { return extractByteArrays(src, null); }
+
+    static Map<String, byte[]> extractByteArrays(String src, Map<String, byte[]> classes) {
         Map<String, byte[]> result = new LinkedHashMap<>();
         Pattern p = Pattern.compile(
             "(?:private |public )?static byte\\[\\]\\s+([\\w$]+)\\(\\)\\s*\\{\\s*return new byte\\[\\]\\{([^}]*)\\}");
@@ -2756,6 +2931,23 @@ public class JarAnalyzer {
         while (m.find()) {
             byte[] arr = parseByteArray(m.group(2));
             if (arr != null && arr.length > 0) result.put(m.group(1), arr);
+        }
+        // Bytecode fallback when source extraction found nothing
+        if (result.isEmpty() && classes != null) {
+            ilog("  Source-level byte arrays not found — trying bytecode extraction...");
+            int idx = 0;
+            for (Map.Entry<String, byte[]> e : classes.entrySet()) {
+                String cname = e.getKey();
+                if (!cname.toLowerCase().contains("examplemod") && !cname.toLowerCase().contains("client")
+                    && !cname.contains("$")) continue;
+                List<byte[]> arrays = extractByteArraysFromBytecode(e.getValue());
+                for (byte[] arr : arrays) {
+                    result.put("bytecode_" + cname + "_" + (idx++), arr);
+                }
+            }
+            if (!result.isEmpty()) {
+                ilog("  Found " + result.size() + " byte array(s) from bytecode extraction");
+            }
         }
         return result;
     }
@@ -4864,6 +5056,10 @@ public class JarAnalyzer {
                     importantPatterns.add("IMCL"); importantPatterns.add("MEntrypoint");
                     importantPatterns.add("LoaderClient"); importantPatterns.add("StagingHelper");
                     break;
+                case PACKUTIL_RAT:
+                    mainPatterns.add("com/example/addon"); mainPatterns.add("com\\example\\addon");
+                    importantPatterns.add("PackUtil"); importantPatterns.add("ExampleModClient");
+                    break;
                 default:
                     mainPatterns.add("/"); // match all non-library
                     importantPatterns.add("webhook"); importantPatterns.add("discord");
@@ -4916,7 +5112,7 @@ public class JarAnalyzer {
                                   Variant variant, List<String> markers,
                                   String decompilerUsed, String src, String configRaw,
                                   boolean hasTrailingSlash) {
-        try (PrintWriter w = new PrintWriter(new FileWriter(outDir.resolve("analysis.txt").toFile()))) {
+        try (PrintWriter w = new PrintWriter(new FileWriter(outDir.resolve(jarName + "_analysis.txt").toFile()))) {
             w.println("═══════════════════════════════════════════════════════════");
             w.println("FILE ANALYSIS REPORT");
             w.println("═══════════════════════════════════════════════════════════");
@@ -5032,6 +5228,17 @@ public class JarAnalyzer {
                     w.println("silently downloads and executes a second-stage payload.");
                     w.println("Detection: me/mclauncher package with IMCL/MEntrypoint/LoaderClient/StagingHelper classes.");
                     break;
+                case PACKUTIL_RAT:
+                    w.println("This JAR is a PACKUTIL RAT — a trojanized Minecraft Fabric mod that masquerades");
+                    w.println("as a legitimate addon (e.g. 'YungLightUI') while hiding a full-featured RAT");
+                    w.println("in the com.example.addon package using PackUtil* utility classes.");
+                    w.println("Capabilities: Minecraft session theft (UUID/access token), screen capture,");
+                    w.println("command execution (Runtime.exec), native library loading (System.load),");
+                    w.println("sun.misc.Unsafe memory manipulation, dynamic class loading, and reflection.");
+                    w.println("Uses control-flow obfuscation (switch dispatchers) and braille art ASCII arrays");
+                    w.println("as string table padding to evade static analysis.");
+                    w.println("Detection: com/example/addon package with 3+ PackUtil* class names.");
+                    break;
                 default:
                     w.println("This JAR's variant could not be definitively classified. It was analyzed");
                     w.println("using generic extraction and behavioral analysis.");
@@ -5100,7 +5307,7 @@ public class JarAnalyzer {
             w.println("  source/           Full decompiled Java source code");
             w.println("  main/             Main application source files (non-library)");
             w.println("  main/important/   C2, config, and crypto code specifically");
-            w.println("  analysis.txt      This report");
+            w.println("  *_analysis.txt    This report");
             w.println("  *_info.log        Detailed analysis log");
             w.println("  *_config.log      Extracted configuration data");
             w.println("  *_iocs.json       Machine-readable IOCs (URLs, hashes, webhooks)");
