@@ -170,7 +170,10 @@ public class JarAnalyzer {
         CFG.setProperty("skyrage.classes", "skyrage|SkyRage");
 
         // WEIRDUTILS detection
-        CFG.setProperty("weirdutils.rawstrings", "owouwu.tk|ObfuscatedClassloader|aHR0cHM6Ly9wYXN0ZWJpbi5jb20vcmF3|spongepowered/tools/obfuscation");
+        // Note: "spongepowered/tools/obfuscation" removed — too generic, triggers on
+        // legitimate mixin libraries like mixinsquared that reference SpongePowered's
+        // obfuscation API. The remaining signatures are specific to WeirdUtils malware.
+        CFG.setProperty("weirdutils.rawstrings", "owouwu.tk|ObfuscatedClassloader|aHR0cHM6Ly9wYXN0ZWJpbi5jb20vcmF3");
         CFG.setProperty("weirdutils.classes", "ObfuscatedClassloader|WeirdUtils");
 
         // COMET detection
