@@ -1963,6 +1963,7 @@ STRING_PATTERNS = {
     "discord_tokens": re.compile(rb'[MN][A-Za-z\d]{23,27}\.[A-Za-z\d\-_]{6}\.[A-Za-z\d\-_]{27,}'),
     "ipv4": re.compile(rb'\b(?:\d{1,3}\.){3}\d{1,3}\b'),
     "eth_addresses": re.compile(rb'0x[0-9a-fA-F]{40}'),
+    "session_exfil_templates": re.compile(rb'accessToken.{0,20}(?:username|uuid|minecraftInfo)', re.IGNORECASE),
 }
 
 IGNORE_IPS = {"127.0.0.1", "0.0.0.0", "255.255.255.255", "1.0.0.0", "1.0.0.1"}
@@ -3693,6 +3694,18 @@ def compute_risk_score(
             score += _hrm_pts
             breakdown["high_risk_markers"] = _hrm_pts
 
+        # Backdoor detection markers from BackdoorDetector — these are strong signals
+        # that deserve their own scoring bucket separate from generic behavioral markers
+        backdoor_markers = [m for m in markers if m.startswith("BACKDOOR")]
+        if backdoor_markers:
+            # Core backdoor findings (chat-to-console, remote op, etc.) = 15 pts each
+            # Trigger string confirmations = 5 pts each (supporting evidence)
+            _bd_core = [m for m in backdoor_markers if not m.startswith("BACKDOOR TRIGGER")]
+            _bd_triggers = [m for m in backdoor_markers if m.startswith("BACKDOOR TRIGGER")]
+            _bd_pts = min(len(_bd_core) * 20 + len(_bd_triggers) * 5, 70)
+            score += _bd_pts
+            breakdown["backdoor"] = _bd_pts
+
         # Filter out non-suspicious markers: skip URL markers and benign bytecode refs
         non_library_markers = [
             m for m in markers
@@ -3741,14 +3754,16 @@ def compute_risk_score(
         # The mod filter above removes individual markers that are common in legit mods,
         # but when MULTIPLE dangerous capabilities appear together, it's a strong signal.
         # Check the FULL (unfiltered) marker list for these combos.
-        _all_markers_lower = " ".join(m.lower() for m in markers)
+        _non_lib_markers = [m for m in markers if "[LIB]" not in m]
+        _all_markers_lower = " ".join(m.lower() for m in _non_lib_markers)
         _has_session_theft = any(x in _all_markers_lower for x in [
             "session accessor", "session get", "getaccesstoken", "getuuidornull",
             "getusername", "launcher_accounts", "launcher_profiles",
         ])
         _has_screen_capture = "screen capture" in _all_markers_lower or "createscreencapture" in _all_markers_lower
         _has_runtime_exec = any(x in _all_markers_lower for x in ["runtime.exec", "processbuilder"])
-        _has_unsafe = "unsafe" in _all_markers_lower
+        _has_unsafe = any("unsafe" in m.lower() and "unsafeallocator" not in m.lower()
+                          for m in _non_lib_markers)
         _has_keylogger = any(x in _all_markers_lower for x in ["keylogger", "nativekeylistener", "getasynckeystate"])
         _has_browser_steal = any(x in _all_markers_lower for x in [
             "login data", "web data", "local state", "logins.json", "key4.db",
@@ -3824,6 +3839,20 @@ def compute_risk_score(
             breakdown["suspicious_package"] = _pkg_pts
             log.info(f"[SCORE] Dangerous API in obfuscated class")
 
+        # ── Weedhack injection detection ──
+        # Detect trojanized mods: legitimate mod code + injected dropper package
+        # with ClassLoader.defineClass + session theft from a DIFFERENT package
+        _has_defineclass_injection = any(
+            "classloader.defineclass" in m.lower() or
+            ("defineclass" in m.lower() and "code injection" in m.lower())
+            for m in markers
+        )
+        if _has_defineclass_injection and _has_session_theft and _has_runtime_exec:
+            _inject_pts = 30
+            score += _inject_pts
+            breakdown["code_injection"] = _inject_pts
+            log.info("[SCORE] ClassLoader injection + session theft + exec = trojanized mod")
+
         # ── High marker count override ──
         # Legitimate mods rarely have 25+ behavioral markers. If a mod has this many,
         # something suspicious is going on regardless of individual marker filtering.
@@ -3890,7 +3919,8 @@ def compute_risk_score(
         elif is_minecraft_mod:
             # For mods: only count rules specifically about Java/JAR threats
             _java_threat_kw = ["fractureiser", "minecraft", "jar_", "java_rat",
-                               "skyrage", "vape", "weedhack", "adam_rat"]
+                               "skyrage", "vape", "weedhack", "adam_rat",
+                               "etherhiding", "silent", "session_token", "exfil"]
             serious_yara = [m for m in yara_matches if any(
                 x in (m.get("rule", "") + " " + m.get("namespace", "")).lower()
                 for x in _java_threat_kw
@@ -3898,6 +3928,10 @@ def compute_risk_score(
             _yara_pts = min(len(serious_yara) * 4, 16)
         else:
             _yara_pts = min(len(yara_matches) * 4, 16)
+        critical_yara = [m for m in yara_matches if
+                         m.get("meta", {}).get("severity") == "critical"]
+        if critical_yara:
+            _yara_pts = max(_yara_pts, min(len(critical_yara) * 20, 40))
         if _yara_pts:
             score += _yara_pts
             breakdown["yara"] = _yara_pts
@@ -3948,6 +3982,9 @@ def compute_risk_score(
         if extracted_strings.get("eth_addresses"):
             score += 4
             breakdown["eth_addresses"] = 4
+        if extracted_strings.get("session_exfil_templates"):
+            score += 18
+            breakdown["session_exfil_template"] = 18
 
     # Combo: webhook + launcher_accounts is almost always a stealer
     has_launcher_accounts = iocs and any(
@@ -4117,6 +4154,16 @@ def compute_risk_score(
         variant = (iocs.get("variant") or "").lower()
         if variant in HIGH_RISK_VARIANTS and score < 61:
             breakdown["variant_floor"] = 61 - score
+            score = 61
+
+    # Minimum score floor for confirmed backdoors — a single core backdoor
+    # finding (chat-to-console, remote op grant, etc.) is definitive
+    if iocs:
+        markers = iocs.get("behavioralMarkers", [])
+        _bd_core_markers = [m for m in markers
+                            if m.startswith("BACKDOOR") and not m.startswith("BACKDOOR TRIGGER")]
+        if _bd_core_markers and score < 61:
+            breakdown["backdoor_floor"] = 61 - score
             score = 61
 
     score = min(score, 100)
@@ -4339,16 +4386,287 @@ _INFECTION_RESOURCES = (
     "\u2022 See this guide for more help: https://prismlauncher.org/wiki/overview/getting-rid-of-malware/"
 )
 
+# ── Type-specific remediation advice ──
+_TYPE_REMEDIATION = {
+    "stealer": (
+        "\n\n**If you already ran this file, you should:**\n"
+        "\u2022 Change ALL browser-saved passwords immediately (Chrome, Firefox, Brave, Edge)\n"
+        "\u2022 Revoke your Discord token: change your Discord password to generate a new one\n"
+        "\u2022 Change your Minecraft/Microsoft account password and revoke sessions\n"
+        "\u2022 Check for stolen crypto: if you had wallets, move funds to a new wallet ASAP\n"
+        "\u2022 Enable 2FA on all accounts\n"
+        "\u2022 Run a full antivirus scan\n"
+        "\u2022 See: https://prismlauncher.org/wiki/overview/getting-rid-of-malware/"
+    ),
+    "rat": (
+        "\n\n**If you already ran this file, you should:**\n"
+        "\u2022 Disconnect from the internet immediately\n"
+        "\u2022 Run a full antivirus scan in Safe Mode\n"
+        "\u2022 Check Task Manager/startup apps for unknown processes\n"
+        "\u2022 Change ALL passwords from a DIFFERENT device\n"
+        "\u2022 Check for new/unknown user accounts on your PC\n"
+        "\u2022 Consider a full OS reinstall if you can't confirm removal\n"
+        "\u2022 See: https://prismlauncher.org/wiki/overview/getting-rid-of-malware/"
+    ),
+    "backdoor": (
+        "\n\n**If you ran this on a server, you should:**\n"
+        "\u2022 Remove the plugin/mod immediately\n"
+        "\u2022 Change all server console/RCON passwords\n"
+        "\u2022 Check server operator list (ops.json) for unauthorized players\n"
+        "\u2022 Review recent console commands for suspicious activity\n"
+        "\u2022 Check for new/modified files in the server directory\n"
+        "\u2022 Regenerate any API keys or secrets stored on the server"
+    ),
+    "zip_bomb": (
+        "\n\n**This file is designed to crash programs that try to open it.**\n"
+        "\u2022 Do NOT try to extract or open this file\n"
+        "\u2022 If you already extracted it, delete the extracted files\n"
+        "\u2022 It should not have caused permanent damage unless it filled your disk\n"
+        "\u2022 Check available disk space and free up if needed"
+    ),
+    "dropper": (
+        "\n\n**If you already ran this file, you should:**\n"
+        "\u2022 It likely downloaded and ran ADDITIONAL malware on your system\n"
+        "\u2022 Run a full antivirus scan immediately\n"
+        "\u2022 Check %APPDATA%, %TEMP%, and Downloads for recently created unknown files\n"
+        "\u2022 Change all passwords from a different device\n"
+        "\u2022 Check startup apps for new entries\n"
+        "\u2022 See: https://prismlauncher.org/wiki/overview/getting-rid-of-malware/"
+    ),
+    "crasher": (
+        "\n\n**This file is a server attack tool.**\n"
+        "\u2022 If you're a server owner: check your server's anti-exploit protections\n"
+        "\u2022 If you found it in a player's files: they may have been griefing servers\n"
+        "\u2022 It typically does not steal data, but don't run unknown files"
+    ),
+}
+
+
+def classify_malware_type(variant, iocs, yara_matches, extracted_strings,
+                          zip_bomb_warning, format_analysis, score):
+    """Classify detected malware into a specific type with type-specific details.
+
+    Returns (type_name, type_label, details_dict) where:
+      - type_name: machine key like "stealer", "rat", "backdoor", "zip_bomb", etc.
+      - type_label: human-readable label like "Info Stealer", "Remote Access Trojan"
+      - details_dict: type-specific info (commands, targets, capabilities, etc.)
+    """
+    markers = (iocs.get("behavioralMarkers", []) if iocs else [])
+    _all_markers_lower = " ".join(m.lower() for m in markers)
+
+    # Threat signal detection (mirrors compute_risk_score clustering)
+    _has_session_theft = any(x in _all_markers_lower for x in [
+        "session accessor", "session get", "getaccesstoken", "getuuidornull",
+        "getusername", "launcher_accounts", "launcher_profiles",
+    ])
+    _has_screen_capture = "screen capture" in _all_markers_lower or "createscreencapture" in _all_markers_lower
+    _has_runtime_exec = any(x in _all_markers_lower for x in ["runtime.exec", "processbuilder"])
+    _has_keylogger = any(x in _all_markers_lower for x in ["keylogger", "nativekeylistener", "getasynckeystate"])
+    _has_browser_steal = any(x in _all_markers_lower for x in [
+        "login data", "web data", "local state", "logins.json", "key4.db",
+        "chrome/user data", "firefox/profiles", "brave-browser",
+    ])
+    _has_clipboard = any(x in _all_markers_lower for x in ["clipboard", "clipboardowner"])
+    _has_webcam = "webcam" in _all_markers_lower
+    _has_c2 = bool(iocs and (iocs.get("c2Base") or iocs.get("ethContract") or iocs.get("contracts")))
+    _has_webhook = bool(
+        (iocs and (iocs.get("webhook") or iocs.get("webhookUrl")))
+        or (extracted_strings and extracted_strings.get("discord_webhooks"))
+    )
+    _has_stage2 = bool(iocs and iocs.get("stage2Url"))
+
+    backdoor_markers = [m for m in markers if m.startswith("BACKDOOR")]
+    _has_backdoor = bool(backdoor_markers)
+
+    # Extract specific details for each type
+    variant_lower = (variant or "").lower()
+
+    # ── ZIP BOMB ──
+    if zip_bomb_warning:
+        details = {"decompressed_size": zip_bomb_warning}
+        return "zip_bomb", "Zip Bomb", details
+
+    # ── SERVER CRASHER ──
+    if variant_lower == "server_crasher":
+        details = {"capabilities": ["Server crash exploits", "Packet flooding", "Resource exhaustion"]}
+        return "crasher", "Server Crasher / Exploit Tool", details
+
+    # ── BACKDOOR (server plugin backdoors) ──
+    if _has_backdoor:
+        commands = []
+        trigger_strings = []
+        for m in backdoor_markers:
+            if m.startswith("BACKDOOR TRIGGER STRING:"):
+                trigger = m.split(":", 1)[1].strip().strip('"')
+                if trigger not in trigger_strings:
+                    trigger_strings.append(trigger)
+            elif m.startswith("BACKDOOR TRIGGER:"):
+                # Extract command prefix from trigger descriptions
+                parts = m.split('"')
+                for i, p in enumerate(parts):
+                    if i % 2 == 1 and p not in trigger_strings:  # quoted strings
+                        trigger_strings.append(p)
+            elif m.startswith("BACKDOOR:"):
+                desc = m.split(":", 1)[1].strip()
+                if desc not in commands:
+                    commands.append(desc)
+        details = {
+            "commands": commands,
+            "trigger_strings": trigger_strings,
+            "capabilities": [],
+        }
+        if any("console" in m.lower() for m in backdoor_markers):
+            details["capabilities"].append("Execute any server console command")
+        if any("op " in m.lower() or "setop" in m.lower() for m in backdoor_markers):
+            details["capabilities"].append("Grant operator status to players")
+        if any("download" in m.lower() or "url" in m.lower() for m in backdoor_markers):
+            details["capabilities"].append("Download and execute remote code")
+        if not details["capabilities"]:
+            details["capabilities"].append("Remote command execution on server")
+        return "backdoor", "Server Backdoor", details
+
+    # ── STEALER (browser/session/token theft) ──
+    stealer_variants = {"adamrat", "session_harvester", "skyrage", "fractureiser", "silent_net"}
+    is_stealer = (
+        variant_lower in stealer_variants
+        or _has_browser_steal
+        or (_has_session_theft and _has_webhook)
+        or (_has_session_theft and _has_c2)
+    )
+    if is_stealer:
+        targets = []
+        if _has_browser_steal:
+            targets.append("Browser saved passwords (Chrome, Firefox, Brave, Edge)")
+            targets.append("Browser cookies and autofill data")
+        if _has_session_theft:
+            targets.append("Minecraft session tokens / login credentials")
+        if _has_clipboard:
+            targets.append("Clipboard contents (copied passwords, crypto addresses)")
+        if _has_keylogger:
+            targets.append("Keystrokes (everything you type)")
+        if _has_screen_capture:
+            targets.append("Screenshots of your screen")
+        if _has_webcam:
+            targets.append("Webcam captures")
+        if any("discord" in m.lower() and "token" in m.lower() for m in markers):
+            targets.append("Discord account token")
+        if extracted_strings and extracted_strings.get("discord_webhooks"):
+            targets.append("Data sent via Discord webhook to attacker")
+        if not targets:
+            targets.append("Minecraft/Discord account credentials")
+        exfil = []
+        if _has_webhook:
+            exfil.append("Discord webhook")
+        if _has_c2:
+            c2 = iocs.get("c2Base") or "unknown"
+            exfil.append(f"C2 server ({c2})")
+        if iocs and iocs.get("ethContract"):
+            exfil.append("Ethereum blockchain (hidden C2 address)")
+        details = {"targets": targets, "exfil_methods": exfil}
+        return "stealer", "Info Stealer", details
+
+    # ── RAT (remote access trojan — full remote control) ──
+    rat_variants = {"vape_curium", "packutil_rat", "weirdutils"}
+    is_rat = (
+        variant_lower in rat_variants
+        or (_has_runtime_exec and _has_c2 and (_has_screen_capture or _has_keylogger or _has_webcam))
+        or (_has_runtime_exec and _has_c2 and _has_clipboard)
+    )
+    if is_rat:
+        capabilities = []
+        if _has_runtime_exec:
+            capabilities.append("Execute arbitrary system commands")
+        if _has_screen_capture:
+            capabilities.append("Capture screenshots")
+        if _has_keylogger:
+            capabilities.append("Log keystrokes")
+        if _has_webcam:
+            capabilities.append("Access webcam")
+        if _has_clipboard:
+            capabilities.append("Read/modify clipboard")
+        if _has_browser_steal:
+            capabilities.append("Steal browser data")
+        if _has_session_theft:
+            capabilities.append("Steal Minecraft sessions")
+        if _has_stage2:
+            capabilities.append(f"Download additional malware")
+        if _has_c2:
+            c2 = iocs.get("c2Base") or "unknown"
+            capabilities.append(f"Remote control via C2 ({c2})")
+        if not capabilities:
+            capabilities.append("Full remote access to your computer")
+        details = {"capabilities": capabilities}
+        return "rat", "Remote Access Trojan (RAT)", details
+
+    # ── DROPPER (downloads and runs second-stage malware) ──
+    dropper_variants = {"mshta_dropper", "mclauncher_loader", "weedhack"}
+    is_dropper = (
+        variant_lower in dropper_variants
+        or _has_stage2
+        or (variant_lower == "ectasy")
+    )
+    if is_dropper:
+        details = {"stages": []}
+        if iocs and iocs.get("stage2Url"):
+            details["stages"].append(f"Downloads from: {iocs['stage2Url']}")
+        if iocs and iocs.get("ethContract"):
+            details["stages"].append(f"Resolves download URL via ETH contract: {iocs['ethContract']}")
+        if variant_lower == "mshta_dropper":
+            details["stages"].append("Uses MSHTA.exe (Windows LOLBin) to execute hidden scripts")
+        if variant_lower == "weedhack":
+            details["stages"].append("Uses Ethereum blockchain to hide the real download URL")
+        if not details["stages"]:
+            details["stages"].append("Downloads and executes second-stage malware")
+        return "dropper", "Malware Dropper / Loader", details
+
+    # ── GENERIC MALWARE (score is high but doesn't fit a specific type) ──
+    if score > 60:
+        capabilities = []
+        if _has_runtime_exec:
+            capabilities.append("Execute system commands")
+        if _has_session_theft:
+            capabilities.append("Access Minecraft sessions")
+        if _has_c2:
+            capabilities.append("Communicates with remote server")
+        if _has_webhook:
+            capabilities.append("Sends data via Discord webhook")
+        return "malware", "Malware (Unclassified)", {"capabilities": capabilities}
+
+    # ── SUSPICIOUS (below malware threshold but still flagged) ──
+    if score > DETECTION_THRESHOLD:
+        return "suspicious", "Suspicious", {}
+
+    return "clean", "Clean", {}
+
 
 def _build_plain_summary(score, level, variant, iocs, vt, yara_matches,
-                         extracted_strings, mb_result):
+                         extracted_strings, mb_result, zip_bomb_warning=None,
+                         format_analysis=None):
     """Build a plain-language summary for the top of the embed."""
     lines = []
 
-    # Best guess at what it is
+    # Classify the malware type
+    mal_type, mal_label, mal_details = classify_malware_type(
+        variant, iocs, yara_matches, extracted_strings,
+        zip_bomb_warning, format_analysis, score,
+    )
+
+    # ── "What is this?" — type-specific description ──
     if variant and variant != "unknown" and variant in _VARIANT_DESCRIPTIONS:
         lines.append(f"**What is this?** This file is **{_VARIANT_DESCRIPTIONS[variant]}**.")
-    elif score > 60:
+    elif mal_type == "zip_bomb":
+        lines.append("**What is this?** This file is a **zip bomb** — a malicious archive designed to expand to an enormous size when extracted, crashing programs or filling your disk.")
+    elif mal_type == "backdoor":
+        lines.append("**What is this?** This file contains a **server backdoor** — hidden code that lets an attacker remotely control your Minecraft server.")
+    elif mal_type == "stealer":
+        lines.append("**What is this?** This file is an **info stealer** — malware designed to steal your passwords, tokens, and personal data.")
+    elif mal_type == "rat":
+        lines.append("**What is this?** This file is a **Remote Access Trojan (RAT)** — malware that gives an attacker full remote control of your computer.")
+    elif mal_type == "dropper":
+        lines.append("**What is this?** This file is a **malware dropper** — it downloads and runs additional malicious software on your system.")
+    elif mal_type == "crasher":
+        lines.append("**What is this?** This file is a **server crasher/exploit tool** — designed to attack and crash Minecraft servers.")
+    elif mal_type == "malware":
         lines.append("**What is this?** This file has strong indicators of being **malware** (a program designed to steal your data or harm your computer).")
     elif score > 35:
         lines.append("**What is this?** This file has some suspicious behaviors that could indicate malware, but it might also be a legitimate (but sketchy-looking) program. Check the details below.")
@@ -4356,6 +4674,35 @@ def _build_plain_summary(score, level, variant, iocs, vt, yara_matches,
         lines.append("**What is this?** This file has a few minor flags. It's probably fine, but take a quick look at the details below to be sure.")
     else:
         lines.append("**What is this?** This file looks clean. No malware indicators were found.")
+
+    # ── "What does it do?" — type-specific details ──
+    if mal_type == "backdoor" and mal_details.get("capabilities"):
+        lines.append("\n**What does it do?**")
+        for cap in mal_details["capabilities"]:
+            lines.append(f"\u2022 {cap}")
+        if mal_details.get("trigger_strings"):
+            lines.append("**Trigger commands:** " + ", ".join(f"`{t}`" for t in mal_details["trigger_strings"]))
+    elif mal_type == "stealer" and mal_details.get("targets"):
+        lines.append("\n**What does it steal?**")
+        for target in mal_details["targets"]:
+            lines.append(f"\u2022 {target}")
+        if mal_details.get("exfil_methods"):
+            lines.append("**Sends stolen data via:** " + ", ".join(mal_details["exfil_methods"]))
+    elif mal_type == "rat" and mal_details.get("capabilities"):
+        lines.append("\n**What can the attacker do?**")
+        for cap in mal_details["capabilities"]:
+            lines.append(f"\u2022 {cap}")
+    elif mal_type == "dropper" and mal_details.get("stages"):
+        lines.append("\n**How does it work?**")
+        for stage in mal_details["stages"]:
+            lines.append(f"\u2022 {stage}")
+    elif mal_type == "zip_bomb":
+        lines.append(f"\n**Decompressed size:** {mal_details.get('decompressed_size', 'unknown')}")
+    elif mal_type == "crasher":
+        if mal_details.get("capabilities"):
+            lines.append("\n**Attack methods:**")
+            for cap in mal_details["capabilities"]:
+                lines.append(f"\u2022 {cap}")
 
     # What the scan found (simplified)
     findings = []
@@ -4373,8 +4720,10 @@ def _build_plain_summary(score, level, variant, iocs, vt, yara_matches,
     if findings:
         lines.append("**Key findings:** " + "; ".join(findings) + ".")
 
-    # Confidence + ran-it warning
-    if score > 60:
+    # Type-specific remediation advice (replaces generic _INFECTION_RESOURCES)
+    if mal_type in _TYPE_REMEDIATION:
+        lines.append(_TYPE_REMEDIATION[mal_type])
+    elif score > 60:
         lines.append(_INFECTION_RESOURCES)
     elif score > 35:
         lines.append("\n*If you're unsure, don't run it. Ask someone you trust or check the details below.*")
@@ -4447,7 +4796,9 @@ def build_embeds(
     if iocs:
         variant_raw = (iocs.get("variant") or "").lower()
     summary = _build_plain_summary(score, level, variant_raw, iocs, vt, yara_matches,
-                                   extracted_strings, mb_result)
+                                   extracted_strings, mb_result,
+                                   zip_bomb_warning=zip_bomb_warning,
+                                   format_analysis=format_analysis)
     if approved_exception:
         summary = ("\u2705 **This file is on the approved exceptions list and has been verified as safe.**\n"
                    "*Full analysis shown below for transparency.*\n\n" + summary)
@@ -4493,6 +4844,20 @@ def build_embeds(
             if campaign:
                 variant_display += f"\nCampaign: `{campaign[:12]}...`"
     e.add_field(name="Variant", value=variant_display, inline=True)
+
+    # malware type classification
+    _mal_type, _mal_label, _mal_details = classify_malware_type(
+        variant_raw, iocs, yara_matches, extracted_strings,
+        zip_bomb_warning, format_analysis, score,
+    )
+    _TYPE_ICONS = {
+        "stealer": "\U0001F4E4", "rat": "\U0001F579", "backdoor": "\U0001F6AA",
+        "zip_bomb": "\U0001F4A3", "dropper": "\U0001F4E5", "crasher": "\U0001F4A5",
+        "malware": "\u2620\uFE0F", "suspicious": "\u26A0\uFE0F", "clean": "\u2705",
+    }
+    _type_icon = _TYPE_ICONS.get(_mal_type, "")
+    if _mal_type not in ("clean", "suspicious"):
+        e.add_field(name="Threat Type", value=f"{_type_icon} **{_mal_label}**", inline=True)
 
     # file info
     size_str = (

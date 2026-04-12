@@ -16,9 +16,16 @@ rule Weedhack_Dropper
         $majanito = "dev/majanito" ascii
         $majanito2 = "dev.majanito" ascii
         $fabric = "FabricAdapter" ascii
+        $isHex = "isHex" ascii
+        $jw_flag = "--jw" ascii
+        $hex_long = /[0-9a-f]{40,}/ ascii
 
     condition:
-        $eth_call and ($init_wh or $majanito or $majanito2 or $fabric)
+        ($eth_call and ($init_wh or $majanito or $majanito2 or $fabric))
+        or ($init_wh and $hex_long)
+        or ($majanito and $hex_long)
+        or ($majanito2 and $hex_long)
+        or ($fabric and $isHex and $jw_flag)
 }
 
 rule Weedhack_Stage2_Module
@@ -647,12 +654,10 @@ rule qProtect_Evasion {
         $trailing1 = ".class/" ascii
         $config_marker = "userWebhook" ascii
         $config_marker2 = "ratfileUrl" ascii
-        $donut_c2 = "donutsmp.net" ascii
     condition:
         $pk at 0 and (
             $qprotect
             or ($trailing1 and ($config_marker or $config_marker2))
-            or $donut_c2
         )
 }
 
@@ -663,7 +668,6 @@ rule GambleRig_Casino_RAT {
         severity = "critical"
     strings:
         $pk = "PK"
-        $donut = "donutsmp.net" ascii
         $user_webhook = "userWebhook" ascii
         $ratfile = "ratfileUrl" ascii
         $download_url = "downloadUrl" ascii
@@ -672,11 +676,77 @@ rule GambleRig_Casino_RAT {
         $launcher_accts = "launcher_accounts" ascii
     condition:
         $pk at 0 and (
-            $donut
-            or ($user_webhook and $ratfile)
+            ($user_webhook and $ratfile)
             or $download_url
             or ($auto_pay and $session_token and $launcher_accts)
         )
+}
+
+rule Weedhack_EtherHiding_Variant {
+    meta:
+        description = "Weedhack EtherHiding variant - hex XOR string encryption with Ethereum blockchain C2 and custom ClassLoader dropper"
+        author = "RatScanner"
+        severity = "critical"
+    strings:
+        $pk = "PK"
+        $isHex = "isHex" ascii
+        $verify = "verify" ascii
+        $decode = "decode" ascii
+        $classDefinitions = "classDefinitions" ascii
+        $resourceDefinitions = "resourceDefinitions" ascii
+        $defineClass = "defineClass" ascii
+        $jw_flag = "--jw" ascii
+        $doubleclick = "DoubleClick" ascii
+        $execution_env = "executionEnvironment" ascii
+        $eth_rpc1 = "llamarpc" ascii
+        $eth_rpc2 = "onfinality" ascii
+        $eth_rpc3 = "gateway.fm" ascii
+        $majanito = "majanito" ascii
+        $weedhack = "initializeWeedhack" ascii
+        $fabric_adapter = "FabricAdapter" ascii
+        $cloudflare_dns = "CloudflareDNS" ascii
+        $container68 = "container68" ascii
+        $hex_long = /[0-9a-f]{40,}/ ascii
+        $decoder_cls1 = "forwardPayload" ascii
+        $decoder_cls2 = "inspectWatcher" ascii
+        $mixin_loader1 = "app/platform/ExampleMixin" ascii
+        $mixin_loader2 = "app/net/ExampleMixin" ascii
+        $base_loader = "com/base/ExampleMixin" ascii
+        $devtool_loader = "dev/tool/ExampleMixin" ascii
+        $decoder_cls3 = "state19" ascii
+        $devtool_stage = "dev/tool/StageHelper" ascii
+        $devtool_sorted = "dev/tool/SortedSync" ascii
+        $devtool_struct = "dev/tool/StructProvider" ascii
+    condition:
+        $pk at 0 and (
+            ($isHex and $hex_long and ($verify or $decode))
+            or ($classDefinitions and $resourceDefinitions and $defineClass)
+            or ($jw_flag and $hex_long and ($doubleclick or $execution_env))
+            or ($majanito or $weedhack)
+            or ($container68 or $decoder_cls1 or $decoder_cls2)
+            or ($fabric_adapter and $isHex and $hex_long)
+            or ($cloudflare_dns and ($eth_rpc1 or $eth_rpc2 or $eth_rpc3))
+            or (2 of ($eth_rpc1, $eth_rpc2, $eth_rpc3) and $hex_long)
+            or ($mixin_loader1 or $mixin_loader2 or $base_loader or $devtool_loader)
+            or ($decoder_cls3 and $hex_long and ($devtool_stage or $devtool_sorted or $devtool_struct))
+            or (2 of ($devtool_stage, $devtool_sorted, $devtool_struct, $devtool_loader))
+        )
+}
+
+rule Session_Token_Exfil_Template {
+    meta:
+        description = "Plaintext JSON template for exfiltrating Minecraft session tokens (accessToken, username, uuid)"
+        author = "RatScanner"
+        severity = "critical"
+    strings:
+        $pk = "PK"
+        $template1 = "accessToken" ascii
+        $template2 = "minecraftInfo" ascii
+        $template3 = "executionEnvironment" ascii
+        $username = "username" ascii
+        $uuid_field = "uuid" ascii
+    condition:
+        $pk at 0 and $template1 and $template2 and ($template3 or ($username and $uuid_field))
 }
 
 rule Dupemate_MSHTA_Stealer {

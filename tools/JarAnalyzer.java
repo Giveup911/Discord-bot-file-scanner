@@ -85,7 +85,7 @@ public class JarAnalyzer {
         "185.178.208.143", "185.178.208.162" // Weedhack (DDoS-Guard)
     ));
     static final Set<String> KNOWN_C2_DOMAINS = new LinkedHashSet<>(Arrays.asList(
-        "adamrat.shop", "whnewreceive.ru", "whereceiver.ru", "api.donutsmp.net",
+        "adamrat.shop", "whnewreceive.ru", "whereceiver.ru",
         "sltnnt.ru", "boobility.online", "feathermc.com",
         "connect.skyrage.de", "files.skyrage.de", "files-8ie.pages.dev",
         "owouwu.tk", "ectasy.club",
@@ -250,8 +250,7 @@ public class JarAnalyzer {
             "curium.cfg=Curium malware config|" +
             "com.libmod=Silent NET malware package|" +
             "sltnnt.ru=Known C2 domain (Silent NET)|" +
-            "api.donutsmp.net=Known C2 domain (DonutSMP/ADAMRAT)|" +
-            "feathermc.com=Known infrastructure (FeatherMC decoy)|" +
+                        "feathermc.com=Known infrastructure (FeatherMC decoy)|" +
             "owouwu.tk=Known C2 domain (WeirdUtils)|" +
             "ectasy.club=Known C2 domain (Ectasy)|" +
             "neko.run=Fractureiser reinfection flag|" +
@@ -309,9 +308,7 @@ public class JarAnalyzer {
             "0x1280a841=Known Ethereum contract address|" +
             "dev.majanito=Weedhack author namespace in class data|" +
             "0x9c0a5073=Known Polygon contract address (Silent NET)|" +
-            "donutsmp=DonutSMP infrastructure reference|" +
-            "api.donutsmp.net=DonutSMP C2 API|" +
-            "feathermc.com=FeatherMC decoy infrastructure|" +
+                                    "feathermc.com=FeatherMC decoy infrastructure|" +
             "receiver.cy=Known Weedhack C2 in class data|" +
             "whrc.ru=Known Weedhack C2 in class data|" +
             "weedhack.cy=Known Weedhack C2 in class data|" +
@@ -1749,6 +1746,9 @@ public class JarAnalyzer {
         // Constant pool method reference scanning (bytecode-level API detection)
         scanConstantPoolMethodRefs(classes, findings);
 
+        // Bukkit/Spigot/Paper plugin backdoor detection (separate module)
+        BackdoorDetector.scan(classes, findings, sourceFiles, detectedModLoaders, markerDetails);
+
         // Static initializer injection detection: method named _[0-9a-f]{32}
         detectStaticInitInjection(src, findings);
 
@@ -1958,6 +1958,7 @@ public class JarAnalyzer {
             if (!findings.contains(msg)) { findings.add(msg); ilog("  [MARKER] " + msg); }
         }
     }
+
 
     // Extract ASCII strings >= 8 chars from raw class bytes
     static Set<String> extractRawStrings(Map<String, byte[]> classes) {
