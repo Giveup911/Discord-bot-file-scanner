@@ -3841,10 +3841,12 @@ def compute_risk_score(
 
         # ── Weedhack injection detection ──
         # Detect trojanized mods: legitimate mod code + injected dropper package
-        # with ClassLoader.defineClass + session theft from a DIFFERENT package
+        # with ClassLoader.defineClass from a suspicious/obfuscated class
+        _SUS_INJECTION_PKGS = ["dev_tool_", "dev/tool/", "com_example_", "com/example/",
+                               "a_b_", "a/b/"]
         _has_defineclass_injection = any(
-            "classloader.defineclass" in m.lower() or
-            ("defineclass" in m.lower() and "code injection" in m.lower())
+            "classloader.defineclass" in m.lower() and
+            any(pkg in m for pkg in _SUS_INJECTION_PKGS)
             for m in markers
         )
         if _has_defineclass_injection and _has_session_theft and _has_runtime_exec:

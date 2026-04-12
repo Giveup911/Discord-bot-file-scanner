@@ -42,6 +42,8 @@ If you're running the scanner bot, these hashes are already in `bot/exceptions.v
 | ForgeConfigAPIPort | v21.11.1 (Fabric) | `31a0686904fad1cf...` | 4 | Config API bridge. |
 | CustomSkinLoader | 14.28 (Fabric) | `e5973b2c680b46dd...` | 10 | Skin loader, all URLs are legit skin service APIs. |
 | Simple Voice Chat | 2.6.14 (1.21.11) | `896d857e07f1a888...` | 25 | By maxhenkel. Session accessors for player ID, native libs for Opus audio codec. |
+| Opsec (aurick) | 1.21.11 v1.1.1 | `6f3a1290d108f7a0...` | — | Privacy/security mod. Uses session API for account management, MS auth for alt switching. |
+| Opsec (aurick) | 1.21.2-1.21.5 v1.1.0 | `b3433c8f8243b772...` | — | Privacy/security mod. Same as above, older MC versions. |
 
 ---
 
@@ -76,4 +78,6 @@ ff79e45ccae9364378e0ead2e0f9d0985f86a8bd937dba841f0af1e8eb278ab8  amber-fabric-9
 31a0686904fad1cfdeb1d6b011ac1c2280990d6e76ac2416468147e2246b4db1  ForgeConfigAPIPort-v21.11.1-mc1.21.11-Fabric.jar
 e5973b2c680b46dd64e2cd1b4c6137188b71eb3aec7e06060fdb028dc3c9a05e  CustomSkinLoader_Fabric-14.28.jar
 896d857e07f1a88831c8961f7848294a510660e8df0272ecaf1e3e638aeb576c  voicechat-fabric-1.21.11-2.6.14.jar
+6f3a1290d108f7a02c47b9f25b12d2d95fba986922eda3116ed6d095800dfc13  opsec-1.21.11v1.1.1.jar
+b3433c8f8243b7720ca858f4e14f1d3b8d8e2d13b3e2e66cf37abeee4e6ffc0f  opsec-1.21.2-1.21.5v1.1.0.jar
 ```
